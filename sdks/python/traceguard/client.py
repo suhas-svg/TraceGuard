@@ -55,7 +55,7 @@ class TraceGuardClient:
             t.start()
             self._threads.append(t)
 
-    def flush(self, timeout: float = 10) -> None:
+    def flush(self, timeout: float = 30) -> None:
         """Wait for queued events to send. Call before process exit,
         otherwise daemon sender threads die with unsent events."""
         for t in self._threads:
