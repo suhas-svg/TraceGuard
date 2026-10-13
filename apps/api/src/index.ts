@@ -5,6 +5,10 @@ import { ingestBodySchema } from "@traceguard/schemas";
 
 const API_KEY = process.env.API_KEY ?? "";
 const PORT = Number(process.env.PORT ?? 8080);
+// The browser dashboard fetches cross-origin, so the API answers CORS.
+// Single trusted origin, configured per deploy. The gateway gets the same
+// treatment when its UI screens land.
+const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN ?? "http://localhost:5173";
 
 export function buildApp() {
   const app = Fastify({ logger: true, genReqId: () => randomUUID() });
@@ -20,6 +24,9 @@ export function buildApp() {
   // shortcut: single API key for all /v1 routes. Upgrade to scoped
   // ingest/gateway/admin keys plus login before multi-user use.
   app.addHook("onRequest", async (req, reply) => {
+    reply.header("Access-Control-Allow-Origin", DASHBOARD_ORIGIN);
+    reply.header("Access-Control-Allow-Headers", "authorization, content-type");
+    if (req.method === "OPTIONS") return reply.code(204).send();
     if (!req.url.startsWith("/v1/")) return;
     const auth = req.headers.authorization ?? "";
     if (auth !== `Bearer ${API_KEY}`) {
