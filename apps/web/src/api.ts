@@ -72,3 +72,19 @@ export function listRuns(opts: { status?: string; limit?: number; cursor?: strin
 export function getTrace(runId: string) {
   return get<{ run: RunItem; spans: Span[] }>(`/v1/runs/${runId}/trace`);
 }
+
+export interface RunUsage {
+  input_tokens: number;
+  output_tokens: number;
+  estimated_cost_micro: number;
+  cost_partial: boolean;
+  missing_pricing: string[];
+}
+
+export function getUsage(runId: string) {
+  return get<RunUsage>(`/v1/runs/${runId}/usage`);
+}
+
+export function formatMicro(micro: number): string {
+  return `$${(micro / 1_000_000).toFixed(4)}`;
+}

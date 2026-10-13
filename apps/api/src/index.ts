@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import { randomUUID } from "node:crypto";
 import { pool, isDbReady } from "./db.js";
 import { ingestBodySchema } from "@traceguard/schemas";
+import { registerBudgetRoutes } from "./budgets.js";
 
 const API_KEY = process.env.API_KEY ?? "";
 const PORT = Number(process.env.PORT ?? 8080);
@@ -203,6 +204,8 @@ export function buildApp() {
     ]);
     return { run: run.rows[0], spans: spans.rows };
   });
+
+  registerBudgetRoutes(app);
 
   return app;
 }
