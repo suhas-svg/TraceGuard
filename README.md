@@ -19,6 +19,16 @@ Self-hosted control plane for AI agents. Phase 1 covers the smallest testable sl
 
 Unit checks: `npm install && npm test`.
 
+## Phase 3: trace dashboard
+
+- `apps/web` is a read-only React dashboard: run list with status filter and
+  Load more pagination, plus a trace view with a nested span tree, per-span
+  detail, token totals, and denied-by-policy shown apart from failures.
+- API URL and key are editable in the page header and kept in localStorage.
+  The dashboard never writes: policy and approval actions stay in API clients.
+- Run it: `npm run dev --workspace=@traceguard/web` (port 5173) against the
+  API on 8090, or `docker compose up web` for the built bundle.
+
 ## Phase 2: gateway and policy
 
 - `POST /v1/servers`, `POST /v1/servers/:id/discover` register Streamable HTTP
