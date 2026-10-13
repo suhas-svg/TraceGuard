@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { pool, isDbReady } from "./db.js";
 import { ingestBodySchema } from "@traceguard/schemas";
 import { registerBudgetRoutes } from "./budgets.js";
+import { registerEvalRoutes } from "./evals.js";
 
 const API_KEY = process.env.API_KEY ?? "";
 const PORT = Number(process.env.PORT ?? 8080);
@@ -206,6 +207,7 @@ export function buildApp() {
   });
 
   registerBudgetRoutes(app);
+  registerEvalRoutes(app);
 
   return app;
 }

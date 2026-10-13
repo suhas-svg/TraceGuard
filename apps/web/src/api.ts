@@ -88,3 +88,52 @@ export function getUsage(runId: string) {
 export function formatMicro(micro: number): string {
   return `$${(micro / 1_000_000).toFixed(4)}`;
 }
+
+export interface EvalSuite {
+  id: string;
+  name: string;
+  version: number;
+  description: string;
+  locked: boolean;
+  case_count: string;
+  run_count: string;
+}
+
+export interface EvalCase {
+  id: string;
+  name: string;
+  assertions: { type: string }[];
+}
+
+export interface EvalResult {
+  id: string;
+  case_name: string;
+  trial: number;
+  passed: boolean;
+  assertion_results: { type: string; passed: boolean; message: string }[];
+  latency_ms: number;
+  cost_micro: number;
+  error_summary: string | null;
+  agent_run_id: string | null;
+}
+
+export interface EvalRun {
+  id: string;
+  agent_name: string;
+  config_fingerprint: string;
+  model: string;
+  trials: number;
+  status: string;
+}
+
+export function listSuites() {
+  return get<{ items: EvalSuite[] }>("/v1/evaluations/suites");
+}
+
+export function getEvalRun(id: string) {
+  return get<{ eval_run: EvalRun; results: EvalResult[] }>(`/v1/evaluations/runs/${id}`);
+}
+
+export function compareEvalRuns(ids: string[]) {
+  return get<{ runs: Record<string, unknown>[] }>(`/v1/evaluations/runs/compare?ids=${ids.join(",")}`);
+}

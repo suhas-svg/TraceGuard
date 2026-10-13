@@ -32,6 +32,20 @@ Self-hosted control plane for AI agents. Phase 1 covers the smallest testable sl
   timestamps the API accepts.
 - The trace header shows the estimated run cost from the usage endpoint.
 
+## Phase 5: evaluation workbench
+
+- Suites version on creation and lock on first use. Cases carry scripted
+  behavior plus deterministic assertions: exact, contains, regex, a small
+  JSON schema subset, tool sequence, and final status.
+- Starting a run replays every case for N trials, writes real runs you can
+  open in the dashboard, and records pass state, latency, cost, and the
+  config fingerprint. Per-run overrides let a second version run the same
+  locked dataset differently.
+- The compare endpoint reports pass rate, latency spread, cost, and denied
+  tool violations side by side, with missing data shown as missing.
+- The dashboard has an Evaluations tab: suite list, per-case results with
+  failure reasons, links back to traces, and a two-run comparison.
+
 Unit checks: `npm install && npm test`.
 
 ## Phase 3: trace dashboard
