@@ -1,0 +1,15 @@
+{
+  "name": "traceguard",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "workspaces": [
+    "apps/api",
+    "packages/schemas"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces",
+    "db:migrate": "psql $DATABASE_URL -f apps/api/migrations/001_init.sql"
+  }
+}
