@@ -4,6 +4,7 @@ import { pool, isDbReady } from "./db.js";
 import { ingestBodySchema } from "@traceguard/schemas";
 import { registerBudgetRoutes } from "./budgets.js";
 import { registerEvalRoutes } from "./evals.js";
+import { attrsToObject, mapOtlpSpan, type OtlpSpan } from "./otlp.js";
 
 const API_KEY = process.env.API_KEY ?? "";
 const PORT = Number(process.env.PORT ?? 8080);
@@ -208,6 +209,95 @@ export function buildApp() {
 
   registerBudgetRoutes(app);
   registerEvalRoutes(app);
+
+  // OTLP/HTTP JSON trace receiver. Exporters must use http/json encoding.
+  // Spans in one trace share a run; ids map deterministically so retries
+  // upsert instead of duplicating. Replies with empty partialSuccess per spec.
+  app.post("/v1/traces", async (req, reply) => {
+    const body = req.body as {
+      resourceSpans?: {
+        resource?: { attributes?: { key: string; value?: Record<string, unknown> }[] };
+        scopeSpans?: { spans?: OtlpSpan[] }[];
+      }[];
+    };
+    const resourceSpans = body?.resourceSpans;
+    if (!Array.isArray(resourceSpans) || resourceSpans.length > 50) {
+      return reply.code(400).send({ error: "invalid_traces" });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      let accepted = 0;
+      let duplicates = 0;
+      for (const rs of resourceSpans) {
+        const resource = attrsToObject(
+          (rs.resource?.attributes ?? []) as Parameters<typeof attrsToObject>[0]
+        );
+        const spans = (rs.scopeSpans ?? []).flatMap((s) => s.spans ?? []).slice(0, 2000);
+        for (const span of spans) {
+          const m = mapOtlpSpan(span, resource);
+          if (!m) continue;
+          let workspace = await client.query("SELECT id FROM workspaces WHERE name = $1", [m.workspaceName]);
+          if (!workspace.rows[0]) {
+            workspace = await client.query("INSERT INTO workspaces (name) VALUES ($1) RETURNING id", [m.workspaceName]);
+          }
+          let agent = await client.query(
+            "SELECT id FROM agents WHERE workspace_id = $1 AND name = $2",
+            [workspace.rows[0].id, m.agentName]
+          );
+          if (!agent.rows[0]) {
+            agent = await client.query(
+              "INSERT INTO agents (workspace_id, name, adapter_type) VALUES ($1, $2, 'otlp') RETURNING id",
+              [workspace.rows[0].id, m.agentName]
+            );
+          }
+          await client.query(
+            `INSERT INTO runs (id, workspace_id, agent_id, status, started_at)
+             VALUES ($1, $2, $3, 'running', $4) ON CONFLICT (id) DO NOTHING`,
+            [m.runId, workspace.rows[0].id, agent.rows[0].id, m.startedAt]
+          );
+          const endedAt =
+            m.durationMs != null
+              ? new Date(new Date(m.startedAt).getTime() + m.durationMs).toISOString()
+              : null;
+          const res = await client.query(
+            `INSERT INTO spans
+               (id, run_id, parent_span_id, event_id, operation_type, name, started_at, ended_at,
+                duration_ms, status, provider, model, input_tokens, output_tokens,
+                usage_source, error_type, attributes)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+             ON CONFLICT (event_id) DO NOTHING`,
+            [m.spanId, m.runId, m.parentSpanId, m.eventId, m.operationType, m.name,
+             m.startedAt, endedAt, m.durationMs, m.status, m.provider, m.model,
+             m.inputTokens, m.outputTokens, m.usageSource, m.errorType, JSON.stringify(m.attributes)]
+          );
+          if (res.rowCount === 0) duplicates++;
+          else accepted++;
+        }
+      }
+      await client.query("COMMIT");
+      return { partialSuccess: {}, accepted, duplicates };
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  });
+
+  // Runs orphaned by crashed SDKs never send a completion event. Call this
+  // periodically (cron, not a scheduler in the app) to close them visibly.
+  app.post("/v1/admin/finalize-stale-runs", async (req) => {
+    const q = req.query as { older_than_seconds?: string };
+    const seconds = Math.min(Math.max(Number(q.older_than_seconds ?? 3600), 60), 86400);
+    const res = await pool.query(
+      `UPDATE runs SET status = 'failed', ended_at = now(), error_type = 'stale_timeout'
+       WHERE status = 'running' AND started_at < now() - ($1 || ' seconds')::interval
+       RETURNING id`,
+      [String(seconds)]
+    );
+    return { finalized: res.rows.length, ids: res.rows.map((r) => r.id) };
+  });
 
   return app;
 }

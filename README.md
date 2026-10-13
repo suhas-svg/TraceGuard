@@ -22,6 +22,11 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 - Gateway on :8091: upstream registry, tool discovery with definition pinning, allow/deny/approval policies, single-use bound approvals, hash-chained audit.
 - Budgets with atomic reserve-and-settle plus a Python `BudgetGuard` wrapper.
 - Evaluations: versioned suites, scripted replay, deterministic assertions, run comparison, dashboard tab.
+- `POST /v1/traces` accepts OpenTelemetry OTLP/HTTP JSON with GenAI
+  conventions, so instrumented frameworks land without a new SDK. Set
+  `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` on the exporter. Spans in one
+  trace share a run, retries upsert by stable ids, and
+  `POST /v1/admin/finalize-stale-runs` closes runs orphaned by crashes.
 - `GET /healthz`, `GET /readyz` report liveness and database state.
 - Python SDK sends events over HTTP with a bounded queue and never raises into the agent.
 - `examples/demo-agent` submits a sample run and fetches its trace.
