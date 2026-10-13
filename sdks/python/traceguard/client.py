@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    # Zod's datetime() parser wants a Z suffix, not +00:00.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 @dataclass
@@ -22,8 +23,11 @@ class TraceGuardClient:
     agent_name: str = "demo-agent"
     workspace_name: str = "default"
     _queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=500), init=False)
+    _threads: list = field(default_factory=list, init=False)
 
     def _post(self, payload: dict) -> None:
+        # Background thread, so a generous timeout only delays flush, never
+        # the agent. Local disks can stall a first write for seconds.
         try:
             req = urllib.request.Request(
                 self.base_url.rstrip("/") + "/v1/ingest/events",
@@ -34,7 +38,7 @@ class TraceGuardClient:
                 },
                 method="POST",
             )
-            urllib.request.urlopen(req, timeout=5).read()
+            urllib.request.urlopen(req, timeout=30).read()
         except Exception:
             pass  # telemetry fails open by design
 
@@ -49,6 +53,14 @@ class TraceGuardClient:
         if events:
             t = threading.Thread(target=self._post, args=({"events": events},), daemon=True)
             t.start()
+            self._threads.append(t)
+
+    def flush(self, timeout: float = 10) -> None:
+        """Wait for queued events to send. Call before process exit,
+        otherwise daemon sender threads die with unsent events."""
+        for t in self._threads:
+            t.join(timeout=max(0.1, timeout / max(1, len(self._threads))))
+        self._threads = [t for t in self._threads if t.is_alive()]
 
     def start_run(self, run_id: str | None = None) -> str:
         run_id = run_id or str(uuid.uuid4())
@@ -110,3 +122,52 @@ class TraceGuardClient:
                 "attributes": {},
             }
         )
+
+
+class BudgetExceeded(Exception):
+    pass
+
+
+class BudgetGuard:
+    """Managed model-call wrapper. Checks the budget before the provider call
+    and settles to the measured cost after. Fails closed: any check error or
+    denial raises instead of calling the provider."""
+
+    def __init__(self, client: TraceGuardClient, budget_id: str):
+        self.client = client
+        self.budget_id = budget_id
+
+    def _api(self, path: str, payload: dict) -> tuple[int, dict]:
+        # Generous timeout: local Docker disks can stall a first write for
+        # seconds (seen 5-13s on this box). Telemetry stays fire-and-forget.
+        req = urllib.request.Request(
+            self.client.base_url.rstrip("/") + path,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.client.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as res:
+                return res.status, json.loads(res.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read() or b"{}")
+            except Exception:
+                return e.code, {}
+
+    def reserve(self, max_cost_micro: int, ttl_seconds: int = 300) -> str:
+        status, body = self._api(
+            "/v1/budgets/check",
+            {"budget_id": self.budget_id, "max_cost_micro": max_cost_micro,
+             "ttl_seconds": ttl_seconds},
+        )
+        if status != 200:
+            raise BudgetExceeded(body.get("error", f"budget check failed: {status}"))
+        return body["reservation_id"]
+
+    def settle(self, reservation_id: str, actual_cost_micro: int | None = None) -> None:
+        self._api("/v1/budgets/settle",
+                  {"reservation_id": reservation_id, "actual_cost_micro": actual_cost_micro})

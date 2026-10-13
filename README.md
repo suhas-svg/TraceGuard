@@ -17,6 +17,21 @@ Self-hosted control plane for AI agents. Phase 1 covers the smallest testable sl
 3. `psql $DATABASE_URL -f apps/api/migrations/001_init.sql` (first boot only, later handled by a migrate step)
 4. `cd examples/demo-agent && TRACEGUARD_URL=http://localhost:8080 python main.py`
 
+## Phase 4: cost and budgets
+
+- `POST /v1/pricing` versions model prices, old versions stay so past
+  estimates keep meaning. Money is integer micro-dollars, never floats.
+- `GET /v1/runs/:id/usage` breaks tokens and cost down per span against the
+  price in force at the time. Spans with no matching price report NULL and
+  list under `missing_pricing`, never zero.
+- `POST /v1/budgets` sets run or agent limits with block or warn effects.
+  The managed path reserves before the call in one atomic UPDATE, then
+  settles to the measured cost. A blocked call gets 409 and the SDK raises
+  `BudgetExceeded` instead of calling the provider.
+- The Python SDK gained `BudgetGuard` plus `flush`, and now stamps Zulu
+  timestamps the API accepts.
+- The trace header shows the estimated run cost from the usage endpoint.
+
 Unit checks: `npm install && npm test`.
 
 ## Phase 3: trace dashboard

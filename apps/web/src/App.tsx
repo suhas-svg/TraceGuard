@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { getTrace, listRuns, settings, type RunItem, type Span } from "./api";
+import { formatMicro, getTrace, getUsage, listRuns, settings, type RunItem, type Span } from "./api";
 import { buildTree, tokenTotal, type SpanNode } from "./tree";
 
 function StatusBadge({ status }: { status: string }) {
@@ -217,6 +217,7 @@ function SpanDetail({ span }: { span: Span }) {
 function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
   const [run, setRun] = useState<RunItem | null>(null);
   const [spans, setSpans] = useState<Span[]>([]);
+  const [cost, setCost] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [error, setError] = useState("");
 
@@ -227,6 +228,9 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
         setSpans(t.spans);
       })
       .catch((e) => setError(e instanceof Error ? e.message : "load failed"));
+    getUsage(runId)
+      .then((u) => setCost(`${formatMicro(u.estimated_cost_micro)}${u.cost_partial ? " (partial)" : ""}`))
+      .catch(() => setCost("n/a"));
   }, [runId]);
 
   if (error) {
@@ -257,6 +261,7 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
         <span className="text-sm text-gray-600">
           {totals.input} in / {totals.output} out
         </span>
+        {cost && <span className="text-sm text-gray-600">est. {cost}</span>}
         {run.error_type && <span className="text-sm text-red-600">{run.error_type}</span>}
       </div>
       <div className="grid gap-4 md:grid-cols-2">
