@@ -183,9 +183,13 @@ function SpanRow({
 }
 
 function SpanDetail({ span }: { span: Span }) {
+  // Denials come from policy rules or exhausted budgets. The stored reason
+  // names the cause; the label only says denied.
+  const denialCause =
+    (span.attributes?.reason as string | undefined) ?? span.error_type ?? "policy";
   const rows: [string, string][] = [
     ["Operation", span.operation_type],
-    ["Status", span.status === "denied" ? "denied by policy" : span.status],
+    ["Status", span.status === "denied" ? `denied by ${denialCause}` : span.status],
     ["Started", new Date(span.started_at).toLocaleString()],
     ["Duration", span.duration_ms != null ? `${span.duration_ms} ms` : "n/a"],
     ["Provider", span.provider ?? "n/a"],

@@ -1,21 +1,29 @@
-# TraceGuard (Phase 1 scaffold)
+# TraceGuard
 
-Self-hosted control plane for AI agents. Phase 1 covers the smallest testable slice: event ingestion plus run and trace reads.
+Self-hosted control plane for AI agents: execution tracing, cost control
+with budgets, MCP tool policy enforcement with human approvals, and
+scripted evaluation workbench.
+
+## Run it
+
+Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
+
+1. Copy `.env.example` to `.env` and set `API_KEY` and `APPROVER_KEY`.
+2. `docker compose up --build`
+3. Apply migrations in order: `for f in apps/api/migrations/*.sql; do psql $DATABASE_URL -f "$f"; done`
+4. Open http://localhost:5173, set the API URL and key in the header, browse runs.
 
 ## What works now
 
 - `POST /v1/ingest/events` validates with Zod, dedupes on `event_id`, auto-creates workspace, agent, and run records.
-- `GET /v1/runs`, `GET /v1/runs/:id`, `GET /v1/runs/:id/trace` read stored runs.
+- `GET /v1/runs`, `GET /v1/runs/:id`, `GET /v1/runs/:id/trace`, `GET /v1/runs/:id/usage` read stored runs with token and cost breakdowns.
+- Gateway on :8091: upstream registry, tool discovery with definition pinning, allow/deny/approval policies, single-use bound approvals, hash-chained audit.
+- Budgets with atomic reserve-and-settle plus a Python `BudgetGuard` wrapper.
+- Evaluations: versioned suites, scripted replay, deterministic assertions, run comparison, dashboard tab.
 - `GET /healthz`, `GET /readyz` report liveness and database state.
 - Python SDK sends events over HTTP with a bounded queue and never raises into the agent.
 - `examples/demo-agent` submits a sample run and fetches its trace.
-
-## Run it
-
-1. Copy `.env.example` to `.env` and set `API_KEY`.
-2. `docker compose up --build`
-3. `psql $DATABASE_URL -f apps/api/migrations/001_init.sql` (first boot only, later handled by a migrate step)
-4. `cd examples/demo-agent && TRACEGUARD_URL=http://localhost:8080 python main.py`
+- `examples/mock-tools` is a two-tool upstream for gateway demos.
 
 ## Phase 4: cost and budgets
 
