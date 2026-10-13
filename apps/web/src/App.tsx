@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { formatMicro, getTrace, getUsage, listRuns, settings, type RunItem, type Span } from "./api";
 import { buildTree, tokenTotal, type SpanNode } from "./tree";
 import EvalsView from "./Evals";
+import PoliciesView from "./Policies";
+import ApprovalsView from "./Approvals";
 
 function StatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
@@ -25,26 +27,41 @@ function short(id: string) {
 function SettingsBar({ onSaved }: { onSaved: () => void }) {
   const [url, setUrl] = useState(settings.url);
   const [key, setKey] = useState(settings.key);
+  const [gwUrl, setGwUrl] = useState(settings.gwUrl);
+  const [approverKey, setApproverKey] = useState(settings.approverKey);
   return (
     <form
       className="flex flex-wrap items-end gap-2 border-b bg-gray-50 px-4 py-2 text-sm"
       onSubmit={(e) => {
         e.preventDefault();
-        settings.save(url, key);
+        settings.save(url, key, gwUrl, approverKey);
         onSaved();
       }}
     >
       <label className="flex flex-col">
         <span className="text-xs text-gray-500">API URL</span>
-        <input className="w-56 rounded border px-2 py-1" value={url} onChange={(e) => setUrl(e.target.value)} />
+        <input className="w-48 rounded border px-2 py-1" value={url} onChange={(e) => setUrl(e.target.value)} />
       </label>
       <label className="flex flex-col">
         <span className="text-xs text-gray-500">API key</span>
         <input
-          className="w-56 rounded border px-2 py-1"
+          className="w-44 rounded border px-2 py-1"
           type="password"
           value={key}
           onChange={(e) => setKey(e.target.value)}
+        />
+      </label>
+      <label className="flex flex-col">
+        <span className="text-xs text-gray-500">Gateway URL</span>
+        <input className="w-48 rounded border px-2 py-1" value={gwUrl} onChange={(e) => setGwUrl(e.target.value)} />
+      </label>
+      <label className="flex flex-col">
+        <span className="text-xs text-gray-500">Approver key</span>
+        <input
+          className="w-44 rounded border px-2 py-1"
+          type="password"
+          value={approverKey}
+          onChange={(e) => setApproverKey(e.target.value)}
         />
       </label>
       <button className="rounded bg-gray-800 px-3 py-1 text-white" type="submit">
@@ -284,7 +301,7 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
 
 export default function App() {
   const [openRun, setOpenRun] = useState<string | null>(null);
-  const [tab, setTab] = useState<"runs" | "evals">("runs");
+  const [tab, setTab] = useState<"runs" | "evals" | "policy" | "approvals">("runs");
   const [settingsTick, setSettingsTick] = useState(0);
   return (
     <div className="min-h-screen bg-white text-gray-900">
@@ -303,12 +320,28 @@ export default function App() {
           >
             Evaluations
           </button>
+          <button
+            className={`rounded px-2 py-1 ${tab === "policy" ? "bg-gray-800 text-white" : "border"}`}
+            onClick={() => setTab("policy")}
+          >
+            Policy
+          </button>
+          <button
+            className={`rounded px-2 py-1 ${tab === "approvals" ? "bg-gray-800 text-white" : "border"}`}
+            onClick={() => setTab("approvals")}
+          >
+            Approvals
+          </button>
         </nav>
       </header>
       <SettingsBar onSaved={() => setSettingsTick((t) => t + 1)} />
       <main key={settingsTick}>
         {tab === "evals" ? (
           <EvalsView onOpenRun={(id) => { setOpenRun(id); setTab("runs"); }} />
+        ) : tab === "policy" ? (
+          <PoliciesView />
+        ) : tab === "approvals" ? (
+          <ApprovalsView />
         ) : openRun ? (
           <TraceView runId={openRun} onBack={() => setOpenRun(null)} />
         ) : (
