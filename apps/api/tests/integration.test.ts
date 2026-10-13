@@ -191,9 +191,10 @@ describe("integration and security", () => {
   });
 
   it("ingests OTLP traces idempotently and finalizes stale runs", async () => {
-    const traceId = "c".repeat(32);
-    const rootId = "d".repeat(16);
-    const childId = "e".repeat(16);
+    const hex = (n: number) => randomUUID().replace(/-/g, "").slice(0, n);
+    const traceId = hex(32);
+    const rootId = hex(16);
+    const childId = hex(16);
     const payload = {
       resourceSpans: [{
         resource: { attributes: [

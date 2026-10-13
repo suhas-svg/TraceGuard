@@ -15,9 +15,17 @@ export const settings = {
   get key() {
     return stored("tg_key", import.meta.env.VITE_API_KEY ?? "dev_key_change_me");
   },
-  save(url: string, key: string) {
+  get gwUrl() {
+    return stored("tg_gw_url", import.meta.env.VITE_GATEWAY_URL ?? "http://localhost:8091");
+  },
+  get approverKey() {
+    return stored("tg_approver_key", import.meta.env.VITE_APPROVER_KEY ?? "dev_approver_change_me");
+  },
+  save(url: string, key: string, gwUrl: string, approverKey: string) {
     localStorage.setItem("tg_url", url);
     localStorage.setItem("tg_key", key);
+    localStorage.setItem("tg_gw_url", gwUrl);
+    localStorage.setItem("tg_approver_key", approverKey);
   }
 };
 
@@ -137,3 +145,72 @@ export function getEvalRun(id: string) {
 export function compareEvalRuns(ids: string[]) {
   return get<{ runs: Record<string, unknown>[] }>(`/v1/evaluations/runs/compare?ids=${ids.join(",")}`);
 }
+
+// Gateway calls go to the gateway process with the agent key. Approval
+// decisions are the one call that uses the approver key instead.
+async function gw<T>(path: string, init?: RequestInit, approver = false): Promise<T> {
+  const res = await fetch(`${settings.gwUrl}${path}`, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${approver ? settings.approverKey : settings.key}`,
+      ...(init?.headers ?? {})
+    }
+  });
+  if (res.status === 401) throw new Error("unauthorized: check the key in settings");
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { error?: string }).error ?? `request failed: ${res.status}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+export interface McpServer {
+  id: string;
+  name: string;
+  base_url: string;
+}
+
+export interface Policy {
+  id: string;
+  name: string;
+  enabled: boolean;
+  priority: number;
+  server_id: string | null;
+  tool_name: string | null;
+  effect: string;
+  conditions: Record<string, unknown>;
+  version: number;
+  superseded_by: string | null;
+}
+
+export interface Approval {
+  id: string;
+  request_id: string;
+  caller: string;
+  server_id: string;
+  tool_name: string;
+  args: Record<string, unknown>;
+  args_hash: string;
+  status: string;
+  expires_at: string;
+  decision_reason: string;
+}
+
+export const gwApi = {
+  servers: () => gw<{ items: McpServer[] }>("/v1/servers"),
+  discover: (id: string) => gw<{ tools: { tool_name: string; quarantined: boolean }[] }>(`/v1/servers/${id}/discover`, { method: "POST", body: "{}" }),
+  policies: () => gw<{ items: Policy[] }>("/v1/policies"),
+  createPolicy: (p: Record<string, unknown>) =>
+    gw<Policy>("/v1/policies", { method: "POST", body: JSON.stringify(p) }),
+  updatePolicy: (id: string, p: Record<string, unknown>) =>
+    gw<Policy>(`/v1/policies/${id}`, { method: "PUT", body: JSON.stringify(p) }),
+  approvals: (status?: string) =>
+    gw<{ items: Approval[] }>(`/v1/approvals${status ? `?status=${status}` : ""}`),
+  decide: (id: string, approved: boolean, reason: string) =>
+    gw<Approval>(`/v1/approvals/${id}/decision`,
+      { method: "POST", body: JSON.stringify({ approved, reason }) }, true),
+  call: (body: Record<string, unknown>) =>
+    gw<{ result?: unknown; approval_id?: string; status?: string; expires_at?: string }>(
+      "/v1/gateway/tools/call", { method: "POST", body: JSON.stringify(body) })
+};

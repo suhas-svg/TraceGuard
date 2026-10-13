@@ -17,6 +17,8 @@ const API_KEY = process.env.API_KEY ?? "";
 const APPROVER_KEY = process.env.APPROVER_KEY ?? "";
 const PORT = Number(process.env.GATEWAY_PORT ?? 8091);
 const APPROVAL_TTL_SECONDS = Number(process.env.APPROVAL_TTL_SECONDS ?? 300);
+// Same single-origin CORS as the API, for the policy screens.
+const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN ?? "http://localhost:5173";
 if (!API_KEY) throw new Error("API_KEY is required");
 if (!APPROVER_KEY) throw new Error("APPROVER_KEY is required");
 
@@ -49,6 +51,9 @@ export function buildGateway() {
   app.get("/healthz", async () => ({ ok: true }));
 
   app.addHook("onRequest", async (req, reply) => {
+    reply.header("Access-Control-Allow-Origin", DASHBOARD_ORIGIN);
+    reply.header("Access-Control-Allow-Headers", "authorization, content-type");
+    if (req.method === "OPTIONS") return reply.code(204).send();
     if (!req.url.startsWith("/v1/")) return;
     // Agent credentials must never reach the approval decision endpoint.
     // Approvals are decided with a separate key held by humans, not agents.
