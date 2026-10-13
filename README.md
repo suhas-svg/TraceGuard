@@ -11,7 +11,9 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 1. Copy `.env.example` to `.env` and set `API_KEY` and `APPROVER_KEY`.
 2. `docker compose up --build`
 3. Apply migrations in order: `for f in apps/api/migrations/*.sql; do psql $DATABASE_URL -f "$f"; done`
-4. Open http://localhost:5173, set the API URL and key in the header, browse runs.
+4. Install the SDK and run the demo: `python -m pip install ./sdks/python`
+   then `TRACEGUARD_URL=http://localhost:8090 python examples/demo-agent/main.py`
+5. Open http://localhost:5173, set the API URL and key in the header, browse runs.
 
 ## What works now
 
