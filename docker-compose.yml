@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-traceguard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-traceguard_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-traceguard}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-traceguard}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: ./apps/api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-traceguard}:${POSTGRES_PASSWORD:-traceguard_dev_only}@postgres:5432/${POSTGRES_DB:-traceguard}
+      API_KEY: ${API_KEY:-dev_key_change_me}
+      PORT: 8080
+    ports:
+      - "8090:8080" # 8080 is taken on some dev machines, public side stays off it
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

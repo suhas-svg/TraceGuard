@@ -1,0 +1,9 @@
+[project]
+name = "traceguard-sdk"
+version = "0.1.0"
+description = "TraceGuard Python SDK (Phase 1: structured event submission)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
