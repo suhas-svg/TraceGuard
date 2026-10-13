@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { formatMicro, getTrace, getUsage, listRuns, settings, type RunItem, type Span } from "./api";
 import { buildTree, tokenTotal, type SpanNode } from "./tree";
+import EvalsView from "./Evals";
 
 function StatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
@@ -279,15 +280,36 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
 
 export default function App() {
   const [openRun, setOpenRun] = useState<string | null>(null);
+  const [tab, setTab] = useState<"runs" | "evals">("runs");
   const [settingsTick, setSettingsTick] = useState(0);
   return (
     <div className="min-h-screen bg-white text-gray-900">
-      <header className="border-b px-4 py-2">
+      <header className="flex items-center gap-4 border-b px-4 py-2">
         <h1 className="text-xl font-bold">TraceGuard</h1>
+        <nav className="flex gap-2 text-sm">
+          <button
+            className={`rounded px-2 py-1 ${tab === "runs" ? "bg-gray-800 text-white" : "border"}`}
+            onClick={() => setTab("runs")}
+          >
+            Runs
+          </button>
+          <button
+            className={`rounded px-2 py-1 ${tab === "evals" ? "bg-gray-800 text-white" : "border"}`}
+            onClick={() => setTab("evals")}
+          >
+            Evaluations
+          </button>
+        </nav>
       </header>
       <SettingsBar onSaved={() => setSettingsTick((t) => t + 1)} />
       <main key={settingsTick}>
-        {openRun ? <TraceView runId={openRun} onBack={() => setOpenRun(null)} /> : <RunsList onOpen={setOpenRun} />}
+        {tab === "evals" ? (
+          <EvalsView onOpenRun={(id) => { setOpenRun(id); setTab("runs"); }} />
+        ) : openRun ? (
+          <TraceView runId={openRun} onBack={() => setOpenRun(null)} />
+        ) : (
+          <RunsList onOpen={setOpenRun} />
+        )}
       </main>
     </div>
   );
