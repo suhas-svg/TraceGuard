@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: traceguard
+          POSTGRES_PASSWORD: traceguard
+          POSTGRES_DB: traceguard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U traceguard"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://traceguard:traceguard@localhost:5432/traceguard
+      TEST_DATABASE_URL: postgres://traceguard:traceguard@localhost:5432/traceguard
+      API_KEY: test_key
+      APPROVER_KEY: test_approver
+      ALLOW_PRIVATE_UPSTREAMS: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm install --ignore-scripts
+      - run: ./node_modules/.bin/tsc -p packages/schemas/tsconfig.json
+      - run: ./node_modules/.bin/tsc -p apps/api/tsconfig.json
+      - run: ./node_modules/.bin/tsc -p apps/web/tsconfig.json
+      - run: for f in apps/api/migrations/*.sql; do psql "$DATABASE_URL" -f "$f"; done
+      - run: ./node_modules/.bin/vitest run --root apps/api
+      - run: ./node_modules/.bin/vitest run --root apps/web
+      - run: python -m py_compile sdks/python/traceguard/client.py examples/demo-agent/main.py
