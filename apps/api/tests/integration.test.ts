@@ -190,6 +190,48 @@ describe("integration and security", () => {
     expect(b.pass_rate).toBe(0);
   });
 
+  it("ingests OTLP traces idempotently and finalizes stale runs", async () => {
+    const traceId = "c".repeat(32);
+    const rootId = "d".repeat(16);
+    const childId = "e".repeat(16);
+    const payload = {
+      resourceSpans: [{
+        resource: { attributes: [
+          { key: "service.name", value: { stringValue: `otel-${tag}` } }
+        ]},
+        scopeSpans: [{ spans: [
+          { traceId, spanId: rootId, name: "gen_ai.chat",
+            startTimeUnixNano: "1760371200000000000", endTimeUnixNano: "1760371200500000000",
+            attributes: [
+              { key: "gen_ai.system", value: { stringValue: "openai" } },
+              { key: "gen_ai.request.model", value: { stringValue: "gpt-x" } },
+              { key: "gen_ai.usage.input_tokens", value: { intValue: "10" } },
+              { key: "gen_ai.usage.output_tokens", value: { intValue: "5" } }
+            ]},
+          { traceId, spanId: childId, parentSpanId: rootId, name: "gen_ai.execute_tool",
+            startTimeUnixNano: "1760371200100000000", endTimeUnixNano: "1760371200200000000",
+            attributes: [
+              { key: "gen_ai.tool.name", value: { stringValue: "lookup" } }
+            ]}
+        ]}]
+      }]
+    };
+    const first = await api.inject({ method: "POST", url: "/v1/traces", headers: key, payload });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({ accepted: 2, duplicates: 0 });
+    const retry = await api.inject({ method: "POST", url: "/v1/traces", headers: key, payload });
+    expect(retry.json()).toMatchObject({ accepted: 0, duplicates: 2 });
+    const runs = await api.inject({ method: "GET", url: "/v1/runs?limit=50", headers: key });
+    const run = runs.json().items.find((r: { agent_name: string }) => r.agent_name === `otel-${tag}`);
+    expect(run).toBeDefined();
+    const trace = await api.inject({ method: "GET", url: `/v1/runs/${run.id}/trace`, headers: key });
+    const ops = trace.json().spans.map((s: { operation_type: string }) => s.operation_type).sort();
+    expect(ops).toEqual(["model.request", "tool.invocation"]);
+    const stale = await api.inject({ method: "POST",
+      url: "/v1/admin/finalize-stale-runs?older_than_seconds=60", headers: key });
+    expect(stale.json().ids).toContain(run.id);
+  });
+
   it("keeps the audit hash chain linked", async () => {
     const rows = await pool.query("SELECT hash, prev_hash FROM audit_events ORDER BY timestamp ASC, id ASC LIMIT 200");
     expect(rows.rows.length).toBeGreaterThan(0);
