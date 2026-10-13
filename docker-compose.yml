@@ -14,6 +14,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    networks:
+      - front
 
   api:
     build:
@@ -28,6 +30,49 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - front
+
+  gateway:
+    build:
+      context: .
+      dockerfile: ./apps/api/Dockerfile
+    command: ["node", "apps/api/dist/gateway.js"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-traceguard}:${POSTGRES_PASSWORD:-traceguard_dev_only}@postgres:5432/${POSTGRES_DB:-traceguard}
+      API_KEY: ${API_KEY:-dev_key_change_me}
+      APPROVER_KEY: ${APPROVER_KEY:-dev_approver_change_me}
+      GATEWAY_PORT: 8091
+      APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS:-300}
+      ALLOW_PRIVATE_UPSTREAMS: "true"
+    ports:
+      - "8091:8091"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - front
+      - tools
+
+  # Demo upstream only. It lives on the tools network with no route from
+  # agents or the public side, which is what makes gateway enforcement real.
+  mock-tools:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - ./examples/mock-tools:/app/examples/mock-tools:ro
+      - ./node_modules:/app/node_modules:ro
+      - ./apps/api/node_modules:/app/apps/api/node_modules:ro
+    command: ["node", "examples/mock-tools/server.mjs"]
+    environment:
+      MOCK_TOOLS_PORT: 8092
+    networks:
+      - tools
+
+networks:
+  front:
+  tools:
+    internal: true
 
 volumes:
   pgdata:

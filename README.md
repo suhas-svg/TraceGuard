@@ -19,9 +19,34 @@ Self-hosted control plane for AI agents. Phase 1 covers the smallest testable sl
 
 Unit checks: `npm install && npm test`.
 
+## Phase 2: gateway and policy
+
+- `POST /v1/servers`, `POST /v1/servers/:id/discover` register Streamable HTTP
+  upstreams and pin each tool definition hash. Changed definitions quarantine
+  until re-approved. Upstream credentials stay in the gateway and are never
+  returned by reads.
+- Policy effects are allow, deny, and require_approval. Deny overrides
+  everything, priority only orders rules with the same effect, and unmatched
+  calls are denied. Conditions use a fixed operator set: required fields plus
+  `path_within`, `regex`, `enum`, and `max_length` per argument.
+- A call needing approval returns 202 with an approval id and the gateway
+  makes no upstream contact. The client retries with the approval id after a
+  human decides with the separate approver key. Approvals are single-use and
+  bound to caller, server, tool, canonical args, and request id. Agent keys
+  get 401 on the decision endpoint.
+- Every decision lands in `policy_decisions` citing the exact policy version,
+  and every admin or execution outcome lands in the hash-chained `audit_events`
+  table. Policies are immutable versions: an update supersedes, never edits.
+- Try it: `node examples/mock-tools/server.mjs`, register
+  `http://localhost:8092/mcp` (needs `ALLOW_PRIVATE_UPSTREAMS=true` locally),
+  discover, add an allow rule, and call through
+  `POST /v1/gateway/tools/call` on port 8091.
+
 ## Deferred to later phases
 
-Gateway, policy engine, approvals, audit log, pricing and budgets, evaluation, dashboard. Directories for those exist in the spec but contain no code yet on purpose. Each lands as its own phase with its own exit test.
+Pricing and budgets, evaluation, dashboard. Gateway, policy, approvals, and
+audit are done in Phase 2. Each remaining piece lands as its own phase with
+its own exit test.
 
 ## Scope decisions from the review
 
