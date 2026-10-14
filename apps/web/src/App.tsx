@@ -7,70 +7,63 @@ import ApprovalsView from "./Approvals";
 import WebhooksView from "./Webhooks";
 import RetentionView from "./Retention";
 import CostsView from "./Costs";
+import {
+  Alert, Badge, Button, Card, Empty, Field, Input, LinkButton,
+  NavIcon, Page, Select, Spinner, Stat, StatusBadge, Table, Td, Th
+} from "./components";
 
-function StatusBadge({ status }: { status: string }) {
-  const colors: Record<string, string> = {
-    success: "bg-green-100 text-green-800",
-    failed: "bg-red-100 text-red-800",
-    running: "bg-amber-100 text-amber-800",
-    cancelled: "bg-gray-100 text-gray-800",
-    denied: "bg-purple-100 text-purple-800"
-  };
-  return (
-    <span className={`inline-block rounded px-2 py-0.5 text-xs font-medium ${colors[status] ?? "bg-gray-100 text-gray-800"}`}>
-      {status}
-    </span>
-  );
-}
+type Tab = "runs" | "evals" | "policy" | "approvals" | "webhooks" | "retention" | "costs";
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: "runs", label: "Runs" },
+  { id: "evals", label: "Evaluations" },
+  { id: "policy", label: "Policy" },
+  { id: "approvals", label: "Approvals" },
+  { id: "webhooks", label: "Webhooks" },
+  { id: "retention", label: "Retention" },
+  { id: "costs", label: "Costs" }
+];
 
 function short(id: string) {
   return id.slice(0, 8);
 }
 
-function SettingsBar({ onSaved }: { onSaved: () => void }) {
+function ConnectionDrawer({ open, onClose, onSaved }: {
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
   const [url, setUrl] = useState(settings.url);
   const [key, setKey] = useState(settings.key);
   const [gwUrl, setGwUrl] = useState(settings.gwUrl);
   const [approverKey, setApproverKey] = useState(settings.approverKey);
+  if (!open) return null;
   return (
-    <form
-      className="flex flex-wrap items-end gap-2 border-b bg-gray-50 px-4 py-2 text-sm"
-      onSubmit={(e) => {
-        e.preventDefault();
-        settings.save(url, key, gwUrl, approverKey);
-        onSaved();
-      }}
-    >
-      <label className="flex flex-col">
-        <span className="text-xs text-gray-500">API URL</span>
-        <input className="w-48 rounded border px-2 py-1" value={url} onChange={(e) => setUrl(e.target.value)} />
-      </label>
-      <label className="flex flex-col">
-        <span className="text-xs text-gray-500">API key</span>
-        <input
-          className="w-44 rounded border px-2 py-1"
-          type="password"
-          value={key}
-          onChange={(e) => setKey(e.target.value)}
-        />
-      </label>
-      <label className="flex flex-col">
-        <span className="text-xs text-gray-500">Gateway URL</span>
-        <input className="w-48 rounded border px-2 py-1" value={gwUrl} onChange={(e) => setGwUrl(e.target.value)} />
-      </label>
-      <label className="flex flex-col">
-        <span className="text-xs text-gray-500">Approver key</span>
-        <input
-          className="w-44 rounded border px-2 py-1"
-          type="password"
-          value={approverKey}
-          onChange={(e) => setApproverKey(e.target.value)}
-        />
-      </label>
-      <button className="rounded bg-gray-800 px-3 py-1 text-white" type="submit">
-        Connect
-      </button>
-    </form>
+    <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-label="Connection settings">
+      <div className="absolute inset-0 bg-ink-950/40" onClick={onClose} />
+      <form
+        className="relative flex w-80 flex-col gap-3 bg-white p-5 shadow-xl"
+        onSubmit={(e) => {
+          e.preventDefault();
+          settings.save(url, key, gwUrl, approverKey);
+          onSaved();
+          onClose();
+        }}
+      >
+        <h2 className="text-base font-semibold text-ink-900">Connection</h2>
+        <p className="text-xs text-ink-500">Keys stay in this browser only, never on the server.</p>
+        <Field label="API URL"><Input value={url} onChange={(e) => setUrl(e.target.value)} /></Field>
+        <Field label="API key"><Input type="password" value={key} onChange={(e) => setKey(e.target.value)} /></Field>
+        <Field label="Gateway URL"><Input value={gwUrl} onChange={(e) => setGwUrl(e.target.value)} /></Field>
+        <Field label="Approver key">
+          <Input type="password" value={approverKey} onChange={(e) => setApproverKey(e.target.value)} />
+        </Field>
+        <div className="mt-1 flex gap-2">
+          <Button variant="primary" type="submit">Connect</Button>
+          <Button type="button" onClick={onClose}>Cancel</Button>
+        </div>
+      </form>
+    </div>
   );
 }
 
@@ -103,100 +96,115 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
     load(null, true);
   }, [load]);
 
+  const counts = runs.reduce<Record<string, number>>((m, r) => {
+    m[r.status] = (m[r.status] ?? 0) + 1;
+    return m;
+  }, {});
+
   return (
-    <div className="p-4">
-      <div className="mb-3 flex items-center gap-2">
-        <h2 className="text-lg font-semibold">Runs</h2>
-        <select
-          aria-label="Filter by status"
-          className="rounded border px-2 py-1 text-sm"
-          value={status}
-          onChange={(e) => setStatus(e.target.value)}
-        >
-          <option value="">all statuses</option>
-          <option value="running">running</option>
-          <option value="success">success</option>
-          <option value="failed">failed</option>
-          <option value="cancelled">cancelled</option>
-        </select>
-        <button className="rounded border px-2 py-1 text-sm" onClick={() => load(null, true)}>
-          Refresh
-        </button>
-      </div>
-      {error && <p className="mb-2 rounded bg-red-50 px-2 py-1 text-sm text-red-700">{error}</p>}
-      {runs.length === 0 && !loading && <p className="text-sm text-gray-500">No runs yet. Run the demo agent to create one.</p>}
-      <table className="w-full border-collapse text-sm">
-        <thead>
-          <tr className="border-b text-left text-gray-500">
-            <th className="py-1 pr-2">Run</th>
-            <th className="py-1 pr-2">Agent</th>
-            <th className="py-1 pr-2">Status</th>
-            <th className="py-1 pr-2">Started</th>
-            <th className="py-1 pr-2">Spans</th>
-            <th className="py-1 pr-2">Tokens in/out</th>
-          </tr>
-        </thead>
-        <tbody>
-          {runs.map((r) => (
-            <tr key={r.id} className="border-b hover:bg-gray-50">
-              <td className="py-1 pr-2">
-                <button className="text-blue-700 underline" onClick={() => onOpen(r.id)}>
-                  {short(r.id)}
-                </button>
-              </td>
-              <td className="py-1 pr-2">{r.agent_name}</td>
-              <td className="py-1 pr-2">
-                <StatusBadge status={r.status} />
-              </td>
-              <td className="py-1 pr-2 text-gray-600">{new Date(r.started_at).toLocaleString()}</td>
-              <td className="py-1 pr-2">{r.span_count}</td>
-              <td className="py-1 pr-2">
-                {r.input_tokens}/{r.output_tokens}
-              </td>
+    <Page
+      title="Runs"
+      sub="Every agent execution, newest first. Open one for its full trace."
+      actions={
+        <>
+          <Select aria-label="Filter by status" value={status} onChange={(e) => setStatus(e.target.value)}>
+            <option value="">all statuses</option>
+            <option value="running">running</option>
+            <option value="success">success</option>
+            <option value="failed">failed</option>
+            <option value="cancelled">cancelled</option>
+          </Select>
+          <Button onClick={() => load(null, true)}>Refresh</Button>
+        </>
+      }
+    >
+      {runs.length > 0 && (
+        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <Stat label="Loaded" value={runs.length} />
+          <Stat label="Failed" value={counts.failed ?? 0} hint="in this page" />
+          <Stat label="Running" value={counts.running ?? 0} hint="in this page" />
+          <Stat label="Denied spans" value={counts.denied ?? 0} hint="in this page" />
+        </div>
+      )}
+      {error && <Alert>{error}</Alert>}
+      {runs.length === 0 && !loading ? (
+        <Empty hint="No runs yet. Run the demo agent to create one." />
+      ) : (
+        <Table>
+          <thead>
+            <tr>
+              <Th>Run</Th>
+              <Th>Agent</Th>
+              <Th>Status</Th>
+              <Th>Started</Th>
+              <Th>Spans</Th>
+              <Th>Tokens in/out</Th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {runs.map((r) => (
+              <tr key={r.id} className="transition-colors hover:bg-ink-50/70">
+                <Td><LinkButton onClick={() => onOpen(r.id)}>{short(r.id)}</LinkButton></Td>
+                <Td>{r.agent_name}</Td>
+                <Td><StatusBadge status={r.status} /></Td>
+                <Td className="whitespace-nowrap text-ink-500">{new Date(r.started_at).toLocaleString()}</Td>
+                <Td>{r.span_count}</Td>
+                <Td className="whitespace-nowrap">{r.input_tokens}/{r.output_tokens}</Td>
+              </tr>
+            ))}
+          </tbody>
+        </Table>
+      )}
+      {loading && <Spinner />}
       <div className="mt-3">
         {cursor && (
-          <button className="rounded border px-3 py-1 text-sm" disabled={loading} onClick={() => load(cursor)}>
+          <Button disabled={loading} onClick={() => load(cursor)}>
             Load more
-          </button>
+          </Button>
         )}
       </div>
-    </div>
+    </Page>
   );
 }
 
-function SpanRow({
-  node,
-  depth,
-  selected,
-  onSelect
-}: {
+function SpanRow({ node, depth, selected, onSelect, base, maxEnd }: {
   node: SpanNode;
   depth: number;
   selected: string | null;
   onSelect: (id: string) => void;
+  base: number;
+  maxEnd: number;
 }) {
   const s = node.span;
+  const start = new Date(s.started_at).getTime() - base;
+  const dur = s.duration_ms ?? 0;
+  const left = maxEnd > 0 ? Math.min(96, (start / maxEnd) * 100) : 0;
+  const width = maxEnd > 0 && dur > 0 ? Math.max(1.5, Math.min(100 - left, (dur / maxEnd) * 100)) : 1.5;
+  const barTone =
+    s.status === "failed" || s.status === "denied" ? "bg-bad-700/70"
+    : s.operation_type.includes("tool") ? "bg-brand-500/70"
+    : "bg-ink-300";
   return (
     <>
       <button
-        className={`flex w-full items-center gap-2 rounded px-2 py-1 text-left text-sm hover:bg-gray-100 ${
-          selected === s.id ? "bg-blue-50" : ""
+        className={`block w-full rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-ink-50 ${
+          selected === s.id ? "bg-brand-50 ring-1 ring-brand-200" : ""
         }`}
         style={{ paddingLeft: `${depth * 1.25 + 0.5}rem` }}
         onClick={() => onSelect(s.id)}
       >
-        <StatusBadge status={s.status} />
-        <span className="font-mono">{s.operation_type}</span>
-        {s.model && <span className="text-gray-600">{s.model}</span>}
-        {s.duration_ms != null && <span className="text-gray-400">{s.duration_ms}ms</span>}
-        {s.error_type && <span className="text-red-600">{s.error_type}</span>}
+        <span className="flex items-center gap-2 text-sm">
+          <StatusBadge status={s.status} />
+          <span className="font-mono font-medium text-ink-800">{s.operation_type}</span>
+          {s.model && <span className="truncate text-ink-500">{s.model}</span>}
+          {s.error_type && <span className="text-bad-700">{s.error_type}</span>}
+        </span>
+        <span className="tg-track mt-1 block h-1.5 w-full" aria-hidden="true">
+          <span className={`tg-bar block h-1.5 ${barTone}`} style={{ marginLeft: `${left}%`, width: `${width}%` }} />
+        </span>
       </button>
       {node.children.map((c) => (
-        <SpanRow key={c.span.id} node={c} depth={depth + 1} selected={selected} onSelect={onSelect} />
+        <SpanRow key={c.span.id} node={c} depth={depth + 1} selected={selected} onSelect={onSelect} base={base} maxEnd={maxEnd} />
       ))}
     </>
   );
@@ -207,8 +215,8 @@ function SpanDetail({ span }: { span: Span }) {
   // names the cause; the label only says denied.
   const denialCause =
     (span.attributes?.reason as string | undefined) ?? span.error_type ?? "policy";
-  const rows: [string, string][] = [
-    ["Operation", span.operation_type],
+  const rows: [string, React.ReactNode][] = [
+    ["Operation", <span className="font-mono">{span.operation_type}</span>],
     ["Status", span.status === "denied" ? `denied by ${denialCause}` : span.status],
     ["Started", new Date(span.started_at).toLocaleString()],
     ["Duration", span.duration_ms != null ? `${span.duration_ms} ms` : "n/a"],
@@ -219,23 +227,23 @@ function SpanDetail({ span }: { span: Span }) {
     ["Error", span.error_type ?? "none"]
   ];
   return (
-    <div className="rounded border p-3 text-sm">
-      <h3 className="mb-2 font-semibold">Span {short(span.id)}</h3>
+    <Card className="p-4 text-sm">
+      <h3 className="mb-2 font-mono font-semibold text-ink-900">span {short(span.id)}</h3>
       <dl>
         {rows.map(([k, v]) => (
-          <div key={k} className="flex gap-2 border-b py-1 last:border-0">
-            <dt className="w-28 shrink-0 text-gray-500">{k}</dt>
-            <dd className="font-mono">{v}</dd>
+          <div key={k} className="flex gap-3 border-b border-ink-100 py-1.5 last:border-0">
+            <dt className="w-28 shrink-0 text-ink-400">{k}</dt>
+            <dd className="text-ink-800">{v}</dd>
           </div>
         ))}
       </dl>
       <details className="mt-2">
-        <summary className="cursor-pointer text-gray-600">attributes</summary>
-        <pre className="mt-1 overflow-auto rounded bg-gray-50 p-2 text-xs">
+        <summary className="cursor-pointer text-sm text-ink-500">attributes</summary>
+        <pre className="mt-1 max-h-64 overflow-auto rounded-lg bg-ink-950 p-3 font-mono text-xs text-ink-100">
           {JSON.stringify(span.attributes, null, 2)}
         </pre>
       </details>
-    </div>
+    </Card>
   );
 }
 
@@ -260,121 +268,145 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
 
   if (error) {
     return (
-      <div className="p-4">
-        <p className="text-sm text-red-700">{error}</p>
-        <button className="mt-2 text-blue-700 underline" onClick={onBack}>
-          Back to runs
-        </button>
-      </div>
+      <Page title="Trace">
+        <Alert>{error}</Alert>
+        <Button onClick={onBack}>Back to runs</Button>
+      </Page>
     );
   }
-  if (!run) return <p className="p-4 text-sm text-gray-500">Loading trace...</p>;
+  if (!run) {
+    return (
+      <Page title="Trace"><Spinner label="Loading trace..." /></Page>
+    );
+  }
 
   const roots = buildTree(spans);
   const totals = tokenTotal(spans);
   const selectedSpan = spans.find((s) => s.id === selected) ?? null;
+  const base = spans.length
+    ? Math.min(...spans.map((s) => new Date(s.started_at).getTime()))
+    : 0;
+  const maxEnd = spans.length
+    ? Math.max(...spans.map((s) => new Date(s.started_at).getTime() + (s.duration_ms ?? 0))) - base
+    : 0;
 
   return (
-    <div className="p-4">
-      <button className="mb-2 text-sm text-blue-700 underline" onClick={onBack}>
-        Back to runs
-      </button>
-      <div className="mb-3 flex flex-wrap items-center gap-3">
-        <h2 className="font-mono text-lg font-semibold">{short(run.id)}</h2>
+    <Page
+      title={short(run.id)}
+      sub={`${run.agent_name ?? "unknown agent"} · started ${new Date(run.started_at).toLocaleString()}`}
+      actions={<Button onClick={onBack}>Back to runs</Button>}
+    >
+      <div className="mb-4 flex flex-wrap items-center gap-2">
         <StatusBadge status={run.status} />
-        <span className="text-sm text-gray-600">{run.agent_name}</span>
-        <span className="text-sm text-gray-600">
-          {totals.input} in / {totals.output} out
-        </span>
-        {cost && <span className="text-sm text-gray-600">est. {cost}</span>}
-        {run.error_type && <span className="text-sm text-red-600">{run.error_type}</span>}
+        {run.error_type && <Badge tone="bad">{run.error_type}</Badge>}
+        <span className="tg-nums text-sm text-ink-500">{totals.input} in / {totals.output} out</span>
+        {cost && <span className="tg-nums text-sm text-ink-500">est. {cost}</span>}
       </div>
-      <div className="grid gap-4 md:grid-cols-2">
-        <div>
+      <div className="grid items-start gap-4 lg:grid-cols-2">
+        <Card className="space-y-0.5 p-2">
           {roots.map((n) => (
-            <SpanRow key={n.span.id} node={n} depth={0} selected={selected} onSelect={setSelected} />
+            <SpanRow key={n.span.id} node={n} depth={0} selected={selected} onSelect={setSelected} base={base} maxEnd={maxEnd} />
           ))}
-          {roots.length === 0 && <p className="text-sm text-gray-500">No spans recorded.</p>}
+          {roots.length === 0 && <p className="p-2 text-sm text-ink-500">No spans recorded.</p>}
+        </Card>
+        <div className="lg:sticky lg:top-4">
+          {selectedSpan ? (
+            <SpanDetail span={selectedSpan} />
+          ) : (
+            <Empty hint="Select a span to inspect its timing, tokens, and error." />
+          )}
         </div>
-        <div>{selectedSpan ? <SpanDetail span={selectedSpan} /> : <p className="text-sm text-gray-500">Select a span.</p>}</div>
       </div>
-    </div>
+    </Page>
   );
 }
 
 export default function App() {
   const [openRun, setOpenRun] = useState<string | null>(null);
-  const [tab, setTab] = useState<"runs" | "evals" | "policy" | "approvals" | "webhooks" | "retention" | "costs">("runs");
+  const [tab, setTab] = useState<Tab>("runs");
   const [settingsTick, setSettingsTick] = useState(0);
+  const [drawer, setDrawer] = useState(false);
+  const [connected, setConnected] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    fetch(`${settings.url}/healthz`)
+      .then((r) => setConnected(r.ok))
+      .catch(() => setConnected(false));
+  }, [settingsTick]);
+
+  const go = (t: Tab) => {
+    setOpenRun(null);
+    setTab(t);
+  };
+
   return (
-    <div className="min-h-screen bg-white text-gray-900">
-      <header className="flex items-center gap-4 border-b px-4 py-2">
-        <h1 className="text-xl font-bold">TraceGuard</h1>
-        <nav className="flex gap-2 text-sm">
-          <button
-            className={`rounded px-2 py-1 ${tab === "runs" ? "bg-gray-800 text-white" : "border"}`}
-            onClick={() => setTab("runs")}
-          >
-            Runs
-          </button>
-          <button
-            className={`rounded px-2 py-1 ${tab === "evals" ? "bg-gray-800 text-white" : "border"}`}
-            onClick={() => setTab("evals")}
-          >
-            Evaluations
-          </button>
-          <button
-            className={`rounded px-2 py-1 ${tab === "policy" ? "bg-gray-800 text-white" : "border"}`}
-            onClick={() => setTab("policy")}
-          >
-            Policy
-          </button>
-          <button
-            className={`rounded px-2 py-1 ${tab === "approvals" ? "bg-gray-800 text-white" : "border"}`}
-            onClick={() => setTab("approvals")}
-          >
-            Approvals
-          </button>
-          <button
-            className={`rounded px-2 py-1 ${tab === "webhooks" ? "bg-gray-800 text-white" : "border"}`}
-            onClick={() => setTab("webhooks")}
-          >
-            Webhooks
-          </button>
-          <button
-            className={`rounded px-2 py-1 ${tab === "retention" ? "bg-gray-800 text-white" : "border"}`}
-            onClick={() => setTab("retention")}
-          >
-            Retention
-          </button>
-          <button
-            className={`rounded px-2 py-1 ${tab === "costs" ? "bg-gray-800 text-white" : "border"}`}
-            onClick={() => setTab("costs")}
-          >
-            Costs
-          </button>
+    <div className="flex min-h-screen">
+      <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col bg-ink-950 text-ink-200">
+        <div className="flex items-center gap-2 px-5 pb-5 pt-6">
+          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand-600 font-mono text-sm font-bold text-white">
+            TG
+          </span>
+          <div>
+            <div className="text-[15px] font-semibold tracking-tight text-white">TraceGuard</div>
+            <div className="text-[11px] text-ink-400">agent control plane</div>
+          </div>
+        </div>
+        <nav className="flex flex-col gap-0.5 px-3" aria-label="Primary">
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              onClick={() => go(t.id)}
+              aria-current={tab === t.id && !openRun ? "page" : undefined}
+              className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors ${
+                tab === t.id && !openRun
+                  ? "bg-white/10 font-medium text-white"
+                  : "text-ink-300 hover:bg-white/5 hover:text-white"
+              }`}
+            >
+              <NavIcon name={t.id} />
+              {t.label}
+            </button>
+          ))}
         </nav>
-      </header>
-      <SettingsBar onSaved={() => setSettingsTick((t) => t + 1)} />
-      <main key={settingsTick}>
-        {tab === "evals" ? (
-          <EvalsView onOpenRun={(id) => { setOpenRun(id); setTab("runs"); }} />
-        ) : tab === "policy" ? (
-          <PoliciesView />
-        ) : tab === "approvals" ? (
-          <ApprovalsView />
-        ) : tab === "webhooks" ? (
-          <WebhooksView />
-        ) : tab === "retention" ? (
-          <RetentionView />
-        ) : tab === "costs" ? (
-          <CostsView />
-        ) : openRun ? (
-          <TraceView runId={openRun} onBack={() => setOpenRun(null)} />
-        ) : (
-          <RunsList onOpen={setOpenRun} />
-        )}
-      </main>
+        <div className="mt-auto p-4">
+          <button
+            onClick={() => setDrawer(true)}
+            className="flex w-full items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-left text-xs text-ink-300 hover:bg-white/5"
+          >
+            <span
+              className={`inline-block h-2 w-2 rounded-full ${
+                connected === null ? "bg-ink-400" : connected ? "bg-green-400" : "bg-red-400"
+              }`}
+              aria-hidden="true"
+            />
+            <span className="truncate">
+              {connected === null ? "checking API..." : connected ? settings.url : "API unreachable"}
+            </span>
+          </button>
+        </div>
+      </aside>
+      <div className="min-w-0 flex-1">
+        <main key={settingsTick}>
+          {tab === "evals" ? (
+            <EvalsView onOpenRun={(id) => { setOpenRun(id); setTab("runs"); }} />
+          ) : tab === "policy" ? (
+            <PoliciesView />
+          ) : tab === "approvals" ? (
+            <ApprovalsView />
+          ) : tab === "webhooks" ? (
+            <WebhooksView />
+          ) : tab === "retention" ? (
+            <RetentionView />
+          ) : tab === "costs" ? (
+            <CostsView />
+          ) : openRun ? (
+            <TraceView runId={openRun} onBack={() => setOpenRun(null)} />
+          ) : (
+            <RunsList onOpen={setOpenRun} />
+          )}
+        </main>
+      </div>
+      <ConnectionDrawer open={drawer} onClose={() => setDrawer(false)} onSaved={() => setSettingsTick((t) => t + 1)} />
     </div>
   );
 }
