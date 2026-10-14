@@ -267,7 +267,24 @@ export interface RetentionRun {
   status: string;
 }
 
+export interface CompareRow {
+  provider: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  estimated_micro: number;
+  actual_micro: number | null;
+  variance_micro: number | null;
+  variance_pct: number | null;
+  missing_pricing: boolean;
+}
+
 export const opsApi = {
+  compareCosts: (periodStart: string, periodEnd: string, provider?: string) =>
+    get<{ period_start: string; period_end: string; rows: CompareRow[] }>(
+      `/v1/reconciliation/compare?period_start=${encodeURIComponent(periodStart)}&period_end=${encodeURIComponent(periodEnd)}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}`),
+  importActuals: (rows: Record<string, unknown>[]) =>
+    postApi<{ accepted: number }>("/v1/reconciliation/actuals", { rows }),
   webhooks: () => get<{ items: Webhook[] }>("/v1/webhooks"),
   createWebhook: (w: Record<string, unknown>) => postApi<Webhook>("/v1/webhooks", w),
   deleteWebhook: (id: string) => deleteApi<{ ok: boolean }>(`/v1/webhooks/${id}`),

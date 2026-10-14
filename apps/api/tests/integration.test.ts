@@ -373,6 +373,40 @@ describe("integration and security", () => {
     expect(jsonAgain.json()).toMatchObject({ accepted: 0, duplicates: 1 });
   });
 
+  it("reconciles estimates against provider actuals", async () => {
+    const prov = `rp-${tag}`;
+    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+      payload: { provider: prov, model: "m1", input_price_per_million: 2000000,
+        output_price_per_million: 8000000 } });
+    // Estimated: (1000*2M + 200*8M)/1M = 3600 micro. Actual billed: 4000.
+    const runId = randomUUID();
+    const spanId = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [{
+        schema_version: "1", event_id: `evt-${randomUUID()}`, agent_name: `rec-${tag}`,
+        run_id: runId, span_id: spanId, parent_span_id: null, event_type: "model.request",
+        timestamp: new Date().toISOString(), status: "success",
+        provider: prov, model: "m1", input_tokens: 1000, output_tokens: 200,
+        usage_source: "provider_reported", attributes: {} }] } });
+    const imp = await api.inject({ method: "POST", url: "/v1/reconciliation/actuals", headers: key,
+      payload: { rows: [{
+        provider: prov, model: "m1",
+        period_start: new Date(Date.now() - 86400000).toISOString(),
+        period_end: new Date(Date.now() + 86400000).toISOString(),
+        input_tokens: 1000, output_tokens: 200, actual_cost_micro: 4000,
+        source: "provider-export.csv" }] } });
+    expect(imp.statusCode).toBe(201);
+    const cmp = await api.inject({ method: "GET",
+      url: `/v1/reconciliation/compare?provider=${prov}&period_start=${new Date(Date.now() - 2 * 86400000).toISOString()}&period_end=${new Date(Date.now() + 2 * 86400000).toISOString()}`,
+      headers: key });
+    const row = cmp.json().rows.find((r: { model: string }) => r.model === "m1");
+    expect(row.estimated_micro).toBe(3600);
+    expect(row.actual_micro).toBe(4000);
+    expect(row.variance_micro).toBe(-400);
+    expect(row.variance_pct).toBeCloseTo(-0.1);
+    expect(row.missing_pricing).toBe(false);
+  });
+
   it("keeps the audit hash chain linked", async () => {
     const rows = await pool.query("SELECT hash, prev_hash FROM audit_events ORDER BY timestamp ASC, id ASC LIMIT 200");
     expect(rows.rows.length).toBeGreaterThan(0);
