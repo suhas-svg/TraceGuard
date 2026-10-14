@@ -42,7 +42,8 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
   estimates per model and period, with a Costs tab showing variance.
 - Users with scoped keys: first registration bootstraps the admin, then
   member keys ingest and call tools while approver keys decide. Memberships
-  confine member writes to their workspaces; reads stay global.
+  confine member writes and reads to their workspaces; foreign ids read as
+  missing.
 - `GET /healthz`, `GET /readyz` report liveness and database state.
 - Python SDK sends events over HTTP with a bounded queue and never raises into the agent.
 - TypeScript SDK (`@traceguard/sdk`, zero dependencies) mirrors it: events, budget guard, flush.

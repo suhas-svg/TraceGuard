@@ -281,7 +281,9 @@ export function registerBudgetRoutes(app: FastifyInstance) {
   app.get("/v1/runs/:id/usage", async (req, reply) => {
     const { id } = req.params as { id: string };
     const run = await pool.query("SELECT * FROM runs WHERE id = $1", [id]);
-    if (!run.rows[0]) return reply.code(404).send({ error: "run_not_found" });
+    if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id)) {
+      return reply.code(404).send({ error: "run_not_found" });
+    }
     const spans = await pool.query(
       `SELECT s.id, s.operation_type, s.provider, s.model, s.input_tokens, s.output_tokens,
               s.started_at, p.id AS pricing_id,

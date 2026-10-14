@@ -53,8 +53,8 @@ const ROUTES: [string, string][] = [
   ["/v1/evaluations/runs/", "read"],
   ["/v1/webhooks/deliveries", "read"],
   ["/v1/evaluations", "admin"],
-  ["/v1/policies", "admin"],
-  ["/v1/servers", "admin"],
+  ["/v1/policies", "read"],
+  ["/v1/servers", "read"],
   ["/v1/budgets", "admin"],
   ["/v1/pricing", "admin"],
   ["/v1/webhooks", "admin"],
@@ -145,6 +145,17 @@ export async function resolvePrincipal(authHeader: string): Promise<Principal | 
 
 export function forbidden(reply: FastifyReply, scope: string) {
   return reply.code(403).send({ error: "forbidden", required_scope: scope });
+}
+
+// Appends a workspace membership predicate for list queries. Unrestricted
+// principals add nothing; everyone else sees only their own rows. An empty
+// membership matches nothing, so strangers see an empty list, not an error.
+export function scopeClause(
+  principal: Principal | undefined, params: unknown[], column: string
+): string | null {
+  if (!principal || principal.workspaces === "all") return null;
+  params.push(principal.workspaces);
+  return `${column} = ANY($${params.length})`;
 }
 
 // Write-path guard. Admins and env keys pass; everyone else must belong to

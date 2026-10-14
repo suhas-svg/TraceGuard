@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
+import { workspaceAllowed } from "./auth.js";
 import { estimateCostMicro } from "./cost.js";
 import { runAssertion } from "./assertions.js";
 import { notify } from "./notify.js";
@@ -264,8 +265,14 @@ export function registerEvalRoutes(app: FastifyInstance) {
 
   app.get("/v1/evaluations/runs/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
-    const run = await pool.query("SELECT * FROM eval_runs WHERE id = $1", [id]);
-    if (!run.rows[0]) return reply.code(404).send({ error: "eval_run_not_found" });
+    const run = await pool.query(
+      `SELECT er.*, a.workspace_id FROM eval_runs er
+       LEFT JOIN agents a ON a.id = er.agent_id WHERE er.id = $1`, [id]);
+    // Runs whose agent lives elsewhere read as missing. Suites and cases
+    // stay shared templates with no workspace of their own.
+    if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id ?? "")) {
+      return reply.code(404).send({ error: "eval_run_not_found" });
+    }
     const results = await pool.query(
       `SELECT r.*, c.name AS case_name FROM eval_results r
        JOIN eval_cases c ON c.id = r.case_id
@@ -280,7 +287,12 @@ export function registerEvalRoutes(app: FastifyInstance) {
     const q = req.query as { ids?: string };
     const ids = (q.ids ?? "").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 5);
     if (ids.length < 2) return reply.code(400).send({ error: "need_two_ids" });
-    const runs = await pool.query("SELECT * FROM eval_runs WHERE id = ANY($1)", [ids]);
+    const runs = await pool.query(
+      `SELECT er.* FROM eval_runs er LEFT JOIN agents a ON a.id = er.agent_id
+       WHERE er.id = ANY($1)${req.principal?.workspaces === "all" ? "" : " AND a.workspace_id = ANY($2)"}`,
+      req.principal?.workspaces === "all" ? [ids] : [ids, req.principal?.workspaces ?? []]);
+    // Anything outside the caller's workspaces reads as missing, so a
+    // compare cannot launder another team's numbers.
     if (runs.rows.length !== ids.length) return reply.code(404).send({ error: "eval_run_not_found" });
     const out = [];
     for (const r of runs.rows) {
