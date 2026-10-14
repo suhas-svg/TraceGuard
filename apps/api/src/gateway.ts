@@ -13,7 +13,7 @@ import {
 } from "./policy.js";
 import { callUpstreamTool, checkUpstreamUrl, definitionHash, discoverTools } from "./upstream.js";
 import { hashesEqual, parseKey, seal, tryOpen } from "./seal.js";
-import { authHook, workspaceAllowed } from "./auth.js";
+import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
 import { notify } from "./notify.js";
 
 const API_KEY = process.env.API_KEY ?? "";
@@ -117,10 +117,13 @@ export function buildGateway() {
     }
   });
 
-  app.get("/v1/servers", async () => {
+  app.get("/v1/servers", async (req) => {
     // auth_secret is never selected here, so reads cannot leak it.
+    const params: unknown[] = [];
+    const scope = scopeClause(req.principal, params, "workspace_id");
     const res = await pool.query(
-      "SELECT id, workspace_id, name, base_url, created_at FROM mcp_servers ORDER BY created_at DESC"
+      `SELECT id, workspace_id, name, base_url, created_at FROM mcp_servers
+       ${scope ? `WHERE ${scope}` : ""} ORDER BY created_at DESC`, params
     );
     return { items: res.rows };
   });
@@ -231,6 +234,8 @@ export function buildGateway() {
       where.push(`server_id = $${params.length}`);
     }
     if (q.all === "true") where.shift();
+    const scope = scopeClause(req.principal, params, "workspace_id");
+    if (scope) where.push(scope);
     const res = await pool.query(
       `SELECT * FROM policies ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY priority DESC, created_at DESC`,
       params
@@ -456,6 +461,10 @@ export function buildGateway() {
       params.push(q.status);
       where.push(`status = $${params.length}`);
     }
+    // Approvers open plaintext here, so the list itself must already be
+    // confined to their workspaces.
+    const ascope = scopeClause(req.principal, params, "workspace_id");
+    if (ascope) where.push(ascope);
     params.push(limit);
     const res = await pool.query(
       `SELECT * FROM approvals ${where.length ? "WHERE " + where.join(" AND ") : ""}
@@ -490,6 +499,11 @@ export function buildGateway() {
       if (approval.status !== "pending") {
         await client.query("ROLLBACK");
         return reply.code(409).send({ error: "approval_not_pending", status: approval.status });
+      }
+      // Approvals from other workspaces read as missing here too.
+      if (!workspaceAllowed(req.principal, approval.workspace_id)) {
+        await client.query("ROLLBACK");
+        return reply.code(404).send({ error: "approval_not_found" });
       }
       if (new Date(approval.expires_at).getTime() < Date.now()) {
         await client.query("UPDATE approvals SET status='expired' WHERE id=$1", [id]);
@@ -535,6 +549,8 @@ export function buildGateway() {
       params.push(q.tool);
       where.push(`tool_name = $${params.length}`);
     }
+    const dscope = scopeClause(req.principal, params, "workspace_id");
+    if (dscope) where.push(dscope);
     params.push(limit);
     const res = await pool.query(
       `SELECT * FROM policy_decisions ${where.length ? "WHERE " + where.join(" AND ") : ""}

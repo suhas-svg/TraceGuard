@@ -528,6 +528,53 @@ describe("integration and security", () => {
     expect(names).not.toContain(`ws-b-${tag}`);
   });
 
+  it("scopes reads to member workspaces", async () => {
+    // Reuse the ws-a/ws-b member from the write test via fresh fixtures.
+    const wsA = await api.inject({ method: "POST", url: "/v1/workspaces", headers: key,
+      payload: { name: `rs-a-${tag}` } });
+    const wsB = await api.inject({ method: "POST", url: "/v1/workspaces", headers: key,
+      payload: { name: `rs-b-${tag}` } });
+    const mu = await api.inject({ method: "POST", url: "/v1/users", headers: key,
+      payload: { email: `rs-${tag}@example.com`, password: "long-password-666", role: "member" } });
+    const memberId = mu.json().id;
+    await api.inject({ method: "POST", url: `/v1/users/${memberId}/memberships`,
+      headers: key, payload: { workspace_id: wsA.json().id } });
+    const kc = await api.inject({ method: "POST", url: `/v1/users/${memberId}/keys`, headers: key,
+      payload: { name: "reader", scopes: ["read", "ingest"] } });
+    const reader = { authorization: `Bearer ${kc.json().key}` };
+    const evt = (ws: string) => ({
+      schema_version: "1", event_id: `evt-${randomUUID()}`, agent_name: `rs-${tag}`,
+      run_id: randomUUID(), span_id: randomUUID(), event_type: "run.started",
+      workspace_name: ws, timestamp: new Date().toISOString(), attributes: {}
+    });
+    // One run per workspace, ingested as admin so both exist.
+    for (const ws of [`rs-a-${tag}`, `rs-b-${tag}`]) {
+      await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+        payload: { events: [evt(ws)] } });
+    }
+    const listed = await api.inject({ method: "GET", url: "/v1/runs?limit=200", headers: reader });
+    expect(listed.json().items.length).toBeGreaterThan(0);
+    // Every listed run must belong to ws-a.
+    for (const r of listed.json().items.filter((x: { agent_name: string }) => x.agent_name === `rs-${tag}`)) {
+      expect(r.workspace_id).toBe(wsA.json().id);
+    }
+    const foreign = listed.json().items.find((x: { agent_name: string }) => x.agent_name === `rs-${tag}` && x.workspace_id === wsB.json().id);
+    expect(foreign).toBeUndefined();
+    // Direct detail, trace, and usage on the foreign run read as missing.
+    const adminList = await api.inject({ method: "GET", url: "/v1/runs?limit=200", headers: key });
+    const foreignRun = adminList.json().items.find((x: { workspace_id: string }) => x.workspace_id === wsB.json().id);
+    expect(foreignRun).toBeDefined();
+    for (const url of [`/v1/runs/${foreignRun.id}`, `/v1/runs/${foreignRun.id}/trace`, `/v1/runs/${foreignRun.id}/usage`]) {
+      const res = await api.inject({ method: "GET", url, headers: reader });
+      expect(res.statusCode).toBe(404);
+    }
+    // Servers and policies from the other workspace stay hidden too.
+    const srv = await gw.inject({ method: "GET", url: "/v1/servers", headers: reader });
+    expect(srv.json().items.every((s: { workspace_id: string }) => s.workspace_id !== wsB.json().id)).toBe(true);
+    const pol = await gw.inject({ method: "GET", url: "/v1/policies", headers: reader });
+    expect(pol.json().items.every((p: { workspace_id: string }) => p.workspace_id !== wsB.json().id)).toBe(true);
+  });
+
   it("keeps the audit hash chain linked", async () => {
     const rows = await pool.query("SELECT hash, prev_hash FROM audit_events ORDER BY timestamp ASC, id ASC LIMIT 200");
     expect(rows.rows.length).toBeGreaterThan(0);

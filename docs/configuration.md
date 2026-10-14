@@ -56,4 +56,12 @@ full access; everyone else belongs to workspaces through memberships:
 Ingest, OTLP, gateway calls, and budget reserve/settle/release all check
 the target workspace and answer 403 `workspace_forbidden` outside it.
 Member keys cannot auto-create workspaces by naming new ones; unknown names
-are denied, not conjured. Reads stay global across the install.
+are denied, not conjured.
+
+Reads are scoped the same way. Run lists, run detail, traces, usage,
+servers, policies, approvals, decisions, and eval runs show only the
+caller's workspaces; foreign ids read as 404 so they cannot be probed.
+Registry reads (servers, policies) need only read scope, while every write
+to them stays admin. Eval suites and cases are shared templates with no
+workspace. Audit, deliveries, retention history, and actuals import stay
+admin-only.

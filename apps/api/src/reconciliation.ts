@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
+import { workspaceAllowed } from "./auth.js";
 
 // Reconciliation answers one question: do our estimates match what the
 // provider says we spent? Actuals are imported operator records. Estimates
@@ -91,6 +92,12 @@ export function registerReconciliationRoutes(app: FastifyInstance) {
     const client = await pool.connect();
     try {
       const workspaceId = await defaultWorkspaceId(client);
+      // The comparison covers the default workspace only; members outside
+      // it get a denial, not another team's numbers.
+      if (!workspaceAllowed(req.principal, workspaceId)) {
+        client.release();
+        return reply.code(403).send({ error: "workspace_forbidden" });
+      }
       const params: unknown[] = [workspaceId, q.period_start, q.period_end];
       const filter: string[] = [];
       if (q.provider) {

@@ -9,7 +9,7 @@ import { registerRetentionRoutes } from "./retention.js";
 import { registerReconciliationRoutes } from "./reconciliation.js";
 import { attrsToObject, mapOtlpSpan, type OtlpSpan } from "./otlp.js";
 import { decodeTraceRequest, encodeEmptyTraceResponse } from "./otlp_proto.js";
-import { authHook, workspaceAllowed } from "./auth.js";
+import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
 import { registerUserRoutes } from "./users.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -194,6 +194,10 @@ export function buildApp() {
       params.push(q.cursor);
       where.push(`r.started_at < (SELECT started_at FROM runs WHERE id = $${params.length})`);
     }
+    // Members list only their own workspaces; the dashboard never sees
+    // another team's runs.
+    const scope = scopeClause(req.principal, params, "r.workspace_id");
+    if (scope) where.push(scope);
     params.push(limit + 1);
     const rows = await pool.query(
       `SELECT r.*, a.name AS agent_name,
@@ -216,14 +220,19 @@ export function buildApp() {
   app.get("/v1/runs/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
     const res = await pool.query("SELECT * FROM runs WHERE id = $1", [id]);
-    if (!res.rows[0]) return reply.code(404).send({ error: "run_not_found" });
+    // Foreign runs read as missing, so ids cannot probe other workspaces.
+    if (!res.rows[0] || !workspaceAllowed(req.principal, res.rows[0].workspace_id)) {
+      return reply.code(404).send({ error: "run_not_found" });
+    }
     return res.rows[0];
   });
 
   app.get("/v1/runs/:id/trace", async (req, reply) => {
     const { id } = req.params as { id: string };
     const run = await pool.query("SELECT * FROM runs WHERE id = $1", [id]);
-    if (!run.rows[0]) return reply.code(404).send({ error: "run_not_found" });
+    if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id)) {
+      return reply.code(404).send({ error: "run_not_found" });
+    }
     const spans = await pool.query("SELECT * FROM spans WHERE run_id = $1 ORDER BY started_at ASC", [
       id
     ]);
