@@ -39,3 +39,21 @@ admin because no users exist yet, then create users and keys:
 Agent keys carry gateway scope at most, so they can ingest and call tools
 but never approve. Writes default to admin unless the path is an explicit
 agent or approver action. Passwords hash with scrypt, keys with SHA-256.
+
+## Workspace membership
+
+Keys write only inside the owner's workspaces. Admins and env keys keep
+full access; everyone else belongs to workspaces through memberships:
+
+- `POST /v1/workspaces {name}` creates one (admin).
+- `GET /v1/workspaces` lists all for admins, only their own for members.
+- `POST /v1/users/:id/memberships {workspace_id}` grants, the DELETE
+  variant revokes (admin).
+- `POST /v1/users/:id/keys` accepts an optional `workspace_id` pin. The pin
+  must be one of the owner's memberships, otherwise creation fails loudly
+  instead of minting a key that can write nowhere.
+
+Ingest, OTLP, gateway calls, and budget reserve/settle/release all check
+the target workspace and answer 403 `workspace_forbidden` outside it.
+Member keys cannot auto-create workspaces by naming new ones; unknown names
+are denied, not conjured. Reads stay global across the install.

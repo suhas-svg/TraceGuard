@@ -17,6 +17,8 @@ export interface Principal {
   kind: "env" | "user";
   userId: string | null;
   scopes: string[];
+  // Workspaces this principal may write into. "all" is env keys and admins.
+  workspaces: "all" | string[];
 }
 
 // Writes that non-admin actors may perform. Everything else that mutates
@@ -61,6 +63,7 @@ const ROUTES: [string, string][] = [
   ["/v1/reconciliation/compare", "read"],
   ["/v1/admin/", "admin"],
   ["/v1/users", "admin"],
+  ["/v1/workspaces", "read"],
   ["/v1/auth/", "admin"]
 ];
 
@@ -105,14 +108,15 @@ export async function resolvePrincipal(authHeader: string): Promise<Principal | 
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
   if (!token) return null;
   if (process.env.API_KEY && token === process.env.API_KEY) {
-    return { kind: "env", userId: null, scopes: ALL_SCOPES };
+    return { kind: "env", userId: null, scopes: ALL_SCOPES, workspaces: "all" };
   }
   if (process.env.APPROVER_KEY && token === process.env.APPROVER_KEY) {
-    return { kind: "env", userId: null, scopes: ["approve", "read"] };
+    return { kind: "env", userId: null, scopes: ["approve", "read"], workspaces: "all" };
   }
   const hash = createHash("sha256").update(token).digest("hex");
   const res = await pool.query(
-    `SELECT k.user_id, k.scopes, k.expires_at, u.role FROM api_keys k
+    `SELECT k.user_id, k.scopes, k.expires_at, k.workspace_id AS key_workspace,
+            u.role FROM api_keys k
      JOIN users u ON u.id = k.user_id WHERE k.key_hash = $1`,
     [hash]
   );
@@ -121,13 +125,34 @@ export async function resolvePrincipal(authHeader: string): Promise<Principal | 
   if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) return null;
   const roleScopes = ROLE_SCOPES[row.role] ?? [];
   const scopes = ((row.scopes ?? []) as string[]).filter((s) => roleScopes.includes(s));
+  let workspaces: "all" | string[];
+  if (row.role === "admin") {
+    workspaces = "all";
+  } else {
+    const mem = await pool.query("SELECT workspace_id FROM memberships WHERE user_id = $1",
+      [row.user_id]);
+    const mine = mem.rows.map((r) => r.workspace_id as string);
+    // A pinned key narrows to one workspace; a pin outside the owner's
+    // memberships leaves the key with nowhere to write.
+    workspaces = row.key_workspace
+      ? (mine.includes(row.key_workspace) ? [row.key_workspace] : [])
+      : mine;
+  }
   await pool.query("UPDATE api_keys SET last_used_at = now() WHERE key_hash = $1", [hash])
     .catch(() => undefined);
-  return { kind: "user", userId: row.user_id, scopes };
+  return { kind: "user", userId: row.user_id, scopes, workspaces };
 }
 
 export function forbidden(reply: FastifyReply, scope: string) {
   return reply.code(403).send({ error: "forbidden", required_scope: scope });
+}
+
+// Write-path guard. Admins and env keys pass; everyone else must belong to
+// the target workspace. Denials name the workspace so operators see why.
+export function workspaceAllowed(principal: Principal | undefined, workspaceId: string): boolean {
+  if (!principal) return false;
+  if (principal.workspaces === "all") return true;
+  return principal.workspaces.includes(workspaceId);
 }
 
 declare module "fastify" {

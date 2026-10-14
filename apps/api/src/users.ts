@@ -71,9 +71,11 @@ export function registerUserRoutes(app: FastifyInstance) {
     const res = await pool.query(
       `SELECT u.id, u.email, u.role, u.created_at,
               COALESCE(json_agg(json_build_object('id', k.id, 'name', k.name,
-                'scopes', k.scopes, 'expires_at', k.expires_at,
-                'last_used_at', k.last_used_at)
-                ORDER BY k.created_at) FILTER (WHERE k.id IS NOT NULL), '[]') AS keys
+                'scopes', k.scopes, 'workspace_id', k.workspace_id,
+                'expires_at', k.expires_at, 'last_used_at', k.last_used_at)
+                ORDER BY k.created_at) FILTER (WHERE k.id IS NOT NULL), '[]') AS keys,
+              COALESCE((SELECT json_agg(workspace_id) FROM memberships m
+                WHERE m.user_id = u.id), '[]') AS workspaces
        FROM users u LEFT JOIN api_keys k ON k.user_id = u.id
        GROUP BY u.id ORDER BY u.created_at`);
     return { items: res.rows };
@@ -83,7 +85,8 @@ export function registerUserRoutes(app: FastifyInstance) {
     const parsed = z.object({
       name: z.string().min(1).max(128),
       scopes: z.array(z.enum(["admin", "ingest", "gateway", "approve", "read"])).min(1),
-      expires_days: z.number().int().min(1).max(365).default(90)
+      expires_days: z.number().int().min(1).max(365).default(90),
+      workspace_id: z.string().uuid().nullable().optional()
     }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_key" });
     const owner = await pool.query("SELECT id, role FROM users WHERE id = $1",
@@ -97,18 +100,31 @@ export function registerUserRoutes(app: FastifyInstance) {
       return reply.code(403).send({ error: "beyond_role" });
     }
     if (scopes.length === 0) return reply.code(400).send({ error: "no_allowed_scopes" });
+    let pin: string | null = parsed.data.workspace_id ?? null;
+    if (pin) {
+      const ws = await pool.query("SELECT id FROM workspaces WHERE id = $1", [pin]);
+      if (!ws.rows[0]) return reply.code(404).send({ error: "no_workspace" });
+      if (owner.rows[0].role !== "admin") {
+        const mem = await pool.query(
+          "SELECT 1 FROM memberships WHERE user_id = $1 AND workspace_id = $2",
+          [owner.rows[0].id, pin]);
+        // Pinning outside the owner's memberships would mint a key that can
+        // write nowhere, so refuse it loudly instead of silently.
+        if (!mem.rows[0]) return reply.code(403).send({ error: "owner_not_member" });
+      }
+    }
     const { plaintext, hash } = newKey();
     const expires = new Date(Date.now() + parsed.data.expires_days * 86400000);
     const created = await pool.query(
-      `INSERT INTO api_keys (user_id, name, key_hash, scopes, expires_at)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id, name, scopes, expires_at, created_at`,
+      `INSERT INTO api_keys (user_id, name, key_hash, scopes, workspace_id, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, scopes, workspace_id, expires_at, created_at`,
       [owner.rows[0].id, parsed.data.name, hash,
-       JSON.stringify(scopes), expires.toISOString()]
+       JSON.stringify(scopes), pin, expires.toISOString()]
     );
     await audit(pool, { actor_type: "user",
       actor_id: req.principal?.userId ?? undefined, action: "key.create",
       resource_type: "api_key", resource_id: created.rows[0].id,
-      result: "success", metadata: { scopes } });
+      result: "success", metadata: { scopes, workspace_id: pin } });
     // The plaintext leaves the server exactly once, here.
     return reply.code(201).send({ ...created.rows[0], key: plaintext });
   });
@@ -122,5 +138,68 @@ export function registerUserRoutes(app: FastifyInstance) {
       actor_id: req.principal?.userId ?? undefined, action: "key.revoke",
       resource_type: "api_key", resource_id: p.keyId, result: "success", metadata: {} });
     return { ok: true };
+  });
+
+  app.post("/v1/users/:id/memberships", async (req, reply) => {
+    const parsed = z.object({ workspace_id: z.string().uuid() }).safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_membership" });
+    const p = req.params as { id: string };
+    const owner = await pool.query("SELECT id FROM users WHERE id = $1", [p.id]);
+    if (!owner.rows[0]) return reply.code(404).send({ error: "no_user" });
+    const ws = await pool.query("SELECT id FROM workspaces WHERE id = $1",
+      [parsed.data.workspace_id]);
+    if (!ws.rows[0]) return reply.code(404).send({ error: "no_workspace" });
+    try {
+      await pool.query("INSERT INTO memberships (user_id, workspace_id) VALUES ($1, $2)",
+        [p.id, parsed.data.workspace_id]);
+    } catch {
+      return reply.code(409).send({ error: "already_member" });
+    }
+    await audit(pool, { actor_type: "user",
+      actor_id: req.principal?.userId ?? undefined, action: "membership.grant",
+      resource_type: "user", resource_id: p.id,
+      result: "success", metadata: { workspace_id: parsed.data.workspace_id } });
+    return reply.code(201).send({ ok: true });
+  });
+
+  app.delete("/v1/users/:id/memberships/:workspaceId", async (req, reply) => {
+    const p = req.params as { id: string; workspaceId: string };
+    const del = await pool.query(
+      "DELETE FROM memberships WHERE user_id = $1 AND workspace_id = $2", [p.id, p.workspaceId]);
+    if (del.rowCount === 0) return reply.code(404).send({ error: "no_membership" });
+    await audit(pool, { actor_type: "user",
+      actor_id: req.principal?.userId ?? undefined, action: "membership.revoke",
+      resource_type: "user", resource_id: p.id,
+      result: "success", metadata: { workspace_id: p.workspaceId } });
+    return { ok: true };
+  });
+
+  app.get("/v1/workspaces", async (req) => {
+    // Admins list everything; members list only their own.
+    if (req.principal?.workspaces === "all") {
+      const all = await pool.query("SELECT id, name, created_at FROM workspaces ORDER BY name");
+      return { items: all.rows };
+    }
+    const own = await pool.query(
+      "SELECT w.id, w.name, w.created_at FROM workspaces w JOIN memberships m ON m.workspace_id = w.id WHERE m.user_id = $1 ORDER BY w.name",
+      [req.principal?.userId ?? null]);
+    return { items: own.rows };
+  });
+
+  app.post("/v1/workspaces", async (req, reply) => {
+    const parsed = z.object({ name: z.string().min(1).max(128) }).safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_workspace" });
+    try {
+      const created = await pool.query(
+        "INSERT INTO workspaces (name) VALUES ($1) RETURNING id, name, created_at",
+        [parsed.data.name]);
+      await audit(pool, { actor_type: "user",
+        actor_id: req.principal?.userId ?? undefined, action: "workspace.create",
+        resource_type: "workspace", resource_id: created.rows[0].id,
+        result: "success", metadata: {} });
+      return reply.code(201).send(created.rows[0]);
+    } catch {
+      return reply.code(409).send({ error: "workspace_taken" });
+    }
   });
 }

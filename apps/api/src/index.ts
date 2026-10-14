@@ -9,7 +9,7 @@ import { registerRetentionRoutes } from "./retention.js";
 import { registerReconciliationRoutes } from "./reconciliation.js";
 import { attrsToObject, mapOtlpSpan, type OtlpSpan } from "./otlp.js";
 import { decodeTraceRequest, encodeEmptyTraceResponse } from "./otlp_proto.js";
-import { authHook } from "./auth.js";
+import { authHook, workspaceAllowed } from "./auth.js";
 import { registerUserRoutes } from "./users.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -62,19 +62,33 @@ export function buildApp() {
       let duplicates = 0;
 
       for (const e of parsed.data.events) {
-        // Resolve workspace: explicit id wins, else named default, else shared default.
+        // Resolve workspace: explicit id wins, else named lookup. Admins and
+        // env keys auto-create unknown names; member keys only write where
+        // they belong, so unknown or foreign names stop here, not later.
         let workspaceId = e.workspace_id;
         if (!workspaceId) {
           const name = e.workspace_name ?? "default";
           const found = await client.query("SELECT id FROM workspaces WHERE name = $1", [name]);
           workspaceId = found.rows[0]?.id;
           if (!workspaceId) {
+            if (req.principal?.workspaces !== "all") {
+              await client.query("ROLLBACK");
+              return reply.code(403).send({ error: "workspace_forbidden", workspace: name });
+            }
             const created = await client.query(
               "INSERT INTO workspaces (name) VALUES ($1) RETURNING id",
               [name]
             );
             workspaceId = created.rows[0].id;
           }
+        }
+        if (typeof workspaceId !== "string") {
+          await client.query("ROLLBACK");
+          return reply.code(400).send({ error: "workspace_unresolved" });
+        }
+        if (!workspaceAllowed(req.principal, workspaceId)) {
+          await client.query("ROLLBACK");
+          return reply.code(403).send({ error: "workspace_forbidden", workspace_id: workspaceId });
         }
 
         // Resolve agent: explicit id wins, else per-workspace named agent.
@@ -262,7 +276,15 @@ export function buildApp() {
           if (!m) continue;
           let workspace = await client.query("SELECT id FROM workspaces WHERE name = $1", [m.workspaceName]);
           if (!workspace.rows[0]) {
+            if (req.principal?.workspaces !== "all") {
+              await client.query("ROLLBACK");
+              return reply.code(403).send({ error: "workspace_forbidden", workspace: m.workspaceName });
+            }
             workspace = await client.query("INSERT INTO workspaces (name) VALUES ($1) RETURNING id", [m.workspaceName]);
+          }
+          if (!workspaceAllowed(req.principal, workspace.rows[0].id)) {
+            await client.query("ROLLBACK");
+            return reply.code(403).send({ error: "workspace_forbidden", workspace: m.workspaceName });
           }
           let agent = await client.query(
             "SELECT id FROM agents WHERE workspace_id = $1 AND name = $2",
