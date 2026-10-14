@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { gwApi, type Approval } from "./api";
 import {
   Alert, Button, Card, Empty, Input, Page,
-  Select, StatusBadge
+  Segmented, StatusBadge
 } from "./components";
 
 function ApprovalCard({ a, onChanged }: { a: Approval; onChanged: () => void }) {
@@ -45,7 +45,7 @@ function ApprovalCard({ a, onChanged }: { a: Approval; onChanged: () => void }) 
         <span className="text-ink-500">from {a.caller}</span>
         <span className="ml-auto text-xs text-ink-400">expires {new Date(a.expires_at).toLocaleString()}</span>
       </div>
-      <pre className="mt-2 max-h-48 overflow-auto rounded-lg bg-ink-950 p-3 font-mono text-xs text-ink-100">
+      <pre className="mt-2 max-h-48 overflow-auto rounded-lg bg-[#0b0e16] p-3 font-mono text-xs text-slate-100">
         {JSON.stringify(a.args, null, 2)}
       </pre>
       {a.decision_reason && <p className="mt-2 text-ink-500">Reason: {a.decision_reason}</p>}
@@ -88,14 +88,19 @@ export default function ApprovalsView() {
       sub="Held tool calls wait here. Nothing executes until a human decides."
       actions={
         <>
-          <Select aria-label="Filter approvals" value={filter} onChange={(e) => setFilter(e.target.value)}>
-            <option value="pending">pending</option>
-            <option value="">all</option>
-            <option value="approved">approved</option>
-            <option value="denied">denied</option>
-            <option value="expired">expired</option>
-            <option value="consumed">consumed</option>
-          </Select>
+          <Segmented
+            label="Filter approvals"
+            value={filter}
+            onChange={(v) => setFilter(v)}
+            options={[
+              { value: "pending", label: "Pending" },
+              { value: "", label: "All" },
+              { value: "approved", label: "Approved" },
+              { value: "denied", label: "Denied" },
+              { value: "expired", label: "Expired" },
+              { value: "consumed", label: "Consumed" }
+            ]}
+          />
           <Button onClick={reload}>Refresh</Button>
         </>
       }
