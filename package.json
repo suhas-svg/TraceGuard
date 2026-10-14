@@ -6,7 +6,9 @@
   "workspaces": [
     "apps/api",
     "apps/web",
-    "packages/schemas"
+    "examples/demo-agent-ts",
+    "packages/schemas",
+    "sdks/typescript"
   ],
   "scripts": {
     "build": "npm run build --workspaces",
