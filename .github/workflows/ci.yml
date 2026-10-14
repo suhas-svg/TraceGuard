@@ -28,6 +28,7 @@ jobs:
       TEST_DATABASE_URL: postgres://traceguard:traceguard@localhost:5432/traceguard
       API_KEY: test_key
       APPROVER_KEY: test_approver
+      APPROVAL_ARGS_KEY: abababababababababababababababababababababababababababababababab
       ALLOW_PRIVATE_UPSTREAMS: "true"
     steps:
       - uses: actions/checkout@v4

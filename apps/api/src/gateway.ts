@@ -12,6 +12,7 @@ import {
   type PolicyRule
 } from "./policy.js";
 import { callUpstreamTool, checkUpstreamUrl, definitionHash, discoverTools } from "./upstream.js";
+import { hashesEqual, open as openSealed, parseKey, seal } from "./seal.js";
 
 const API_KEY = process.env.API_KEY ?? "";
 const APPROVER_KEY = process.env.APPROVER_KEY ?? "";
@@ -21,6 +22,20 @@ const APPROVAL_TTL_SECONDS = Number(process.env.APPROVAL_TTL_SECONDS ?? 300);
 const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN ?? "http://localhost:5173";
 if (!API_KEY) throw new Error("API_KEY is required");
 if (!APPROVER_KEY) throw new Error("APPROVER_KEY is required");
+// Pending approval arguments are sealed at rest. The gateway cannot start
+// without the key, so there is no silent plaintext mode.
+const ARGS_KEY = parseKey(process.env.APPROVAL_ARGS_KEY ?? "");
+
+// Reads one approval's arguments. New rows unseal with the request id as
+// associated data; rows written before sealing stay readable as plaintext.
+function storedArgs(row: {
+  args_enc: boolean; args: unknown; request_id: string;
+}): Record<string, unknown> {
+  if (!row.args_enc) return row.args as Record<string, unknown>;
+  const envelope = row.args as { sealed?: string };
+  if (!envelope || typeof envelope.sealed !== "string") throw new Error("bad sealed envelope");
+  return openSealed(ARGS_KEY, envelope.sealed, row.request_id);
+}
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
   const found = await client.query("SELECT id FROM workspaces WHERE name = 'default'");
@@ -335,7 +350,7 @@ export function buildGateway() {
           return reply.code(410).send({ error: "approval_expired" });
         }
         const want = requestHash(caller, server_id, tool, args, approval.request_id);
-        if (want !== approval.args_hash || approval.caller !== caller) {
+        if (!hashesEqual(want, approval.args_hash) || approval.caller !== caller) {
           await recordDecision(client, { workspace_id: server.workspace_id, caller,
             server_id, tool_name: tool, args_hash: sha256Hex(stableStringify(args)),
             decision: "deny", reason: "approval binding mismatch", approval_id: approval.id });
@@ -346,8 +361,14 @@ export function buildGateway() {
             expires_at: approval.expires_at });
         }
         await client.query("UPDATE approvals SET status='consumed', decided_at=now() WHERE id=$1", [approval.id]);
+        let stored: Record<string, unknown>;
         try {
-          const result = await forward(client, server, tool, approval.args as Record<string, unknown>,
+          stored = storedArgs(approval);
+        } catch {
+          return reply.code(500).send({ error: "approval_unreadable" });
+        }
+        try {
+          const result = await forward(client, server, tool, stored,
             caller, { approval_id: approval.id });
           return { result, approval_id: approval.id };
         } catch {
@@ -383,13 +404,14 @@ export function buildGateway() {
         const requestId = parsed.data.request_id ?? `req-${randomUUID()}`;
         const hash = requestHash(caller, server_id, tool, args as Record<string, unknown>, requestId);
         const expiresAt = new Date(Date.now() + APPROVAL_TTL_SECONDS * 1000).toISOString();
+        const sealed = seal(ARGS_KEY, args as Record<string, unknown>, requestId);
         const ap = await client.query(
           `INSERT INTO approvals
-             (request_id, workspace_id, caller, server_id, tool_name, args_hash, args, requested_by, expires_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)
+             (request_id, workspace_id, caller, server_id, tool_name, args_hash, args, args_enc, requested_by, expires_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10)
            ON CONFLICT (request_id) DO NOTHING RETURNING id, request_id, status, expires_at`,
           [requestId, server.workspace_id, caller, server_id, tool, hash,
-           JSON.stringify(args), caller, expiresAt]
+           JSON.stringify({ sealed }), true, caller, expiresAt]
         );
         const row = ap.rows[0] ?? (await client.query("SELECT id, request_id, status, expires_at FROM approvals WHERE request_id=$1", [requestId])).rows[0];
         await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
@@ -427,7 +449,17 @@ export function buildGateway() {
       `SELECT * FROM approvals ${where.length ? "WHERE " + where.join(" AND ") : ""}
        ORDER BY requested_at DESC LIMIT $${params.length}`, params
     );
-    return { items: res.rows };
+    // Approvers see plaintext; the seal opens here, inside the gateway.
+    // A row that will not open is shown redacted, never dropped silently.
+    const items = res.rows.map((row) => {
+      if (!row.args_enc) return row;
+      try {
+        return { ...row, args: storedArgs(row) };
+      } catch {
+        return { ...row, args: {}, decrypt_error: true };
+      }
+    });
+    return { items };
   });
 
   app.post("/v1/approvals/:id/decision", async (req, reply) => {

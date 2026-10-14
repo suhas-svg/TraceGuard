@@ -26,6 +26,9 @@ The audit log is append-only with a hash chain: tamper-evident, not
 tamper-proof. Reads never return secrets, and no UPDATE or DELETE against
 the audit table exists in the codebase.
 
-Known limits: one API key per deploy, one approver key, pending approval
-arguments rest in the database until expiry, and the SDK trusts the clock
+Pending approval arguments are sealed with AES-256-GCM bound to the
+request id, and open only inside the gateway. Rows written before sealing
+stay readable as plaintext; everything new seals.
+
+Known limits: one API key per deploy, one approver key, and the SDK trusts the clock
 for Zulu timestamps.

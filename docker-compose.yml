@@ -42,6 +42,7 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-traceguard}:${POSTGRES_PASSWORD:-traceguard_dev_only}@postgres:5432/${POSTGRES_DB:-traceguard}
       API_KEY: ${API_KEY:-dev_key_change_me}
       APPROVER_KEY: ${APPROVER_KEY:-dev_approver_change_me}
+      APPROVAL_ARGS_KEY: ${APPROVAL_ARGS_KEY}
       GATEWAY_PORT: 8091
       APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS:-300}
       ALLOW_PRIVATE_UPSTREAMS: "true"
