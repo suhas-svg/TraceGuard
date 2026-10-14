@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
+import { notify } from "./notify.js";
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
   const found = await client.query("SELECT id FROM workspaces WHERE name = 'default'");
@@ -163,6 +164,8 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         await audit(pool, { actor_type: "agent", action: "budget.exceeded",
           resource_type: "budget", resource_id: budget.id, result: "blocked",
           metadata: { spent_micro: budget.spent_micro, limit_micro: budget.limit_micro } });
+        void notify(budget.workspace_id, "budget.exceeded",
+          { budget_id: budget.id, scope: budget.scope, spent_micro: Number(budget.spent_micro), limit_micro: Number(budget.limit_micro) });
         return reply.code(409).send({ error: "budget_exceeded",
           spent_micro: Number(budget.spent_micro), limit_micro: Number(budget.limit_micro) });
       }

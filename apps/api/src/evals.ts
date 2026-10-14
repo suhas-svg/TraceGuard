@@ -6,6 +6,7 @@ import { pool } from "./db.js";
 import { audit } from "./audit.js";
 import { estimateCostMicro } from "./cost.js";
 import { runAssertion } from "./assertions.js";
+import { notify } from "./notify.js";
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
   const found = await client.query("SELECT id FROM workspaces WHERE name = 'default'");
@@ -248,9 +249,13 @@ export function registerEvalRoutes(app: FastifyInstance) {
       const status = stopped ? "cancelled" : "success";
       await client.query("UPDATE eval_runs SET status = $2, ended_at = now() WHERE id = $1",
         [evalRun.id, status]);
+      const passed = results.filter((r) => r.passed).length;
       await audit(pool, { actor_type: "admin", action: "eval.run",
         resource_type: "eval_run", resource_id: evalRun.id, result: status,
         metadata: { suite: suite.rows[0].name, trials: cfg.trials, stopped } });
+      void notify(workspaceId, "eval.completed",
+        { eval_run_id: evalRun.id, suite: suite.rows[0].name, status,
+          passed, total: results.length });
       return reply.code(201).send({ eval_run: { ...evalRun, status }, results, stopped });
     } finally {
       client.release();

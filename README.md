@@ -30,6 +30,10 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
   `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` on the exporter. Spans in one
   trace share a run, retries upsert by stable ids, and
   `POST /v1/admin/finalize-stale-runs` closes runs orphaned by crashes.
+- Webhooks report denials, approvals, budget breaches, and finished
+  evaluations to operator URLs with an HMAC signature. Delivery never
+  blocks the decision, every attempt is logged, and failures retry from
+  `POST /v1/webhooks/deliveries/:id/retry`.
 - `GET /healthz`, `GET /readyz` report liveness and database state.
 - Python SDK sends events over HTTP with a bounded queue and never raises into the agent.
 - `examples/demo-agent` submits a sample run and fetches its trace.

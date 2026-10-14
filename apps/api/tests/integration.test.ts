@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -199,6 +199,8 @@ describe("integration and security", () => {
     const traceId = hex(32);
     const rootId = hex(16);
     const childId = hex(16);
+    // Current timestamps: fixed old ones sort off the runs pages on busy DBs.
+    const nano = (agoMs: number) => String(BigInt(Date.now() - agoMs) * 1_000_000n);
     const payload = {
       resourceSpans: [{
         resource: { attributes: [
@@ -206,7 +208,7 @@ describe("integration and security", () => {
         ]},
         scopeSpans: [{ spans: [
           { traceId, spanId: rootId, name: "gen_ai.chat",
-            startTimeUnixNano: "1760371200000000000", endTimeUnixNano: "1760371200500000000",
+            startTimeUnixNano: nano(500), endTimeUnixNano: nano(0),
             attributes: [
               { key: "gen_ai.system", value: { stringValue: "openai" } },
               { key: "gen_ai.request.model", value: { stringValue: "gpt-x" } },
@@ -214,7 +216,7 @@ describe("integration and security", () => {
               { key: "gen_ai.usage.output_tokens", value: { intValue: "5" } }
             ]},
           { traceId, spanId: childId, parentSpanId: rootId, name: "gen_ai.execute_tool",
-            startTimeUnixNano: "1760371200100000000", endTimeUnixNano: "1760371200200000000",
+            startTimeUnixNano: nano(400), endTimeUnixNano: nano(300),
             attributes: [
               { key: "gen_ai.tool.name", value: { stringValue: "lookup" } }
             ]}
@@ -232,9 +234,49 @@ describe("integration and security", () => {
     const trace = await api.inject({ method: "GET", url: `/v1/runs/${run.id}/trace`, headers: key });
     const ops = trace.json().spans.map((s: { operation_type: string }) => s.operation_type).sort();
     expect(ops).toEqual(["model.request", "tool.invocation"]);
+    await pool.query("UPDATE runs SET started_at = now() - interval '1 hour' WHERE id = $1", [run.id]);
     const stale = await api.inject({ method: "POST",
       url: "/v1/admin/finalize-stale-runs?older_than_seconds=60", headers: key });
     expect(stale.json().ids).toContain(run.id);
+  });
+
+  it("alerts webhooks on denials with a verifiable signature", async () => {
+    const received: { headers: Record<string, string | string[] | undefined>; body: string }[] = [];
+    const stub = createServer((req, res) => {
+      let data = "";
+      req.on("data", (c) => (data += c));
+      req.on("end", () => {
+        received.push({ headers: req.headers, body: data });
+        res.writeHead(200).end("ok");
+      });
+    });
+    await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", resolve));
+    const port = (stub.address() as { port: number }).port;
+    try {
+      const sub = await api.inject({ method: "POST", url: "/v1/webhooks", headers: key,
+        payload: { name: `hook-${tag}`, url: `http://127.0.0.1:${port}/ping`,
+          secret: "hook-secret", events: ["tool.denied"] } });
+      expect(sub.statusCode).toBe(201);
+      const listed = await api.inject({ method: "GET", url: "/v1/webhooks", headers: key });
+      expect(JSON.stringify(listed.json())).not.toContain("hook-secret");
+      await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+        payload: { server_id: serverId, tool: "ghost", arguments: {}, caller: "t" } });
+      // Delivery runs beside the response, not inside it, so wait for arrival.
+      await vi.waitFor(() => expect(received).toHaveLength(1), { timeout: 10000 });
+      const [hit] = received;
+      expect(hit.headers["x-traceguard-event"]).toBe("tool.denied");
+      const { createHmac } = await import("node:crypto");
+      const expectSig = createHmac("sha256", "hook-secret").update(hit.body).digest("hex");
+      expect(hit.headers["x-traceguard-signature"]).toBe(expectSig);
+      expect(JSON.parse(hit.body).tool).toBe("ghost");
+      const deliveries = await api.inject({ method: "GET",
+        url: "/v1/webhooks/deliveries", headers: key });
+      const row = deliveries.json().items.find(
+        (d: { subscription_id: string }) => d.subscription_id === sub.json().id);
+      expect(row.status).toBe("delivered");
+    } finally {
+      stub.close();
+    }
   });
 
   it("keeps the audit hash chain linked", async () => {
