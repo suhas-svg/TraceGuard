@@ -279,7 +279,36 @@ export interface CompareRow {
   missing_pricing: boolean;
 }
 
+export interface TeamUser {
+  id: string;
+  email: string;
+  role: string;
+  created_at: string;
+  keys: { id: string; name: string; scopes: string[]; workspace_id: string | null;
+    expires_at: string | null; last_used_at: string | null }[];
+  workspaces: string[];
+}
+
+export interface Workspace {
+  id: string;
+  name: string;
+  created_at: string;
+}
+
 export const opsApi = {
+  team: () => get<{ items: TeamUser[] }>("/v1/users"),
+  createUser: (u: { email: string; password: string; role: string }) =>
+    postApi<TeamUser>("/v1/users", u),
+  mintKey: (userId: string, k: Record<string, unknown>) =>
+    postApi<{ id: string; key: string }>(`/v1/users/${userId}/keys`, k),
+  revokeKey: (userId: string, keyId: string) =>
+    deleteApi<{ ok: boolean }>(`/v1/users/${userId}/keys/${keyId}`),
+  grantMembership: (userId: string, workspace_id: string) =>
+    postApi<{ ok: boolean }>(`/v1/users/${userId}/memberships`, { workspace_id }),
+  revokeMembership: (userId: string, workspaceId: string) =>
+    deleteApi<{ ok: boolean }>(`/v1/users/${userId}/memberships/${workspaceId}`),
+  workspaces: () => get<{ items: Workspace[] }>("/v1/workspaces"),
+  createWorkspace: (name: string) => postApi<Workspace>("/v1/workspaces", { name }),
   compareCosts: (periodStart: string, periodEnd: string, provider?: string) =>
     get<{ period_start: string; period_end: string; rows: CompareRow[] }>(
       `/v1/reconciliation/compare?period_start=${encodeURIComponent(periodStart)}&period_end=${encodeURIComponent(periodEnd)}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}`),

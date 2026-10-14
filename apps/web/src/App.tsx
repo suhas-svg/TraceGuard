@@ -7,12 +7,13 @@ import ApprovalsView from "./Approvals";
 import WebhooksView from "./Webhooks";
 import RetentionView from "./Retention";
 import CostsView from "./Costs";
+import UsersView from "./Users";
 import {
   Alert, Badge, Button, Card, Empty, Field, Input, LinkButton,
   NavIcon, Page, Segmented, Spinner, Stat, StatusBadge, Table, Td, Th
 } from "./components";
 
-type Tab = "runs" | "evals" | "policy" | "approvals" | "webhooks" | "retention" | "costs";
+type Tab = "runs" | "evals" | "policy" | "approvals" | "webhooks" | "retention" | "costs" | "users";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "runs", label: "Runs" },
@@ -21,7 +22,8 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "approvals", label: "Approvals" },
   { id: "webhooks", label: "Webhooks" },
   { id: "retention", label: "Retention" },
-  { id: "costs", label: "Costs" }
+  { id: "costs", label: "Costs" },
+  { id: "users", label: "Users" }
 ];
 
 function short(id: string) {
@@ -452,6 +454,8 @@ export default function App() {
             <RetentionView />
           ) : tab === "costs" ? (
             <CostsView />
+          ) : tab === "users" ? (
+            <UsersView />
           ) : openRun ? (
             <TraceView runId={openRun} onBack={() => setOpenRun(null)} />
           ) : (
