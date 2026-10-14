@@ -146,6 +146,10 @@ describe("integration and security", () => {
         request_id: `r-${tag}`, approval_id: approvalId } });
     expect(replay.statusCode).toBe(410);
     expect(upstreamHits).toBe(before + 1);
+    // Sealed at rest: the stored row carries ciphertext, never the plaintext.
+    const stored = await pool.query("SELECT args_enc, args FROM approvals WHERE id = $1", [approvalId]);
+    expect(stored.rows[0].args_enc).toBe(true);
+    expect(JSON.stringify(stored.rows[0].args)).not.toContain("wait");
     const call2 = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: "late" }, caller: "t", request_id: `r2-${tag}` } });
     const approval2 = call2.json().approval_id;

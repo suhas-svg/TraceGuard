@@ -9,6 +9,7 @@ variable, which is how the compose file reads them.
 | DATABASE_URL | api, gateway | local postgres | both processes share one database |
 | API_KEY | api, gateway | dev_key_change_me | agent and dashboard credential |
 | APPROVER_KEY | gateway | dev_approver_change_me | human approval decisions only |
+| APPROVAL_ARGS_KEY | gateway | (required, no default) | 32 bytes hex sealing pending approval arguments; generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
 | GATEWAY_PORT | gateway | 8091 | |
 | APPROVAL_TTL_SECONDS | gateway | 300 | pending approvals die after this |
 | ALLOW_PRIVATE_UPSTREAMS | gateway | true | set false in production; true is for local mock upstreams |
