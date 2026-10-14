@@ -36,6 +36,21 @@ export function open(key: Buffer, sealed: string, aad: string): Record<string, u
   return parsed as Record<string, unknown>;
 }
 
+// Opens with the first key that works. Rotation keeps the previous key
+// configured until pending rows sealed under it expire, so in-flight
+// approvals survive a key change. New rows always seal with keys[0].
+export function tryOpen(keys: Buffer[], sealed: string, aad: string): Record<string, unknown> {
+  let lastError: unknown = new Error("no keys configured");
+  for (const key of keys) {
+    try {
+      return open(key, sealed, aad);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
+
 // Constant-shape comparison helper for callers that check hashes first.
 export function hashesEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);

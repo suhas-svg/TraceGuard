@@ -30,5 +30,9 @@ Pending approval arguments are sealed with AES-256-GCM bound to the
 request id, and open only inside the gateway. Rows written before sealing
 stay readable as plaintext; everything new seals.
 
+Rotate by generating a fresh key, deploying it as the primary with the old
+key as the previous, waiting past the approval TTL so sealed rows drain,
+then removing the previous key. New rows always use the primary.
+
 Known limits: one API key per deploy, one approver key, and the SDK trusts the clock
 for Zulu timestamps.
