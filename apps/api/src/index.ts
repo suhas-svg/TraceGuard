@@ -5,6 +5,7 @@ import { ingestBodySchema } from "@traceguard/schemas";
 import { registerBudgetRoutes } from "./budgets.js";
 import { registerEvalRoutes } from "./evals.js";
 import { registerWebhookRoutes } from "./webhooks.js";
+import { registerRetentionRoutes } from "./retention.js";
 import { attrsToObject, mapOtlpSpan, type OtlpSpan } from "./otlp.js";
 
 const API_KEY = process.env.API_KEY ?? "";
@@ -211,6 +212,7 @@ export function buildApp() {
   registerBudgetRoutes(app);
   registerEvalRoutes(app);
   registerWebhookRoutes(app);
+  registerRetentionRoutes(app);
 
   // OTLP/HTTP JSON trace receiver. Exporters must use http/json encoding.
   // Spans in one trace share a run; ids map deterministically so retries

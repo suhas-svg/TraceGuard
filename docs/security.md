@@ -17,6 +17,15 @@ Model output truth, prompt injection in general, safety of tools called
 outside the gateway, or protection when the agent can reach upstream
 servers directly. Run upstreams on the internal tools network.
 
+## Retention
+
+Execution data does not live forever. Retention rules name a target
+(`runs`, terminal `approvals`, `webhook_deliveries`), a maximum age in
+days, and an on/off switch. `POST /v1/retention/run` executes every
+enabled rule and reports per-rule deletion counts; call it from cron.
+Policies, decisions, pending approvals, the audit log, and money tables
+are not valid targets, and the API refuses them.
+
 ## Reporting a vulnerability
 
 Email the repository owner with a description, reproduction steps, and the

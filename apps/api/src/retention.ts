@@ -1,0 +1,172 @@
+import type { FastifyInstance } from "fastify";
+import { z } from "zod";
+import type { PoolClient } from "pg";
+import { pool } from "./db.js";
+import { audit } from "./audit.js";
+
+// Retention deletes execution and operational data past its age. It never
+// touches policies, decisions, pending approvals, the audit log, or money.
+// Like the stale-run finalizer, an operator cron calls the run endpoint;
+// the app holds no scheduler.
+const targets = ["runs", "approvals", "webhook_deliveries"] as const;
+
+async function defaultWorkspaceId(client: PoolClient): Promise<string> {
+  const found = await client.query("SELECT id FROM workspaces WHERE name = 'default'");
+  if (found.rows[0]) return found.rows[0].id;
+  const created = await client.query("INSERT INTO workspaces (name) VALUES ('default') RETURNING id");
+  return created.rows[0].id;
+}
+
+async function applyRule(
+  client: PoolClient,
+  rule: { id: string; workspace_id: string; target: string; older_than_days: number }
+): Promise<number> {
+  const cutoff = `now() - (${rule.older_than_days} || ' days')::interval`;
+  switch (rule.target) {
+    case "runs": {
+      // Spans go with their runs through the foreign-key cascade.
+      const r = await client.query(
+        `DELETE FROM runs WHERE workspace_id = $1 AND started_at < ${cutoff}`, [rule.workspace_id]
+      );
+      return r.rowCount ?? 0;
+    }
+    case "approvals": {
+      // Terminal rows only. Pending approvals decide real calls and stay.
+      const r = await client.query(
+        `DELETE FROM approvals WHERE workspace_id = $1 AND status <> 'pending'
+         AND requested_at < ${cutoff}`, [rule.workspace_id]
+      );
+      return r.rowCount ?? 0;
+    }
+    case "webhook_deliveries": {
+      const r = await client.query(
+        `DELETE FROM webhook_deliveries d USING webhook_subscriptions s
+         WHERE d.subscription_id = s.id AND s.workspace_id = $1 AND d.created_at < ${cutoff}`,
+        [rule.workspace_id]
+      );
+      return r.rowCount ?? 0;
+    }
+    default:
+      return 0;
+  }
+}
+
+export function registerRetentionRoutes(app: FastifyInstance) {
+  const ruleSchema = z.object({
+    name: z.string().min(1).max(128),
+    target: z.enum(targets),
+    older_than_days: z.number().int().min(1).max(3650),
+    enabled: z.boolean().default(true)
+  });
+
+  app.post("/v1/retention/rules", async (req, reply) => {
+    const parsed = ruleSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_rule" });
+    const client = await pool.connect();
+    try {
+      const workspaceId = await defaultWorkspaceId(client);
+      const r = parsed.data;
+      try {
+        const res = await client.query(
+          `INSERT INTO retention_rules (workspace_id, name, target, older_than_days, enabled)
+           VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+          [workspaceId, r.name, r.target, r.older_than_days, r.enabled]
+        );
+        await audit(pool, { actor_type: "admin", action: "retention.rule_create",
+          resource_type: "retention_rule", resource_id: res.rows[0].id, result: "success",
+          metadata: { name: r.name, target: r.target, older_than_days: r.older_than_days } });
+        return reply.code(201).send(res.rows[0]);
+      } catch (err: unknown) {
+        if ((err as { code?: string }).code === "23505") {
+          return reply.code(409).send({ error: "rule_name_taken" });
+        }
+        throw err;
+      }
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get("/v1/retention/rules", async () => {
+    const res = await pool.query("SELECT * FROM retention_rules ORDER BY created_at DESC");
+    return { items: res.rows };
+  });
+
+  app.put("/v1/retention/rules/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const parsed = z.object({
+      older_than_days: z.number().int().min(1).max(3650).optional(),
+      enabled: z.boolean().optional()
+    }).safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_rule" });
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (parsed.data.older_than_days !== undefined) {
+      params.push(parsed.data.older_than_days);
+      sets.push(`older_than_days = $${params.length}`);
+    }
+    if (parsed.data.enabled !== undefined) {
+      params.push(parsed.data.enabled);
+      sets.push(`enabled = $${params.length}`);
+    }
+    if (!sets.length) return reply.code(400).send({ error: "nothing_to_update" });
+    params.push(id);
+    const res = await pool.query(
+      `UPDATE retention_rules SET ${sets.join(", ")} WHERE id = $${params.length} RETURNING *`, params
+    );
+    if (!res.rows[0]) return reply.code(404).send({ error: "rule_not_found" });
+    return res.rows[0];
+  });
+
+  app.delete("/v1/retention/rules/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const res = await pool.query("DELETE FROM retention_rules WHERE id = $1 RETURNING id", [id]);
+    if (!res.rows[0]) return reply.code(404).send({ error: "rule_not_found" });
+    await audit(pool, { actor_type: "admin", action: "retention.rule_delete",
+      resource_type: "retention_rule", resource_id: id, result: "success" });
+    return { ok: true };
+  });
+
+  app.post("/v1/retention/run", async (req, reply) => {
+    const client = await pool.connect();
+    try {
+      const rules = await client.query(
+        "SELECT * FROM retention_rules WHERE enabled = true ORDER BY created_at"
+      );
+      const run = await client.query(
+        "INSERT INTO retention_runs (workspace_id, status) VALUES ($1, 'running') RETURNING id",
+        [rules.rows[0]?.workspace_id ?? (await defaultWorkspaceId(client))]
+      );
+      const counts: Record<string, number> = {};
+      await client.query("BEGIN");
+      try {
+        for (const rule of rules.rows) {
+          counts[rule.name] = await applyRule(client, rule);
+        }
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        await pool.query("UPDATE retention_runs SET status = 'failed', ended_at = now() WHERE id = $1",
+          [run.rows[0].id]);
+        throw err;
+      }
+      await pool.query(
+        "UPDATE retention_runs SET status = 'success', ended_at = now(), deleted_counts = $2 WHERE id = $1",
+        [run.rows[0].id, JSON.stringify(counts)]
+      );
+      await audit(pool, { actor_type: "admin", action: "retention.run",
+        resource_type: "retention_run", resource_id: run.rows[0].id, result: "success",
+        metadata: { deleted: counts } });
+      return { run_id: run.rows[0].id, deleted: counts };
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get("/v1/retention/runs", async (req) => {
+    const q = req.query as { limit?: string };
+    const limit = Math.min(Math.max(Number(q.limit ?? 20), 1), 100);
+    const res = await pool.query("SELECT * FROM retention_runs ORDER BY started_at DESC LIMIT $1", [limit]);
+    return { items: res.rows };
+  });
+}
