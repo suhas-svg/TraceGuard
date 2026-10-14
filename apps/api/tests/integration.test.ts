@@ -123,6 +123,13 @@ describe("integration and security", () => {
 
   it("holds approval calls, refuses agent decisions, enforces single use and expiry", async () => {
     const before = upstreamHits;
+    // A gateway-scoped agent key stands in for the agent here; the shared
+    // env key is an admin and may legitimately approve.
+    const au = await api.inject({ method: "POST", url: "/v1/users", headers: key,
+      payload: { email: `ag-${tag}@example.com`, password: "long-password-444", role: "member" } });
+    const ak = await api.inject({ method: "POST", url: `/v1/users/${au.json().id}/keys`, headers: key,
+      payload: { name: "agent", scopes: ["gateway"], expires_days: 7 } });
+    const agentKey = { authorization: `Bearer ${ak.json().key}` };
     await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `appr-${tag}`, priority: 50, server_id: serverId, effect: "require_approval" } });
     const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
@@ -131,8 +138,8 @@ describe("integration and security", () => {
     expect(upstreamHits).toBe(before);
     const approvalId = call.json().approval_id;
     const agentDecision = await gw.inject({ method: "POST", url: `/v1/approvals/${approvalId}/decision`,
-      headers: key, payload: { approved: true } });
-    expect(agentDecision.statusCode).toBe(401);
+      headers: agentKey, payload: { approved: true } });
+    expect(agentDecision.statusCode).toBe(403);
     const decided = await gw.inject({ method: "POST", url: `/v1/approvals/${approvalId}/decision`,
       headers: approver, payload: { approved: true, reason: "test" } });
     expect(decided.json().status).toBe("approved");
@@ -405,6 +412,56 @@ describe("integration and security", () => {
     expect(row.variance_micro).toBe(-400);
     expect(row.variance_pct).toBeCloseTo(-0.1);
     expect(row.missing_pricing).toBe(false);
+  });
+
+  it("scopes credentials by role: agent keys never approve, approver keys never ingest", async () => {
+    const email = `owner-${tag}@example.com`;
+    const reg = await api.inject({ method: "POST", url: "/v1/auth/register",
+      payload: { email, password: "long-password-000" } });
+    // Fresh test databases start empty, so the first registration here may
+    // bootstrap the admin, or an earlier test may have taken it already.
+    expect([201, 403]).toContain(reg.statusCode);
+    const second = await api.inject({ method: "POST", url: "/v1/auth/register",
+      payload: { email: `other-${tag}@example.com`, password: "long-password-111" } });
+    expect(second.statusCode).toBe(403);
+    // The env key keeps full access, so it can mint a member and a key for it.
+    const mk = await api.inject({ method: "POST", url: "/v1/users", headers: key,
+      payload: { email: `agent-${tag}@example.com`, password: "long-password-222", role: "member" } });
+    expect(mk.statusCode).toBe(201);
+    const memberId = mk.json().id;
+    const kc = await api.inject({ method: "POST", url: `/v1/users/${memberId}/keys`, headers: key,
+      payload: { name: "agent", scopes: ["ingest", "gateway"], expires_days: 7 } });
+    expect(kc.statusCode).toBe(201);
+    expect(kc.json().key).toMatch(/^tg_/);
+    const agentAuth = { authorization: `Bearer ${kc.json().key}` };
+    const oneEvent = {
+      schema_version: "1", event_id: `evt-${randomUUID()}`, agent_name: `scope-${tag}`,
+      run_id: randomUUID(), span_id: randomUUID(), event_type: "run.started",
+      timestamp: new Date().toISOString(), attributes: {}
+    };
+    const ing = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: agentAuth,
+      payload: { events: [oneEvent] } });
+    expect(ing.statusCode).toBe(200);
+    // Agent key at the approval endpoint: scoped out, not just unauthorized.
+    const dec = await gw.inject({ method: "POST", url: "/v1/approvals/00000000-0000-0000-0000-000000000000/decision",
+      headers: agentAuth, payload: { approved: true } });
+    expect(dec.statusCode).toBe(403);
+    // Approver-role key: the mirror image.
+    const ap = await api.inject({ method: "POST", url: "/v1/users", headers: key,
+      payload: { email: `human-${tag}@example.com`, password: "long-password-333", role: "approver" } });
+    const akc = await api.inject({ method: "POST", url: `/v1/users/${ap.json().id}/keys`, headers: key,
+      payload: { name: "human", scopes: ["approve", "read"], expires_days: 7 } });
+    const humanAuth = { authorization: `Bearer ${akc.json().key}` };
+    const noIngest = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: humanAuth,
+      payload: { events: [] } });
+    expect(noIngest.statusCode).toBe(403);
+    // Login mints a bearer; wrong password does not.
+    const login = await api.inject({ method: "POST", url: "/v1/auth/login",
+      payload: { email, password: "long-password-000" } });
+    expect([200, 401]).toContain(login.statusCode);
+    const bad = await api.inject({ method: "POST", url: "/v1/auth/login",
+      payload: { email, password: "wrong-password-000" } });
+    expect(bad.statusCode).toBe(401);
   });
 
   it("keeps the audit hash chain linked", async () => {

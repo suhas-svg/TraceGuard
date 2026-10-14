@@ -13,6 +13,7 @@ import {
 } from "./policy.js";
 import { callUpstreamTool, checkUpstreamUrl, definitionHash, discoverTools } from "./upstream.js";
 import { hashesEqual, parseKey, seal, tryOpen } from "./seal.js";
+import { authHook } from "./auth.js";
 import { notify } from "./notify.js";
 
 const API_KEY = process.env.API_KEY ?? "";
@@ -77,18 +78,10 @@ export function buildGateway() {
     reply.header("Access-Control-Allow-Origin", DASHBOARD_ORIGIN);
     reply.header("Access-Control-Allow-Headers", "authorization, content-type");
     if (req.method === "OPTIONS") return reply.code(204).send();
-    if (!req.url.startsWith("/v1/")) return;
-    // Agent credentials must never reach the approval decision endpoint.
-    // Approvals are decided with a separate key held by humans, not agents.
-    if (req.url.startsWith("/v1/approvals/") && req.method === "POST") {
-      if (req.headers.authorization !== `Bearer ${APPROVER_KEY}`) {
-        return reply.code(401).send({ error: "approver_unauthorized" });
-      }
-      return;
-    }
-    if (req.headers.authorization !== `Bearer ${API_KEY}`) {
-      return reply.code(401).send({ error: "unauthorized" });
-    }
+    // One scoped-auth table for every route. Agent keys carry gateway scope
+    // only, so they can never reach the approval decision endpoint no
+    // matter how the call is framed; it needs approve scope.
+    await authHook(req, reply);
   });
 
   const serverSchema = z.object({
