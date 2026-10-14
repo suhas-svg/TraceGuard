@@ -22,9 +22,10 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 - Gateway on :8091: upstream registry, tool discovery with definition pinning, allow/deny/approval policies, single-use bound approvals, hash-chained audit.
 - Budgets with atomic reserve-and-settle plus a Python `BudgetGuard` wrapper.
 - Evaluations: versioned suites, scripted replay, deterministic assertions, run comparison.
-- The dashboard has Runs, Evaluations, Policy, and Approvals tabs: run
-  search and traces, suite results with comparison, rule create and edit
-  with versioning, and the approval queue with approve, deny, and Run now.
+- The dashboard has Runs, Evaluations, Policy, Approvals, Webhooks, and
+  Retention tabs: run search and traces, suite results with comparison,
+  rule editing, the approval queue, webhook subscriptions with delivery
+  log, and retention rules with run history.
 - `POST /v1/traces` accepts OpenTelemetry OTLP/HTTP JSON with GenAI
   conventions, so instrumented frameworks land without a new SDK. Set
   `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` on the exporter. Spans in one
