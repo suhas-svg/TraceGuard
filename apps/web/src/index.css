@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -36,6 +38,45 @@
   --color-info-700: #4338ca;
   --color-mute-100: #f1f5f9;
   --color-mute-700: #475569;
+
+  --color-surface: #ffffff;
+  --color-surface-2: #f6f7f9;
+}
+
+/* Dark mode flips the ink scale and deepens the semantic tints, so every
+   utility that references these tokens follows the theme with no per-view
+   dark: classes. Brand stays put; it reads on both backgrounds. */
+.dark {
+  --color-ink-50: #0a0d15;
+  --color-ink-100: #111624;
+  --color-ink-200: #1c2338;
+  --color-ink-300: #2d3752;
+  --color-ink-400: #5b6a8c;
+  --color-ink-500: #8b98b8;
+  --color-ink-600: #b6c0d8;
+  --color-ink-700: #d3dae9;
+  --color-ink-800: #e8ecf4;
+  --color-ink-900: #f4f6fa;
+  --color-ink-950: #ffffff;
+
+  --color-brand-50: #1e1b4b;
+  --color-brand-100: #26216b;
+  --color-brand-200: #3730a3;
+
+  --color-ok-100: #123a24;
+  --color-ok-700: #6ee7a8;
+  --color-ok-800: #a7f3c9;
+  --color-warn-100: #45300d;
+  --color-warn-700: #fbbf24;
+  --color-bad-100: #471414;
+  --color-bad-700: #f87171;
+  --color-info-100: #232a5e;
+  --color-info-700: #a5b4fc;
+  --color-mute-100: #1c2338;
+  --color-mute-700: #b6c0d8;
+
+  --color-surface: #12172a;
+  --color-surface-2: #0a0d15;
 }
 
 html {

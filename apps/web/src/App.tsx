@@ -9,7 +9,7 @@ import RetentionView from "./Retention";
 import CostsView from "./Costs";
 import {
   Alert, Badge, Button, Card, Empty, Field, Input, LinkButton,
-  NavIcon, Page, Select, Spinner, Stat, StatusBadge, Table, Td, Th
+  NavIcon, Page, Segmented, Spinner, Stat, StatusBadge, Table, Td, Th
 } from "./components";
 
 type Tab = "runs" | "evals" | "policy" | "approvals" | "webhooks" | "retention" | "costs";
@@ -28,6 +28,48 @@ function short(id: string) {
   return id.slice(0, 8);
 }
 
+function theme(): "light" | "dark" {
+  if (typeof document === "undefined") return "light";
+  const saved = localStorage.getItem("tg-theme");
+  if (saved === "dark" || saved === "light") return saved;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function ThemeToggle() {
+  const [mode, setMode] = useState<"light" | "dark">("light");
+  useEffect(() => {
+    const t = theme();
+    setMode(t);
+    document.documentElement.classList.toggle("dark", t === "dark");
+  }, []);
+  return (
+    <button
+      onClick={() => {
+        const next = mode === "dark" ? "light" : "dark";
+        setMode(next);
+        localStorage.setItem("tg-theme", next);
+        document.documentElement.classList.toggle("dark", next === "dark");
+      }}
+      aria-label={mode === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+      title={mode === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+      className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
+    >
+      {mode === "dark" ? (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}
+          strokeLinecap="round" className="h-4 w-4" aria-hidden="true">
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4l1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+        </svg>
+      ) : (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}
+          strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
+          <path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
 function ConnectionDrawer({ open, onClose, onSaved }: {
   open: boolean;
   onClose: () => void;
@@ -40,9 +82,9 @@ function ConnectionDrawer({ open, onClose, onSaved }: {
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-label="Connection settings">
-      <div className="absolute inset-0 bg-ink-950/40" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/50" onClick={onClose} />
       <form
-        className="relative flex w-80 flex-col gap-3 bg-white p-5 shadow-xl"
+        className="relative flex w-80 flex-col gap-3 bg-surface p-5 shadow-xl"
         onSubmit={(e) => {
           e.preventDefault();
           settings.save(url, key, gwUrl, approverKey);
@@ -107,13 +149,18 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
       sub="Every agent execution, newest first. Open one for its full trace."
       actions={
         <>
-          <Select aria-label="Filter by status" value={status} onChange={(e) => setStatus(e.target.value)}>
-            <option value="">all statuses</option>
-            <option value="running">running</option>
-            <option value="success">success</option>
-            <option value="failed">failed</option>
-            <option value="cancelled">cancelled</option>
-          </Select>
+          <Segmented
+            label="Filter by status"
+            value={status}
+            onChange={(v) => setStatus(v)}
+            options={[
+              { value: "", label: "All" },
+              { value: "running", label: "Running" },
+              { value: "success", label: "Success" },
+              { value: "failed", label: "Failed" },
+              { value: "cancelled", label: "Cancelled" }
+            ]}
+          />
           <Button onClick={() => load(null, true)}>Refresh</Button>
         </>
       }
@@ -198,6 +245,9 @@ function SpanRow({ node, depth, selected, onSelect, base, maxEnd }: {
           <span className="font-mono font-medium text-ink-800">{s.operation_type}</span>
           {s.model && <span className="truncate text-ink-500">{s.model}</span>}
           {s.error_type && <span className="text-bad-700">{s.error_type}</span>}
+          <span className="tg-nums ml-auto shrink-0 text-xs text-ink-400">
+            {s.duration_ms != null ? `${s.duration_ms} ms` : ""}
+          </span>
         </span>
         <span className="tg-track mt-1 block h-1.5 w-full" aria-hidden="true">
           <span className={`tg-bar block h-1.5 ${barTone}`} style={{ marginLeft: `${left}%`, width: `${width}%` }} />
@@ -239,7 +289,7 @@ function SpanDetail({ span }: { span: Span }) {
       </dl>
       <details className="mt-2">
         <summary className="cursor-pointer text-sm text-ink-500">attributes</summary>
-        <pre className="mt-1 max-h-64 overflow-auto rounded-lg bg-ink-950 p-3 font-mono text-xs text-ink-100">
+        <pre className="mt-1 max-h-64 overflow-auto rounded-lg bg-[#0b0e16] p-3 font-mono text-xs text-slate-100">
           {JSON.stringify(span.attributes, null, 2)}
         </pre>
       </details>
@@ -341,15 +391,18 @@ export default function App() {
 
   return (
     <div className="flex min-h-screen">
-      <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col bg-ink-950 text-ink-200">
+      <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col bg-[#0b0e16] text-slate-300">
         <div className="flex items-center gap-2 px-5 pb-5 pt-6">
-          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand-600 font-mono text-sm font-bold text-white">
+          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 font-mono text-sm font-bold text-white shadow-lg shadow-brand-600/30">
             TG
           </span>
           <div>
             <div className="text-[15px] font-semibold tracking-tight text-white">TraceGuard</div>
-            <div className="text-[11px] text-ink-400">agent control plane</div>
+            <div className="text-[11px] text-slate-500">agent control plane</div>
           </div>
+          <span className="ml-auto">
+            <ThemeToggle />
+          </span>
         </div>
         <nav className="flex flex-col gap-0.5 px-3" aria-label="Primary">
           {TABS.map((t) => (
@@ -360,7 +413,7 @@ export default function App() {
               className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors ${
                 tab === t.id && !openRun
                   ? "bg-white/10 font-medium text-white"
-                  : "text-ink-300 hover:bg-white/5 hover:text-white"
+                  : "text-slate-400 hover:bg-white/5 hover:text-white"
               }`}
             >
               <NavIcon name={t.id} />
@@ -371,11 +424,11 @@ export default function App() {
         <div className="mt-auto p-4">
           <button
             onClick={() => setDrawer(true)}
-            className="flex w-full items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-left text-xs text-ink-300 hover:bg-white/5"
+            className="flex w-full items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-left text-xs text-slate-400 hover:bg-white/5"
           >
             <span
               className={`inline-block h-2 w-2 rounded-full ${
-                connected === null ? "bg-ink-400" : connected ? "bg-green-400" : "bg-red-400"
+                connected === null ? "bg-slate-500" : connected ? "bg-green-400" : "bg-red-400"
               }`}
               aria-hidden="true"
             />

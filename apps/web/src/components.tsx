@@ -15,7 +15,7 @@ export function Button({ variant = "secondary", size = "md", className = "", ...
   const variants: Record<string, string> = {
     primary: "bg-brand-600 text-white shadow-sm hover:bg-brand-700 disabled:bg-ink-300",
     secondary:
-      "border border-ink-200 bg-white text-ink-700 shadow-sm hover:border-ink-300 hover:bg-ink-50 disabled:text-ink-300",
+      "border border-ink-200 bg-surface text-ink-700 shadow-sm hover:border-ink-300 hover:bg-ink-50 disabled:text-ink-300",
     danger: "bg-bad-700 text-white shadow-sm hover:brightness-110",
     ghost: "text-ink-500 hover:bg-ink-100 hover:text-ink-800"
   };
@@ -66,7 +66,7 @@ export function StatusBadge({ status }: { status: string }) {
 // ---------- Forms ----------
 
 const inputCls =
-  "rounded-lg border border-ink-200 bg-white px-2.5 py-1.5 text-sm text-ink-800 placeholder:text-ink-300 focus:border-brand-400";
+  "rounded-lg border border-ink-200 bg-surface px-2.5 py-1.5 text-sm text-ink-800 placeholder:text-ink-300 focus:border-brand-400";
 
 export function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
   return <input {...props} className={`${inputCls} ${props.className ?? ""}`} />;
@@ -109,7 +109,7 @@ export function Page({ title, sub, actions, children }: {
 
 export function Card({ children, className = "" }: { children: ReactNode; className?: string }) {
   return (
-    <div className={`rounded-xl border border-ink-200 bg-white shadow-[0_1px_2px_rgba(20,24,36,0.05)] ${className}`}>
+    <div className={`rounded-xl border border-ink-200 bg-surface shadow-[0_1px_2px_rgba(20,24,36,0.05)] ${className}`}>
       {children}
     </div>
   );
@@ -125,7 +125,7 @@ export function Alert({ children }: { children: ReactNode }) {
 
 export function Empty({ hint, action }: { hint: string; action?: ReactNode }) {
   return (
-    <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-ink-200 bg-white px-6 py-10 text-center">
+    <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-ink-200 bg-surface px-6 py-10 text-center">
       <p className="text-sm text-ink-500">{hint}</p>
       {action}
     </div>
@@ -153,6 +153,30 @@ export function Stat({ label, value, hint }: { label: string; value: ReactNode; 
 
 // ---------- Tables ----------
 
+export function Segmented<T extends string>({ options, value, onChange, label }: {
+  options: { value: T; label: string }[];
+  value: T;
+  onChange: (v: T) => void;
+  label: string;
+}) {
+  return (
+    <div role="group" aria-label={label}
+      className="inline-flex rounded-lg border border-ink-200 bg-surface p-0.5 shadow-sm">
+      {options.map((o) => (
+        <button
+          key={o.value}
+          onClick={() => onChange(o.value)}
+          aria-pressed={value === o.value}
+          className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+            value === o.value ? "bg-ink-800 text-ink-50 shadow-sm" : "text-ink-500 hover:text-ink-800"
+          }`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
 export function Table({ children }: { children: ReactNode }) {
   return (
     <Card className="overflow-hidden">
