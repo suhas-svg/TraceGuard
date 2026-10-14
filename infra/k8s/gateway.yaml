@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: traceguard
+spec:
+  selector:
+    app: gateway
+  ports:
+    - port: 8091
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: traceguard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: traceguard/api:latest
+          args: ["node", "apps/api/dist/gateway.js"]
+          ports:
+            - containerPort: 8091
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: DATABASE_URL } }
+            - name: API_KEY
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: API_KEY } }
+            - name: APPROVER_KEY
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: APPROVER_KEY } }
+            - name: APPROVAL_ARGS_KEY
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: APPROVAL_ARGS_KEY } }
+            - name: GATEWAY_PORT
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: GATEWAY_PORT } }
+            - name: APPROVAL_TTL_SECONDS
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: APPROVAL_TTL_SECONDS } }
+            - name: ALLOW_PRIVATE_UPSTREAMS
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: ALLOW_PRIVATE_UPSTREAMS } }
+            - name: DASHBOARD_ORIGIN
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: DASHBOARD_ORIGIN } }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8091 }
+            periodSeconds: 15
+          resources:
+            requests: { memory: "128Mi", cpu: "100m" }
+            limits: { memory: "512Mi" }

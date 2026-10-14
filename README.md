@@ -42,6 +42,7 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 - TypeScript SDK (`@traceguard/sdk`, zero dependencies) mirrors it: events, budget guard, flush.
 - `examples/demo-agent` submits a sample run and fetches its trace.
 - `examples/mock-tools` is a two-tool upstream for gateway demos.
+- `infra/k8s` holds Kubernetes manifests with a migrate job; see `docs/kubernetes.md`.
 
 ## Phase 4: cost and budgets
 

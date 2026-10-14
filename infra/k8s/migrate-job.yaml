@@ -1,0 +1,25 @@
+# Runs every migration in filename order against the cluster database.
+# Apply after postgres is ready and before the api and gateway roll out.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: traceguard
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: traceguard/migrate:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              for f in $(ls /migrations/*.sql | sort); do
+                echo "applying $f";
+                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" || exit 1;
+              done
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: DATABASE_URL } }

@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .env
 pgdata/
+infra/k8s/secrets.yaml
