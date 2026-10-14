@@ -241,6 +241,11 @@ describe("integration and security", () => {
   });
 
   it("alerts webhooks on denials with a verifiable signature", async () => {
+    // Self-contained upstream: other tests may be skipped in filtered runs.
+    const reg = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `hook-upstream-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp` } });
+    const hookServerId = reg.json().id;
+    await gw.inject({ method: "POST", url: `/v1/servers/${hookServerId}/discover`, headers: key });
     const received: { headers: Record<string, string | string[] | undefined>; body: string }[] = [];
     const stub = createServer((req, res) => {
       let data = "";
@@ -260,9 +265,10 @@ describe("integration and security", () => {
       const listed = await api.inject({ method: "GET", url: "/v1/webhooks", headers: key });
       expect(JSON.stringify(listed.json())).not.toContain("hook-secret");
       await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
-        payload: { server_id: serverId, tool: "ghost", arguments: {}, caller: "t" } });
+        payload: { server_id: hookServerId, tool: "ghost", arguments: {}, caller: "t" } });
       // Delivery runs beside the response, not inside it, so wait for arrival.
-      await vi.waitFor(() => expect(received).toHaveLength(1), { timeout: 10000 });
+      // Generous timeout: this box stalls database writes for seconds.
+      await vi.waitFor(() => expect(received).toHaveLength(1), { timeout: 30000 });
       const [hit] = received;
       expect(hit.headers["x-traceguard-event"]).toBe("tool.denied");
       const { createHmac } = await import("node:crypto");

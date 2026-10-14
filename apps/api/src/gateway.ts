@@ -12,7 +12,7 @@ import {
   type PolicyRule
 } from "./policy.js";
 import { callUpstreamTool, checkUpstreamUrl, definitionHash, discoverTools } from "./upstream.js";
-import { hashesEqual, open as openSealed, parseKey, seal } from "./seal.js";
+import { hashesEqual, parseKey, seal, tryOpen } from "./seal.js";
 import { notify } from "./notify.js";
 
 const API_KEY = process.env.API_KEY ?? "";
@@ -24,8 +24,15 @@ const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN ?? "http://localhost:5173"
 if (!API_KEY) throw new Error("API_KEY is required");
 if (!APPROVER_KEY) throw new Error("APPROVER_KEY is required");
 // Pending approval arguments are sealed at rest. The gateway cannot start
-// without the key, so there is no silent plaintext mode.
+// without the key, so there is no silent plaintext mode. Rotation sets the
+// previous key alongside: old rows still open, new rows seal with primary.
 const ARGS_KEY = parseKey(process.env.APPROVAL_ARGS_KEY ?? "");
+const ARGS_KEYS = [
+  ARGS_KEY,
+  ...((process.env.APPROVAL_ARGS_KEY_PREVIOUS ?? "").trim()
+    ? [parseKey(process.env.APPROVAL_ARGS_KEY_PREVIOUS ?? "")]
+    : [])
+];
 
 // Reads one approval's arguments. New rows unseal with the request id as
 // associated data; rows written before sealing stay readable as plaintext.
@@ -35,7 +42,7 @@ function storedArgs(row: {
   if (!row.args_enc) return row.args as Record<string, unknown>;
   const envelope = row.args as { sealed?: string };
   if (!envelope || typeof envelope.sealed !== "string") throw new Error("bad sealed envelope");
-  return openSealed(ARGS_KEY, envelope.sealed, row.request_id);
+  return tryOpen(ARGS_KEYS, envelope.sealed, row.request_id);
 }
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
