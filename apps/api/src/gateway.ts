@@ -13,6 +13,7 @@ import {
 } from "./policy.js";
 import { callUpstreamTool, checkUpstreamUrl, definitionHash, discoverTools } from "./upstream.js";
 import { hashesEqual, open as openSealed, parseKey, seal } from "./seal.js";
+import { notify } from "./notify.js";
 
 const API_KEY = process.env.API_KEY ?? "";
 const APPROVER_KEY = process.env.APPROVER_KEY ?? "";
@@ -328,6 +329,9 @@ export function buildGateway() {
           decision: "deny", reason: toolRow.rows[0] ? "tool quarantined" : "unknown tool" });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
           resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied" });
+        // Alerts never block the denial they report.
+        void notify(server.workspace_id, "tool.denied",
+          { caller, server_id, tool, reason: toolRow.rows[0] ? "quarantined" : "unknown" });
         return reply.code(403).send({ error: "tool_blocked", reason: "unknown or quarantined tool" });
       }
 
@@ -397,6 +401,8 @@ export function buildGateway() {
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
           resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied",
           metadata: { rule: verdict.rule?.name ?? null } });
+        void notify(server.workspace_id, "tool.denied",
+          { caller, server_id, tool, rule: verdict.rule?.name ?? null, reason: verdict.reason });
         return reply.code(403).send({ error: "tool_blocked", reason: verdict.reason });
       }
 
@@ -420,6 +426,8 @@ export function buildGateway() {
           matched: verdict.matched, reason: verdict.reason, approval_id: row.id });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.request",
           resource_type: "approval", resource_id: row.id, result: "pending" });
+        void notify(server.workspace_id, "approval.requested",
+          { approval_id: row.id, caller, server_id, tool });
         return reply.code(202).send({ approval_id: row.id, status: row.status, expires_at: row.expires_at });
       }
 
@@ -499,6 +507,8 @@ export function buildGateway() {
         resource_type: "approval", resource_id: id,
         result: parsed.data.approved ? "approved" : "denied",
         metadata: { reason: parsed.data.reason } });
+      void notify(approval.workspace_id, "approval.decided",
+        { approval_id: id, result: parsed.data.approved ? "approved" : "denied" });
       return updated.rows[0];
     } catch (err) {
       await client.query("ROLLBACK").catch(() => undefined);
