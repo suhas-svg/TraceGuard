@@ -34,6 +34,9 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
   evaluations to operator URLs with an HMAC signature. Delivery never
   blocks the decision, every attempt is logged, and failures retry from
   `POST /v1/webhooks/deliveries/:id/retry`.
+- Retention rules age out runs, terminal approvals, and delivery logs on a
+  cron-driven run endpoint. Policies, decisions, pending approvals, audit
+  history, and money tables are never deletion targets.
 - `GET /healthz`, `GET /readyz` report liveness and database state.
 - Python SDK sends events over HTTP with a bounded queue and never raises into the agent.
 - `examples/demo-agent` submits a sample run and fetches its trace.

@@ -279,6 +279,38 @@ describe("integration and security", () => {
     }
   });
 
+  it("retains recent data and deletes only what rules allow", async () => {
+    const oldRun = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: oldRun })] } });
+    await pool.query("UPDATE runs SET started_at = now() - interval '30 days' WHERE id = $1", [oldRun]);
+    const freshRun = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: freshRun })] } });
+    // Fixed event timestamps age; pin the fresh run to now so it stays kept.
+    await pool.query("UPDATE runs SET started_at = now() WHERE id = $1", [freshRun]);
+    const rule = await api.inject({ method: "POST", url: "/v1/retention/rules", headers: key,
+      payload: { name: `30d-runs-${tag}`, target: "runs", older_than_days: 30 } });
+    expect(rule.statusCode).toBe(201);
+    const bad = await api.inject({ method: "POST", url: "/v1/retention/rules", headers: key,
+      payload: { name: `bad-${tag}`, target: "audit_events", older_than_days: 1 } });
+    expect(bad.statusCode).toBe(400);
+    const run = await api.inject({ method: "POST", url: "/v1/retention/run", headers: key });
+    expect(run.json().deleted[`30d-runs-${tag}`]).toBeGreaterThanOrEqual(1);
+    const gone = await api.inject({ method: "GET", url: `/v1/runs/${oldRun}`, headers: key });
+    expect(gone.statusCode).toBe(404);
+    const kept = await api.inject({ method: "GET", url: `/v1/runs/${freshRun}`, headers: key });
+    expect(kept.statusCode).toBe(200);
+    // Compliance tables are never valid targets, even by direct insert.
+    await expect(
+      pool.query(
+        `INSERT INTO retention_rules (workspace_id, name, target, older_than_days)
+         VALUES ((SELECT id FROM workspaces WHERE name='default'), $1, 'policies', 1)`,
+        [`hack-${tag}`]
+      )
+    ).rejects.toThrow();
+  });
+
   it("keeps the audit hash chain linked", async () => {
     const rows = await pool.query("SELECT hash, prev_hash FROM audit_events ORDER BY timestamp ASC, id ASC LIMIT 200");
     expect(rows.rows.length).toBeGreaterThan(0);
