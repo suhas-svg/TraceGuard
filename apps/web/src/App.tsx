@@ -168,9 +168,9 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
       {runs.length > 0 && (
         <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
           <Stat label="Loaded" value={runs.length} />
-          <Stat label="Failed" value={counts.failed ?? 0} hint="in this page" />
-          <Stat label="Running" value={counts.running ?? 0} hint="in this page" />
-          <Stat label="Denied spans" value={counts.denied ?? 0} hint="in this page" />
+          <Stat label="Failed" value={counts.failed ?? 0} />
+          <Stat label="Running" value={counts.running ?? 0} />
+          <Stat label="Denied spans" value={counts.denied ?? 0} />
         </div>
       )}
       {error && <Alert>{error}</Alert>}
@@ -184,8 +184,8 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
               <Th>Agent</Th>
               <Th>Status</Th>
               <Th>Started</Th>
-              <Th>Spans</Th>
-              <Th>Tokens in/out</Th>
+              <Th className="text-right">Spans</Th>
+              <Th className="text-right">Tokens in/out</Th>
             </tr>
           </thead>
           <tbody>
@@ -195,8 +195,8 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
                 <Td>{r.agent_name}</Td>
                 <Td><StatusBadge status={r.status} /></Td>
                 <Td className="whitespace-nowrap text-ink-500">{new Date(r.started_at).toLocaleString()}</Td>
-                <Td>{r.span_count}</Td>
-                <Td className="whitespace-nowrap">{r.input_tokens}/{r.output_tokens}</Td>
+                <Td className="text-right">{r.span_count}</Td>
+                <Td className="whitespace-nowrap text-right">{r.input_tokens}/{r.output_tokens}</Td>
               </tr>
             ))}
           </tbody>
