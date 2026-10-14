@@ -13,7 +13,7 @@ import {
 } from "./policy.js";
 import { callUpstreamTool, checkUpstreamUrl, definitionHash, discoverTools } from "./upstream.js";
 import { hashesEqual, parseKey, seal, tryOpen } from "./seal.js";
-import { authHook } from "./auth.js";
+import { authHook, workspaceAllowed } from "./auth.js";
 import { notify } from "./notify.js";
 
 const API_KEY = process.env.API_KEY ?? "";
@@ -319,6 +319,10 @@ export function buildGateway() {
         return reply.code(404).send({ error: "server_not_found" });
       }
       const server = srv.rows[0];
+
+      if (!workspaceAllowed(req.principal, server.workspace_id)) {
+        return reply.code(403).send({ error: "workspace_forbidden", workspace_id: server.workspace_id });
+      }
 
       const toolRow = await client.query(
         "SELECT * FROM server_tools WHERE server_id = $1 AND tool_name = $2", [server_id, tool]

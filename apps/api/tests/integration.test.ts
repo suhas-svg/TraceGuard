@@ -429,6 +429,17 @@ describe("integration and security", () => {
       payload: { email: `agent-${tag}@example.com`, password: "long-password-222", role: "member" } });
     expect(mk.statusCode).toBe(201);
     const memberId = mk.json().id;
+    // Members write only where they belong, so grant the default workspace
+    // this test ingests into.
+    const wsList = await api.inject({ method: "GET", url: "/v1/workspaces", headers: key });
+    let defId = wsList.json().items.find((w: { name: string }) => w.name === "default")?.id;
+    if (!defId) {
+      const created = await api.inject({ method: "POST", url: "/v1/workspaces", headers: key,
+        payload: { name: "default" } });
+      defId = created.json().id;
+    }
+    await api.inject({ method: "POST", url: `/v1/users/${memberId}/memberships`,
+      headers: key, payload: { workspace_id: defId } });
     const kc = await api.inject({ method: "POST", url: `/v1/users/${memberId}/keys`, headers: key,
       payload: { name: "agent", scopes: ["ingest", "gateway"], expires_days: 7 } });
     expect(kc.statusCode).toBe(201);
@@ -462,6 +473,59 @@ describe("integration and security", () => {
     const bad = await api.inject({ method: "POST", url: "/v1/auth/login",
       payload: { email, password: "wrong-password-000" } });
     expect(bad.statusCode).toBe(401);
+  });
+
+  it("confines member writes to their workspaces", async () => {
+    // Two workspaces, one member in the first only.
+    const wsA = await api.inject({ method: "POST", url: "/v1/workspaces", headers: key,
+      payload: { name: `ws-a-${tag}` } });
+    expect(wsA.statusCode).toBe(201);
+    const wsB = await api.inject({ method: "POST", url: "/v1/workspaces", headers: key,
+      payload: { name: `ws-b-${tag}` } });
+    expect(wsB.statusCode).toBe(201);
+    const mu = await api.inject({ method: "POST", url: "/v1/users", headers: key,
+      payload: { email: `ws-${tag}@example.com`, password: "long-password-555", role: "member" } });
+    const memberId = mu.json().id;
+    const grant = await api.inject({ method: "POST", url: `/v1/users/${memberId}/memberships`,
+      headers: key, payload: { workspace_id: wsA.json().id } });
+    expect(grant.statusCode).toBe(201);
+    const pinned = await api.inject({ method: "POST", url: `/v1/users/${memberId}/keys`, headers: key,
+      payload: { name: "pinned", scopes: ["ingest", "gateway"], workspace_id: wsA.json().id } });
+    expect(pinned.statusCode).toBe(201);
+    const elsewhere = await api.inject({ method: "POST", url: `/v1/users/${memberId}/keys`, headers: key,
+      payload: { name: "bad-pin", scopes: ["ingest"], workspace_id: wsB.json().id } });
+    expect(elsewhere.statusCode).toBe(403);
+    const unpinned = await api.inject({ method: "POST", url: `/v1/users/${memberId}/keys`, headers: key,
+      payload: { name: "open", scopes: ["read", "ingest", "gateway"] } });
+    const agentAuth = { authorization: `Bearer ${unpinned.json().key}` };
+    const pinAuth = { authorization: `Bearer ${pinned.json().key}` };
+    const evt = (ws: string) => ({
+      schema_version: "1", event_id: `evt-${randomUUID()}`, agent_name: `ws-${tag}`,
+      run_id: randomUUID(), span_id: randomUUID(), event_type: "run.started",
+      workspace_name: ws, timestamp: new Date().toISOString(), attributes: {}
+    });
+    const home = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: agentAuth,
+      payload: { events: [evt(`ws-a-${tag}`)] } });
+    expect(home.statusCode).toBe(200);
+    const away = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: agentAuth,
+      payload: { events: [evt(`ws-b-${tag}`)] } });
+    expect(away.statusCode).toBe(403);
+    expect(away.json().error).toBe("workspace_forbidden");
+    const conjured = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: agentAuth,
+      payload: { events: [evt(`ws-nope-${tag}`)] } });
+    expect(conjured.statusCode).toBe(403);
+    // The pinned key writes home but nothing else, by construction.
+    const pinHome = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: pinAuth,
+      payload: { events: [evt(`ws-a-${tag}`)] } });
+    expect(pinHome.statusCode).toBe(200);
+    const pinAway = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: pinAuth,
+      payload: { events: [evt(`ws-b-${tag}`)] } });
+    expect(pinAway.statusCode).toBe(403);
+    // Members list their own workspaces only.
+    const listed = await api.inject({ method: "GET", url: "/v1/workspaces", headers: agentAuth });
+    const names = listed.json().items.map((w: { name: string }) => w.name);
+    expect(names).toContain(`ws-a-${tag}`);
+    expect(names).not.toContain(`ws-b-${tag}`);
   });
 
   it("keeps the audit hash chain linked", async () => {

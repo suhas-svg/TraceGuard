@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
+import { workspaceAllowed } from "./auth.js";
 import { notify } from "./notify.js";
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
@@ -156,6 +157,10 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         return reply.code(404).send({ error: "budget_not_found" });
       }
       const budget = b.rows[0];
+      if (!workspaceAllowed(req.principal, budget.workspace_id)) {
+        await client.query("ROLLBACK");
+        return reply.code(403).send({ error: "workspace_forbidden" });
+      }
       const used = Number(budget.spent_micro) + Number(budget.reserved_micro);
       const over = used + parsed.data.max_cost_micro > Number(budget.limit_micro);
 
@@ -215,6 +220,11 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         await client.query("ROLLBACK");
         return reply.code(409).send({ error: "reservation_not_held", status: res.status });
       }
+      const bw = await client.query("SELECT workspace_id FROM budgets WHERE id = $1", [res.budget_id]);
+      if (!workspaceAllowed(req.principal, bw.rows[0]?.workspace_id ?? "")) {
+        await client.query("ROLLBACK");
+        return reply.code(403).send({ error: "workspace_forbidden" });
+      }
       const actual = parsed.data.actual_cost_micro ?? Number(res.amount_micro);
       await client.query(
         `UPDATE budgets SET reserved_micro = reserved_micro - $2, spent_micro = spent_micro + $3,
@@ -246,6 +256,11 @@ export function registerBudgetRoutes(app: FastifyInstance) {
       if (!r.rows[0] || r.rows[0].status !== "held") {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "reservation_not_found" });
+      }
+      const rw = await client.query("SELECT workspace_id FROM budgets WHERE id = $1", [r.rows[0].budget_id]);
+      if (!workspaceAllowed(req.principal, rw.rows[0]?.workspace_id ?? "")) {
+        await client.query("ROLLBACK");
+        return reply.code(403).send({ error: "workspace_forbidden" });
       }
       await client.query("UPDATE budgets SET reserved_micro = reserved_micro - $2 WHERE id = $1",
         [r.rows[0].budget_id, Number(r.rows[0].amount_micro)]);
