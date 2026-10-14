@@ -7,6 +7,7 @@ import { registerEvalRoutes } from "./evals.js";
 import { registerWebhookRoutes } from "./webhooks.js";
 import { registerRetentionRoutes } from "./retention.js";
 import { attrsToObject, mapOtlpSpan, type OtlpSpan } from "./otlp.js";
+import { decodeTraceRequest, encodeEmptyTraceResponse } from "./otlp_proto.js";
 
 const API_KEY = process.env.API_KEY ?? "";
 const PORT = Number(process.env.PORT ?? 8080);
@@ -17,6 +18,14 @@ const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN ?? "http://localhost:5173"
 
 export function buildApp() {
   const app = Fastify({ logger: true, genReqId: () => randomUUID() });
+
+  // OTLP exporters speak binary protobuf by default. This parser hands the
+  // raw bytes to the protobuf decoder instead of the JSON parser.
+  for (const type of ["application/x-protobuf", "application/protobuf"]) {
+    app.addContentTypeParser(type, { parseAs: "buffer" }, (_req, body, done) => {
+      done(null, body);
+    });
+  }
 
   app.get("/healthz", async () => ({ ok: true }));
 
@@ -214,17 +223,27 @@ export function buildApp() {
   registerWebhookRoutes(app);
   registerRetentionRoutes(app);
 
-  // OTLP/HTTP JSON trace receiver. Exporters must use http/json encoding.
-  // Spans in one trace share a run; ids map deterministically so retries
-  // upsert instead of duplicating. Replies with empty partialSuccess per spec.
+  // OTLP/HTTP receiver in both encodings. Exporters default to binary
+  // protobuf; http/json also works. Spans in one trace share a run; ids map
+  // deterministically so retries upsert instead of duplicating. JSON replies
+  // with counts, protobuf replies with an empty partialSuccess per spec.
   app.post("/v1/traces", async (req, reply) => {
-    const body = req.body as {
-      resourceSpans?: {
-        resource?: { attributes?: { key: string; value?: Record<string, unknown> }[] };
-        scopeSpans?: { spans?: OtlpSpan[] }[];
-      }[];
-    };
-    const resourceSpans = body?.resourceSpans;
+    const contentType = String(req.headers["content-type"] ?? "");
+    const isProtobuf = contentType.includes("protobuf");
+    let resourceSpans: {
+      resource?: { attributes?: { key: string; value?: Record<string, unknown> }[] };
+      scopeSpans?: { spans?: OtlpSpan[] }[];
+    }[] | undefined;
+    if (isProtobuf) {
+      try {
+        resourceSpans = decodeTraceRequest(req.body as Buffer).resourceSpans as typeof resourceSpans;
+      } catch {
+        return reply.code(400).send({ error: "invalid_protobuf" });
+      }
+    } else {
+      const body = req.body as { resourceSpans?: typeof resourceSpans };
+      resourceSpans = body?.resourceSpans;
+    }
     if (!Array.isArray(resourceSpans) || resourceSpans.length > 50) {
       return reply.code(400).send({ error: "invalid_traces" });
     }
@@ -280,6 +299,9 @@ export function buildApp() {
         }
       }
       await client.query("COMMIT");
+      if (isProtobuf) {
+        return reply.type("application/x-protobuf").send(encodeEmptyTraceResponse());
+      }
       return { partialSuccess: {}, accepted, duplicates };
     } catch (err) {
       await client.query("ROLLBACK");

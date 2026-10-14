@@ -280,6 +280,10 @@ describe("integration and security", () => {
   });
 
   it("retains recent data and deletes only what rules allow", async () => {
+    // Rules are workspace-global, so start from a clean slate: every rule
+    // here is test-created (the feature is new), and leftovers from earlier
+    // runs would otherwise steal this test's deletions.
+    await pool.query("DELETE FROM retention_rules");
     const oldRun = randomUUID();
     await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
       payload: { events: [ev({ run_id: oldRun })] } });
@@ -309,6 +313,58 @@ describe("integration and security", () => {
         [`hack-${tag}`]
       )
     ).rejects.toThrow();
+  });
+
+  it("ingests binary protobuf traces on the same path as JSON", async () => {
+    const { encodeTraceRequest } = await import("../src/otlp_proto.js");
+    const traceId = randomUUID().replace(/-/g, "");
+    const spanId = randomUUID().replace(/-/g, "").slice(0, 16);
+    const nano = (agoMs: number) => String(BigInt(Date.now() - agoMs) * 1_000_000n);
+    const obj = {
+      resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: `pb-${tag}` } }] },
+        scopeSpans: [{ spans: [{
+          traceId: Buffer.from(traceId, "hex"),
+          spanId: Buffer.from(spanId, "hex"),
+          name: "gen_ai.chat",
+          startTimeUnixNano: nano(500),
+          endTimeUnixNano: nano(0),
+          attributes: [
+            { key: "gen_ai.system", value: { stringValue: "anthropic" } },
+            { key: "gen_ai.request.model", value: { stringValue: "claude-x" } },
+            { key: "gen_ai.usage.input_tokens", value: { intValue: 7 } },
+            { key: "gen_ai.usage.output_tokens", value: { intValue: 3 } }
+          ]
+        }] }]
+      }]
+    };
+    const bytes = encodeTraceRequest(obj);
+    const first = await api.inject({ method: "POST", url: "/v1/traces",
+      headers: { ...key, "content-type": "application/x-protobuf" }, payload: bytes });
+    expect(first.statusCode).toBe(200);
+    expect(first.headers["content-type"]).toContain("application/x-protobuf");
+    const runs = await api.inject({ method: "GET", url: "/v1/runs?limit=50", headers: key });
+    const run = runs.json().items.find((r: { agent_name: string }) => r.agent_name === `pb-${tag}`);
+    expect(run).toBeDefined();
+    const trace = await api.inject({ method: "GET", url: `/v1/runs/${run.id}/trace`, headers: key });
+    expect(trace.json().spans[0].provider).toBe("anthropic");
+    // Same trace over JSON dedupes: both encodings share one id mapping.
+    const jsonSpan = {
+      traceId: traceId,
+      spanId: spanId,
+      name: "gen_ai.chat",
+      startTimeUnixNano: nano(500),
+      endTimeUnixNano: nano(0),
+      attributes: [
+        { key: "gen_ai.system", value: { stringValue: "anthropic" } },
+        { key: "gen_ai.request.model", value: { stringValue: "claude-x" } },
+        { key: "gen_ai.usage.input_tokens", value: { intValue: "7" } },
+        { key: "gen_ai.usage.output_tokens", value: { intValue: "3" } }
+      ]
+    };
+    const jsonAgain = await api.inject({ method: "POST", url: "/v1/traces", headers: key,
+      payload: { resourceSpans: [{ resource: { attributes: [{ key: "service.name", value: { stringValue: "pb-" + tag } }] }, scopeSpans: [{ spans: [jsonSpan] }] }] } });
+    expect(jsonAgain.json()).toMatchObject({ accepted: 0, duplicates: 1 });
   });
 
   it("keeps the audit hash chain linked", async () => {
