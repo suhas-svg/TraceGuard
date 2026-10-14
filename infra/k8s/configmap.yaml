@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traceguard-config
+  namespace: traceguard
+data:
+  PORT: "8080"
+  GATEWAY_PORT: "8091"
+  APPROVAL_TTL_SECONDS: "300"
+  ALLOW_PRIVATE_UPSTREAMS: "false"
+  DASHBOARD_ORIGIN: "http://localhost:5173"
