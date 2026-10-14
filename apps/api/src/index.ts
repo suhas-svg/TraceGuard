@@ -6,6 +6,7 @@ import { registerBudgetRoutes } from "./budgets.js";
 import { registerEvalRoutes } from "./evals.js";
 import { registerWebhookRoutes } from "./webhooks.js";
 import { registerRetentionRoutes } from "./retention.js";
+import { registerReconciliationRoutes } from "./reconciliation.js";
 import { attrsToObject, mapOtlpSpan, type OtlpSpan } from "./otlp.js";
 import { decodeTraceRequest, encodeEmptyTraceResponse } from "./otlp_proto.js";
 
@@ -222,6 +223,7 @@ export function buildApp() {
   registerEvalRoutes(app);
   registerWebhookRoutes(app);
   registerRetentionRoutes(app);
+  registerReconciliationRoutes(app);
 
   // OTLP/HTTP receiver in both encodings. Exporters default to binary
   // protobuf; http/json also works. Spans in one trace share a run; ids map

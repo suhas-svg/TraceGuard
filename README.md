@@ -38,6 +38,8 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 - Retention rules age out runs, terminal approvals, and delivery logs on a
   cron-driven run endpoint. Policies, decisions, pending approvals, audit
   history, and money tables are never deletion targets.
+- Reconciliation imports provider actuals and compares them against
+  estimates per model and period, with a Costs tab showing variance.
 - `GET /healthz`, `GET /readyz` report liveness and database state.
 - Python SDK sends events over HTTP with a bounded queue and never raises into the agent.
 - TypeScript SDK (`@traceguard/sdk`, zero dependencies) mirrors it: events, budget guard, flush.

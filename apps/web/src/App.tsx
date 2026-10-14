@@ -6,6 +6,7 @@ import PoliciesView from "./Policies";
 import ApprovalsView from "./Approvals";
 import WebhooksView from "./Webhooks";
 import RetentionView from "./Retention";
+import CostsView from "./Costs";
 
 function StatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
@@ -303,7 +304,7 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
 
 export default function App() {
   const [openRun, setOpenRun] = useState<string | null>(null);
-  const [tab, setTab] = useState<"runs" | "evals" | "policy" | "approvals" | "webhooks" | "retention">("runs");
+  const [tab, setTab] = useState<"runs" | "evals" | "policy" | "approvals" | "webhooks" | "retention" | "costs">("runs");
   const [settingsTick, setSettingsTick] = useState(0);
   return (
     <div className="min-h-screen bg-white text-gray-900">
@@ -346,6 +347,12 @@ export default function App() {
           >
             Retention
           </button>
+          <button
+            className={`rounded px-2 py-1 ${tab === "costs" ? "bg-gray-800 text-white" : "border"}`}
+            onClick={() => setTab("costs")}
+          >
+            Costs
+          </button>
         </nav>
       </header>
       <SettingsBar onSaved={() => setSettingsTick((t) => t + 1)} />
@@ -360,6 +367,8 @@ export default function App() {
           <WebhooksView />
         ) : tab === "retention" ? (
           <RetentionView />
+        ) : tab === "costs" ? (
+          <CostsView />
         ) : openRun ? (
           <TraceView runId={openRun} onBack={() => setOpenRun(null)} />
         ) : (
