@@ -19,3 +19,23 @@ variable, which is how the compose file reads them.
 
 Ports on a dev machine: API 8090, gateway 8091, mock tools 8092
 (internal network only), web 5173.
+
+## Users and scoped keys
+
+Single-user installs keep working: `API_KEY` has full access and
+`APPROVER_KEY` approves. For teams, register the first user, which becomes
+admin because no users exist yet, then create users and keys:
+
+- `POST /v1/auth/register {email, password}` stays open only until the
+  first user exists; afterwards it returns 403.
+- `POST /v1/users {email, password, role}` needs an admin. Roles map to
+  scopes: admin gets everything, member gets read, ingest, and gateway,
+  approver gets read and approve.
+- `POST /v1/users/:id/keys {name, scopes, expires_days}` returns the key
+  plaintext exactly once; only its hash is stored.
+- `POST /v1/auth/login {email, password}` mints a 24-hour bearer.
+- `DELETE /v1/users/:id/keys/:keyId` revokes.
+
+Agent keys carry gateway scope at most, so they can ingest and call tools
+but never approve. Writes default to admin unless the path is an explicit
+agent or approver action. Passwords hash with scrypt, keys with SHA-256.

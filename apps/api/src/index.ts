@@ -9,8 +9,9 @@ import { registerRetentionRoutes } from "./retention.js";
 import { registerReconciliationRoutes } from "./reconciliation.js";
 import { attrsToObject, mapOtlpSpan, type OtlpSpan } from "./otlp.js";
 import { decodeTraceRequest, encodeEmptyTraceResponse } from "./otlp_proto.js";
+import { authHook } from "./auth.js";
+import { registerUserRoutes } from "./users.js";
 
-const API_KEY = process.env.API_KEY ?? "";
 const PORT = Number(process.env.PORT ?? 8080);
 // The browser dashboard fetches cross-origin, so the API answers CORS.
 // Single trusted origin, configured per deploy. The gateway gets the same
@@ -36,17 +37,13 @@ export function buildApp() {
     return { ok: true };
   });
 
-  // shortcut: single API key for all /v1 routes. Upgrade to scoped
-  // ingest/gateway/admin keys plus login before multi-user use.
+  // CORS first, then the central scoped-auth hook. The old single key still
+  // works with full access; user keys carry role scopes instead.
   app.addHook("onRequest", async (req, reply) => {
     reply.header("Access-Control-Allow-Origin", DASHBOARD_ORIGIN);
     reply.header("Access-Control-Allow-Headers", "authorization, content-type");
     if (req.method === "OPTIONS") return reply.code(204).send();
-    if (!req.url.startsWith("/v1/")) return;
-    const auth = req.headers.authorization ?? "";
-    if (auth !== `Bearer ${API_KEY}`) {
-      return reply.code(401).send({ error: "unauthorized" });
-    }
+    await authHook(req, reply);
   });
 
   app.post("/v1/ingest/events", async (req, reply) => {
@@ -224,6 +221,7 @@ export function buildApp() {
   registerWebhookRoutes(app);
   registerRetentionRoutes(app);
   registerReconciliationRoutes(app);
+  registerUserRoutes(app);
 
   // OTLP/HTTP receiver in both encodings. Exporters default to binary
   // protobuf; http/json also works. Spans in one trace share a run; ids map
