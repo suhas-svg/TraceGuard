@@ -43,7 +43,10 @@ jobs:
       - run: ./node_modules/.bin/tsc -p packages/schemas/tsconfig.json
       - run: ./node_modules/.bin/tsc -p apps/api/tsconfig.json
       - run: ./node_modules/.bin/tsc -p apps/web/tsconfig.json
+      - run: ./node_modules/.bin/tsc -p sdks/typescript/tsconfig.json
+      - run: ./node_modules/.bin/tsc -p examples/demo-agent-ts/tsconfig.json
       - run: for f in apps/api/migrations/*.sql; do psql "$DATABASE_URL" -f "$f"; done
       - run: ./node_modules/.bin/vitest run --root apps/api
       - run: ./node_modules/.bin/vitest run --root apps/web
+      - run: ./node_modules/.bin/vitest run --root sdks/typescript
       - run: python -m py_compile sdks/python/traceguard/client.py examples/demo-agent/main.py
