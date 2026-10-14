@@ -4,6 +4,8 @@ import { buildTree, tokenTotal, type SpanNode } from "./tree";
 import EvalsView from "./Evals";
 import PoliciesView from "./Policies";
 import ApprovalsView from "./Approvals";
+import WebhooksView from "./Webhooks";
+import RetentionView from "./Retention";
 
 function StatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
@@ -301,7 +303,7 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
 
 export default function App() {
   const [openRun, setOpenRun] = useState<string | null>(null);
-  const [tab, setTab] = useState<"runs" | "evals" | "policy" | "approvals">("runs");
+  const [tab, setTab] = useState<"runs" | "evals" | "policy" | "approvals" | "webhooks" | "retention">("runs");
   const [settingsTick, setSettingsTick] = useState(0);
   return (
     <div className="min-h-screen bg-white text-gray-900">
@@ -332,6 +334,18 @@ export default function App() {
           >
             Approvals
           </button>
+          <button
+            className={`rounded px-2 py-1 ${tab === "webhooks" ? "bg-gray-800 text-white" : "border"}`}
+            onClick={() => setTab("webhooks")}
+          >
+            Webhooks
+          </button>
+          <button
+            className={`rounded px-2 py-1 ${tab === "retention" ? "bg-gray-800 text-white" : "border"}`}
+            onClick={() => setTab("retention")}
+          >
+            Retention
+          </button>
         </nav>
       </header>
       <SettingsBar onSaved={() => setSettingsTick((t) => t + 1)} />
@@ -342,6 +356,10 @@ export default function App() {
           <PoliciesView />
         ) : tab === "approvals" ? (
           <ApprovalsView />
+        ) : tab === "webhooks" ? (
+          <WebhooksView />
+        ) : tab === "retention" ? (
+          <RetentionView />
         ) : openRun ? (
           <TraceView runId={openRun} onBack={() => setOpenRun(null)} />
         ) : (

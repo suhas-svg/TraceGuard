@@ -93,6 +93,24 @@ export function getUsage(runId: string) {
   return get<RunUsage>(`/v1/runs/${runId}/usage`);
 }
 
+async function postApi<T>(path: string, body: unknown, method = "POST"): Promise<T> {
+  const res = await fetch(`${settings.url}${path}`, {
+    method,
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${settings.key}` },
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  if (res.status === 401) throw new Error("unauthorized: check the API key in settings");
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error((data as { error?: string }).error ?? `request failed: ${res.status}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+async function deleteApi<T>(path: string): Promise<T> {
+  return postApi<T>(path, undefined, "DELETE");
+}
+
 export function formatMicro(micro: number): string {
   return `$${(micro / 1_000_000).toFixed(4)}`;
 }
@@ -213,4 +231,55 @@ export const gwApi = {
   call: (body: Record<string, unknown>) =>
     gw<{ result?: unknown; approval_id?: string; status?: string; expires_at?: string }>(
       "/v1/gateway/tools/call", { method: "POST", body: JSON.stringify(body) })
+};
+
+export interface Webhook {
+  id: string;
+  name: string;
+  url: string;
+  events: string[];
+  enabled: boolean;
+}
+
+export interface Delivery {
+  id: string;
+  subscription: string;
+  event_type: string;
+  status: string;
+  attempts: number;
+  last_error: string | null;
+  created_at: string;
+}
+
+export interface RetentionRule {
+  id: string;
+  name: string;
+  target: string;
+  older_than_days: number;
+  enabled: boolean;
+}
+
+export interface RetentionRun {
+  id: string;
+  started_at: string;
+  ended_at: string | null;
+  deleted_counts: Record<string, number>;
+  status: string;
+}
+
+export const opsApi = {
+  webhooks: () => get<{ items: Webhook[] }>("/v1/webhooks"),
+  createWebhook: (w: Record<string, unknown>) => postApi<Webhook>("/v1/webhooks", w),
+  deleteWebhook: (id: string) => deleteApi<{ ok: boolean }>(`/v1/webhooks/${id}`),
+  deliveries: (status?: string) =>
+    get<{ items: Delivery[] }>(`/v1/webhooks/deliveries${status ? `?status=${status}` : ""}`),
+  retryDelivery: (id: string) =>
+    postApi<{ status: string; lastError: string | null }>(`/v1/webhooks/deliveries/${id}/retry`, {}),
+  retentionRules: () => get<{ items: RetentionRule[] }>("/v1/retention/rules"),
+  createRetentionRule: (r: Record<string, unknown>) => postApi<RetentionRule>("/v1/retention/rules", r),
+  updateRetentionRule: (id: string, r: Record<string, unknown>) =>
+    postApi<RetentionRule>(`/v1/retention/rules/${id}`, r, "PUT"),
+  deleteRetentionRule: (id: string) => deleteApi<{ ok: boolean }>(`/v1/retention/rules/${id}`),
+  runRetention: () => postApi<{ run_id: string; deleted: Record<string, number> }>("/v1/retention/run", {}),
+  retentionRuns: () => get<{ items: RetentionRun[] }>("/v1/retention/runs")
 };
