@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { opsApi, type TeamUser, type Workspace } from "./api";
 import {
   Alert, Badge, Button, Card, Empty, Field, Input,
@@ -151,32 +152,19 @@ function WorkspacePicker({ options, value, onPick, exclude, allowBlank, blankLab
 }
 
 export default function UsersView() {
-  const [users, setUsers] = useState<TeamUser[] | null>(null);
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
-  const [denied, setDenied] = useState(false);
-  const [error, setError] = useState("");
   const [form, setForm] = useState({ email: "", password: "", role: "member" });
   const [wsName, setWsName] = useState("");
+  const [error, setError] = useState("");
+  const queryClient = useQueryClient();
+  const teamQuery = useQuery({ queryKey: ["team"], queryFn: () => opsApi.team() });
+  const workspacesQuery = useQuery({ queryKey: ["workspaces"], queryFn: () => opsApi.workspaces() });
+  const workspaces = workspacesQuery.data?.items ?? [];
+  const loadError = teamQuery.error ?? workspacesQuery.error;
+  const denied = loadError instanceof Error && /forbidden|unauthorized/i.test(loadError.message);
+  const loadFailed = loadError && !denied ? (loadError instanceof Error ? loadError.message : "load failed") : "";
+  const users = teamQuery.data?.items ?? null;
 
-  const reload = () =>
-    Promise.all([opsApi.team(), opsApi.workspaces()])
-      .then(([t, w]) => {
-        setUsers(t.items);
-        setWorkspaces(w.items);
-        setDenied(false);
-      })
-      .catch((e) => {
-        if (e instanceof Error && /forbidden|unauthorized/i.test(e.message)) {
-          setDenied(true);
-          setUsers([]);
-        } else {
-          setError(e instanceof Error ? e.message : "load failed");
-        }
-      });
-
-  useEffect(() => {
-    reload();
-  }, []);
+  const reload = () => queryClient.invalidateQueries();
 
   const nameOf = (id: string) => workspaces.find((w) => w.id === id)?.name ?? id.slice(0, 8);
 
@@ -193,7 +181,7 @@ export default function UsersView() {
       title="Users"
       sub="Team, keys, and workspace membership. Key plaintext shows once, at mint."
     >
-      {error && <Alert>{error}</Alert>}
+      {(error || loadFailed) && <Alert>{error || loadFailed}</Alert>}
       <div className="mb-5 grid gap-4 lg:grid-cols-2">
         <Card className="p-4">
           <h3 className="mb-2 text-sm font-semibold text-ink-700">New user</h3>

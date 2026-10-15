@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { opsApi, type RetentionRule, type RetentionRun } from "./api";
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { opsApi } from "./api";
 import {
   Alert, Button, Card, Empty, Field, Input, Page,
   Select, StatusBadge
@@ -8,23 +9,18 @@ import {
 const TARGETS = ["runs", "approvals", "webhook_deliveries"];
 
 export default function RetentionView() {
-  const [rules, setRules] = useState<RetentionRule[]>([]);
-  const [runs, setRuns] = useState<RetentionRun[]>([]);
   const [form, setForm] = useState({ name: "", target: "runs", older_than_days: "30" });
   const [error, setError] = useState("");
   const [lastRun, setLastRun] = useState<Record<string, number> | null>(null);
+  const queryClient = useQueryClient();
+  const rulesQuery = useQuery({ queryKey: ["retention-rules"], queryFn: () => opsApi.retentionRules() });
+  const runsQuery = useQuery({ queryKey: ["retention-runs"], queryFn: () => opsApi.retentionRuns() });
+  const rules = rulesQuery.data?.items ?? [];
+  const runs = runsQuery.data?.items ?? [];
+  const loadError = rulesQuery.error ?? runsQuery.error;
+  const loadFailed = loadError ? (loadError instanceof Error ? loadError.message : "load failed") : "";
 
-  const reload = () =>
-    Promise.all([opsApi.retentionRules(), opsApi.retentionRuns()])
-      .then(([r, h]) => {
-        setRules(r.items);
-        setRuns(h.items);
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : "load failed"));
-
-  useEffect(() => {
-    reload();
-  }, []);
+  const reload = () => queryClient.invalidateQueries();
 
   return (
     <Page
@@ -37,7 +33,7 @@ export default function RetentionView() {
         </Button>
       }
     >
-      {error && <Alert>{error}</Alert>}
+      {(error || loadFailed) && <Alert>{error || loadFailed}</Alert>}
       {lastRun && (
         <Card className="mb-4 border-ok-700/20 bg-ok-100/50 px-4 py-2.5 text-sm text-ok-800">
           Deleted: {Object.entries(lastRun).map(([k, v]) => `${k}: ${v}`).join(", ") || "nothing"}

@@ -141,6 +141,22 @@ export function Spinner({ label = "Loading..." }: { label?: string }) {
   );
 }
 
+export function Skeleton({ className = "" }: { className?: string }) {
+  return <div aria-hidden="true" className={`animate-pulse rounded-lg bg-ink-100 ${className}`} />;
+}
+
+export function TableSkeleton({ rows = 6, label = "Loading..." }: { rows?: number; label?: string }) {
+  return (
+    <Card className="p-3">
+      <div className="space-y-2" role="status" aria-label={label}>
+        {Array.from({ length: rows }).map((_, i) => (
+          <Skeleton key={i} className="h-8" />
+        ))}
+      </div>
+    </Card>
+  );
+}
+
 export function Stat({ label, value, hint }: { label: string; value: ReactNode; hint?: string }) {
   return (
     <Card className="px-4 py-3">

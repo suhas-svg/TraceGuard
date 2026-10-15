@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { gwApi, type Approval } from "./api";
 import {
   Alert, Button, Card, Empty, Input, Page,
-  Segmented, StatusBadge
+  Segmented, Spinner, StatusBadge
 } from "./components";
 
 function ApprovalCard({ a, onChanged }: { a: Approval; onChanged: () => void }) {
@@ -70,17 +71,14 @@ function ApprovalCard({ a, onChanged }: { a: Approval; onChanged: () => void }) 
 
 export default function ApprovalsView() {
   const [filter, setFilter] = useState("pending");
-  const [items, setItems] = useState<Approval[]>([]);
-  const [error, setError] = useState("");
-
-  const reload = () =>
-    gwApi.approvals(filter || undefined)
-      .then((r) => setItems(r.items))
-      .catch((e) => setError(e instanceof Error ? e.message : "load failed"));
-
-  useEffect(() => {
-    reload();
-  }, [filter]);
+  const approvalsQuery = useQuery({
+    queryKey: ["approvals", filter],
+    queryFn: () => gwApi.approvals(filter || undefined),
+    refetchInterval: 10_000
+  });
+  const items = approvalsQuery.data?.items ?? [];
+  const error = approvalsQuery.error instanceof Error ? approvalsQuery.error.message : "";
+  const reload = () => approvalsQuery.refetch();
 
   return (
     <Page
@@ -106,7 +104,11 @@ export default function ApprovalsView() {
       }
     >
       {error && <Alert>{error}</Alert>}
-      {items.length === 0 && <Empty hint="Nothing here. Held calls appear under the pending filter." />}
+      {approvalsQuery.isPending ? (
+        <Spinner label="Loading approvals..." />
+      ) : items.length === 0 ? (
+        <Empty hint="Nothing here. Held calls appear under the pending filter." />
+      ) : null}
       {items.map((a) => (
         <ApprovalCard key={a.id} a={a} onChanged={reload} />
       ))}
