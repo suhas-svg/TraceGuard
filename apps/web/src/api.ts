@@ -138,7 +138,7 @@ export interface EvalResult {
   passed: boolean;
   assertion_results: { type: string; passed: boolean; message: string }[];
   latency_ms: number;
-  cost_micro: number;
+  cost_micro: number | null;
   error_summary: string | null;
   agent_run_id: string | null;
 }

@@ -60,8 +60,8 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
   price in force at the time. Spans with no matching price report NULL and
   list under `missing_pricing`, never zero.
 - `POST /v1/budgets` sets run or agent limits with block or warn effects.
-  The managed path reserves before the call in one atomic UPDATE, then
-  settles to the measured cost. A blocked call gets 409 and the SDK raises
+  The managed path reserves before the call under a row lock, then settles
+  to the measured cost. A blocked call gets 409 and the SDK raises
   `BudgetExceeded` instead of calling the provider.
 - The Python SDK gained `BudgetGuard` plus `flush`, and now stamps Zulu
   timestamps the API accepts.
@@ -89,7 +89,8 @@ Unit checks: `npm install && npm test`.
   Load more pagination, plus a trace view with a nested span tree, per-span
   detail, token totals, and denied-by-policy shown apart from failures.
 - API URL and key are editable in the page header and kept in localStorage.
-  The dashboard never writes: policy and approval actions stay in API clients.
+  Policy and approval actions live on their own tabs; run views stay
+  read-only.
 - Run it: `npm run dev --workspace=@traceguard/web` (port 5173) against the
   API on 8090, or `docker compose up web` for the built bundle.
 
@@ -116,11 +117,13 @@ Unit checks: `npm install && npm test`.
   discover, add an allow rule, and call through
   `POST /v1/gateway/tools/call` on port 8091.
 
-## Deferred to later phases
+## Status
 
-Pricing and budgets, evaluation, dashboard. Gateway, policy, approvals, and
-audit are done in Phase 2. Each remaining piece lands as its own phase with
-its own exit test.
+Every roadmap phase above is implemented: ingestion and the trace dashboard,
+the gateway with policy, approvals, and audit, budgets and pricing, and the
+evaluation workbench. Webhooks, retention, reconciliation, users and
+memberships, and OTLP ingestion landed on top; their sections are under
+"What works now".
 
 ## Scope decisions from the review
 

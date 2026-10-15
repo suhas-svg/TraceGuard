@@ -73,12 +73,14 @@ function dropPooled(key: string): void {
 
 // One reused client per upstream. Calls to the same server queue behind each
 // other on a promise chain, so two concurrent calls never share one MCP
-// exchange. Idle clients reconnect on next use; a failed call drops the
-// client and retries once on a fresh connection.
+// exchange. Idle clients reconnect on next use. Only read-only discovery
+// retries once after a transport failure; a tool call never does, because a
+// lost response does not prove the tool did not run (spec section 14).
 async function withClient<T>(
   baseUrl: string,
   authSecret: string | null,
-  fn: (client: Client) => Promise<T>
+  fn: (client: Client) => Promise<T>,
+  retryTransport = false
 ): Promise<T> {
   const key = poolKey(baseUrl, authSecret);
   const run = async (retried: boolean): Promise<T> => {
@@ -97,10 +99,9 @@ async function withClient<T>(
     try {
       return await task;
     } catch (err) {
-      if (!retried) {
-        if (pool.get(key) === current) dropPooled(key);
-        return run(true);
-      }
+      // A failed exchange may poison the pooled client; drop it either way.
+      if (pool.get(key) === current) dropPooled(key);
+      if (retryTransport && !retried) return run(true);
       throw err;
     }
   };
@@ -118,7 +119,7 @@ export async function discoverTools(
       description: t.description ?? "",
       inputSchema: (t.inputSchema as Record<string, unknown>) ?? {}
     }));
-  });
+  }, true);
 }
 
 export async function callUpstreamTool(

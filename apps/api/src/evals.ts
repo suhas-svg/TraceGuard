@@ -38,7 +38,7 @@ async function executeCase(
   agentName: string,
   exec: ExecConfig,
   model: string
-): Promise<{ runId: string; output: string; tools: string[]; status: string; latencyMs: number; costMicro: number }> {
+): Promise<{ runId: string; output: string; tools: string[]; status: string; latencyMs: number; costMicro: number | null }> {
   const started = Date.now();
   const runId = randomUUID();
   const rootId = randomUUID();
@@ -68,8 +68,8 @@ async function executeCase(
   const tools = exec.tools ?? [];
   await addSpan(randomUUID(), rootId, "model.request", {
     duration_ms: Date.now() - started, provider: exec.provider ?? "scripted",
-    model: exec.model ?? model, input_tokens: exec.input_tokens ?? 0,
-    output_tokens: exec.output_tokens ?? 0
+    model: exec.model ?? model, input_tokens: exec.input_tokens ?? null,
+    output_tokens: exec.output_tokens ?? null
   });
   const toolNames: string[] = [];
   for (const t of tools) {
@@ -88,13 +88,16 @@ async function executeCase(
     "SELECT * FROM pricing WHERE provider=$1 AND model=$2 ORDER BY effective_from DESC LIMIT 1",
     [exec.provider ?? "scripted", exec.model ?? model]
   );
-  const cost = price.rows[0]
+  // Unknown price or unknown usage stays NULL, never zero (same rule as the
+  // usage endpoint; comparisons must not read "no price" as "$0.00").
+  const priced = price.rows[0] != null && (exec.input_tokens != null || exec.output_tokens != null);
+  const cost = priced
     ? estimateCostMicro(exec.input_tokens ?? 0, exec.output_tokens ?? 0, 0, {
         input_price_per_million: Number(price.rows[0].input_price_per_million),
         output_price_per_million: Number(price.rows[0].output_price_per_million),
         cached_input_price_per_million: Number(price.rows[0].cached_input_price_per_million)
       })
-    : 0;
+    : null;
   return { runId, output: exec.output ?? "", tools: toolNames, status,
     latencyMs: Date.now() - started, costMicro: cost };
 }
@@ -230,7 +233,9 @@ export function registerEvalRoutes(app: FastifyInstance) {
             ...((cfg.exec_overrides[c.name] ?? {}) as Partial<ExecConfig>) };
           const out = await executeCase(client, workspaceId, agent.rows[0].id,
             cfg.agent_name, exec, cfg.model);
-          spent += out.costMicro;
+          // Unknown costs cannot count against the cap; the cap is a guard,
+          // not an accounting.
+          spent += out.costMicro ?? 0;
           const ctx = { output: out.output, tools: out.tools, status: out.status };
           const assertionResults = ((c.assertions ?? []) as Record<string, unknown>[])
             .map((a) => ({ type: String(a.type ?? "?"), ...runAssertion(a, ctx) }));
@@ -281,8 +286,9 @@ export function registerEvalRoutes(app: FastifyInstance) {
     return { eval_run: run.rows[0], results: results.rows };
   });
 
-  // Compare explicit run ids on pass rate, latency, cost, and violations.
-  // Missing data stays missing: absent costs do not count as zero.
+  // Compare explicit run ids on pass rate, latency, cost, token usage, and
+  // violations. Missing data stays missing: absent costs and tokens do not
+  // count as zero.
   app.get("/v1/evaluations/runs/compare", async (req, reply) => {
     const q = req.query as { ids?: string };
     const ids = (q.ids ?? "").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 5);
@@ -303,6 +309,14 @@ export function registerEvalRoutes(app: FastifyInstance) {
          WHERE e.eval_run_id = $1 AND s.status = 'denied'`, [r.id]
       );
       const passed = res.rows.filter((x) => x.passed).length;
+      const costs = res.rows.map((x) => (x.cost_micro == null ? null : Number(x.cost_micro)))
+        .filter((c): c is number => c !== null);
+      const tokens = await pool.query(
+        `SELECT SUM(s.input_tokens) AS input_tokens, SUM(s.output_tokens) AS output_tokens
+           FROM spans s JOIN eval_results e ON e.agent_run_id = s.run_id
+          WHERE e.eval_run_id = $1`, [r.id]
+      );
+      const num = (v: unknown) => (v == null ? null : Number(v));
       out.push({
         eval_run_id: r.id, agent_name: r.agent_name, config_fingerprint: r.config_fingerprint,
         model: r.model, trials: r.trials, cases: res.rows.length, passed,
@@ -310,7 +324,9 @@ export function registerEvalRoutes(app: FastifyInstance) {
         latency_ms: lat.length
           ? { mean: Math.round(lat.reduce((a, b) => a + b, 0) / lat.length), min: Math.min(...lat), max: Math.max(...lat) }
           : null,
-        cost_micro: res.rows.reduce((a, x) => a + Number(x.cost_micro), 0),
+        cost_micro: costs.length ? costs.reduce((a, b) => a + b, 0) : null,
+        input_tokens: num(tokens.rows[0].input_tokens),
+        output_tokens: num(tokens.rows[0].output_tokens),
         violations: Number(denied.rows[0]?.n ?? 0)
       });
     }

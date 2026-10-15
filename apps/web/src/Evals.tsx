@@ -21,7 +21,7 @@ function ResultRow({ r, onOpenRun }: { r: EvalResult; onOpenRun: (id: string) =>
         <Badge tone={r.passed ? "ok" : "bad"}>{r.passed ? "pass" : "fail"}</Badge>
       </Td>
       <Td className="whitespace-nowrap">{r.latency_ms}ms</Td>
-      <Td className="whitespace-nowrap">{formatMicro(Number(r.cost_micro))}</Td>
+      <Td className="whitespace-nowrap">{r.cost_micro == null ? "n/a" : formatMicro(Number(r.cost_micro))}</Td>
       <Td className="max-w-xs text-ink-500">
         {r.passed ? "" : (r.error_summary ?? "")}
         {!r.passed &&
@@ -160,6 +160,7 @@ export default function EvalsView({ onOpenRun }: { onOpenRun: (id: string) => vo
                   <Th>Rate</Th>
                   <Th>Latency mean</Th>
                   <Th>Cost</Th>
+                  <Th>Tokens</Th>
                   <Th>Violations</Th>
                 </tr>
               </thead>
@@ -170,7 +171,8 @@ export default function EvalsView({ onOpenRun }: { onOpenRun: (id: string) => vo
                     <Td>{String(r.passed)}/{String((r as { cases: number }).cases)}</Td>
                     <Td>{r.pass_rate == null ? "n/a" : `${Math.round(Number(r.pass_rate) * 100)}%`}</Td>
                     <Td>{r.latency_ms ? `${(r.latency_ms as { mean: number }).mean}ms` : "n/a"}</Td>
-                    <Td>{formatMicro(Number(r.cost_micro))}</Td>
+                    <Td>{r.cost_micro == null ? "n/a" : formatMicro(Number(r.cost_micro))}</Td>
+                    <Td>{r.input_tokens == null && r.output_tokens == null ? "n/a" : `${r.input_tokens ?? "?"}/${r.output_tokens ?? "?"}`}</Td>
                     <Td>{String(r.violations)}</Td>
                   </tr>
                 ))}

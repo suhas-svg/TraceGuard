@@ -7,7 +7,7 @@
 - Denied calls never contact the upstream server. The security suite asserts
   this with upstream hit counters, not just status codes.
 - Agent credentials cannot decide approvals. The decision endpoint takes a
-  separate key and answers 401 to agent keys.
+  separate key and answers 403 to agent keys.
 - Costs are estimates from provider-reported usage and versioned prices,
   never billing truth.
 
@@ -16,6 +16,11 @@
 Model output truth, prompt injection in general, safety of tools called
 outside the gateway, or protection when the agent can reach upstream
 servers directly. Run upstreams on the internal tools network.
+
+The `caller` and `agent_id` fields on gateway calls are attribution the
+caller supplies, not authenticated identity; policy scoping on them tells
+cooperative agents apart, not adversaries. Give each agent its own key when
+identity must be authenticated.
 
 ## Retention
 

@@ -143,15 +143,16 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     ttl_seconds: z.number().int().min(1).default(300)
   });
 
-  // Reserve-before-call. One atomic UPDATE decides, so concurrent calls cannot
-  // all slip past an exhausted budget together.
+  // Reserve-before-call. SELECT ... FOR UPDATE holds the budget row for the
+  // rest of the check, so concurrent calls serialize and cannot both pass an
+  // exhausted budget.
   app.post("/v1/budgets/check", async (req, reply) => {
     const parsed = checkSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_check" });
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      const b = await client.query("SELECT * FROM budgets WHERE id = $1", [parsed.data.budget_id]);
+      const b = await client.query("SELECT * FROM budgets WHERE id = $1 FOR UPDATE", [parsed.data.budget_id]);
       if (!b.rows[0]) {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "budget_not_found" });

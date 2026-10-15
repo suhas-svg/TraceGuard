@@ -285,8 +285,39 @@ export function buildGateway() {
     agent_name: z.string().max(128).optional(),
     caller: z.string().max(128).optional(),
     request_id: z.string().max(128).optional(),
-    approval_id: z.string().uuid().optional()
+    approval_id: z.string().uuid().optional(),
+    // Attribution the caller supplies, like `caller` itself; see
+    // docs/security.md for what that does and does not prove.
+    agent_id: z.string().uuid().optional(),
+    // When a run is named, the gateway writes its own denials into that run's
+    // trace, so denied calls show up next to failed ones (FR-005).
+    run_id: z.string().uuid().optional(),
+    span_id: z.string().uuid().optional()
   });
+
+  // A blocked call still belongs in the run trace: one span with the denied
+  // status the trace view and the eval violations counter look for.
+  async function recordDeniedSpan(
+    client: PoolClient,
+    ctx: { run_id?: string; span_id?: string },
+    serverId: string,
+    tool: string,
+    reason: string
+  ): Promise<void> {
+    if (!ctx.run_id) return;
+    try {
+      await client.query(
+        `INSERT INTO spans
+           (id, run_id, event_id, operation_type, name, started_at, status, error_type, attributes)
+         VALUES ($1,$2,$3,'tool.invocation',$4,$5,'denied','policy_denied',$6::jsonb)
+         ON CONFLICT (id) DO NOTHING`,
+        [ctx.span_id ?? randomUUID(), ctx.run_id, `gw-${randomUUID()}`, tool,
+         new Date().toISOString(), JSON.stringify({ server_id: serverId, tool, reason })]
+      );
+    } catch {
+      // The denial stands even when the trace write cannot land.
+    }
+  }
 
   async function forward(
     client: PoolClient,
@@ -333,14 +364,16 @@ export function buildGateway() {
         "SELECT * FROM server_tools WHERE server_id = $1 AND tool_name = $2", [server_id, tool]
       );
       if (!toolRow.rows[0] || toolRow.rows[0].quarantined) {
+        const reason = toolRow.rows[0] ? "tool quarantined" : "unknown tool";
         await recordDecision(client, { workspace_id: server.workspace_id, caller,
           server_id, tool_name: tool, args_hash: sha256Hex(stableStringify(args)),
-          decision: "deny", reason: toolRow.rows[0] ? "tool quarantined" : "unknown tool" });
+          decision: "deny", reason });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
           resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied" });
         // Alerts never block the denial they report.
         void notify(server.workspace_id, "tool.denied",
           { caller, server_id, tool, reason: toolRow.rows[0] ? "quarantined" : "unknown" });
+        await recordDeniedSpan(client, parsed.data, server.id, tool, reason);
         return reply.code(403).send({ error: "tool_blocked", reason: "unknown or quarantined tool" });
       }
 
@@ -373,7 +406,13 @@ export function buildGateway() {
           return reply.code(202).send({ approval_id: approval.id, status: "pending",
             expires_at: approval.expires_at });
         }
-        await client.query("UPDATE approvals SET status='consumed', decided_at=now() WHERE id=$1", [approval.id]);
+        // Only one concurrent retry can flip approved -> consumed; the loser
+        // gets 410 instead of forwarding a second time.
+        const consumed = await client.query(
+          "UPDATE approvals SET status='consumed', decided_at=now() WHERE id=$1 AND status='approved' RETURNING id",
+          [approval.id]
+        );
+        if (!consumed.rows[0]) return reply.code(410).send({ error: "approval_consumed" });
         let stored: Record<string, unknown>;
         try {
           stored = storedArgs(approval);
@@ -398,7 +437,8 @@ export function buildGateway() {
         effect: r.effect, conditions: (r.conditions ?? {}) as PolicyRule["conditions"]
       }));
       const verdict = evaluate(rules, {
-        caller, agent_id: null, server_id, tool_name: tool, args: args as Record<string, unknown>
+        caller, agent_id: parsed.data.agent_id ?? null, server_id, tool_name: tool,
+        args: args as Record<string, unknown>
       });
       const argsHash = sha256Hex(stableStringify(args));
 
@@ -412,6 +452,7 @@ export function buildGateway() {
           metadata: { rule: verdict.rule?.name ?? null } });
         void notify(server.workspace_id, "tool.denied",
           { caller, server_id, tool, rule: verdict.rule?.name ?? null, reason: verdict.reason });
+        await recordDeniedSpan(client, parsed.data, server.id, tool, verdict.reason);
         return reply.code(403).send({ error: "tool_blocked", reason: verdict.reason });
       }
 
