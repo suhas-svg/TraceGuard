@@ -20,7 +20,8 @@ human return 202 with an approval id; the agent retries with that id after
 the decision. Approvals are single-use and bound to the exact call by hash.
 
 Money is integer micro-dollars. Budgets reserve the worst case before a
-managed call in one atomic UPDATE, then settle to the measured cost.
+managed call under a row lock (SELECT ... FOR UPDATE), so concurrent calls
+serialize and settle to the measured cost after.
 
 The audit log is append-only with a hash chain: tamper-evident, not
 tamper-proof. Reads never return secrets, and no UPDATE or DELETE against

@@ -185,7 +185,8 @@ describe("integration and security", () => {
     const suiteId = suite.json().id;
     await api.inject({ method: "POST", url: `/v1/evaluations/suites/${suiteId}/cases`, headers: key,
       payload: { name: "c1", assertions: [{ type: "contains", value: "yes" }],
-        exec_config: { output: "yes indeed", latency_ms: 5 } } });
+        exec_config: { output: "yes indeed", latency_ms: 5, input_tokens: 7, output_tokens: 3,
+          provider: `ep-${tag}` } } });
     const runA = await api.inject({ method: "POST", url: `/v1/evaluations/suites/${suiteId}/runs`,
       headers: key, payload: { agent_name: `ea-${tag}`, config_fingerprint: "a" } });
     expect(runA.statusCode).toBe(201);
@@ -199,6 +200,11 @@ describe("integration and security", () => {
     const [a, b] = cmp.json().runs;
     expect(a.pass_rate).toBe(1);
     expect(b.pass_rate).toBe(0);
+    // No price row exists for the scripted adapter: cost stays unknown, never
+    // zero, while token usage sums the spans the replay wrote.
+    expect(a.cost_micro).toBeNull();
+    expect(a.input_tokens).toBe(7);
+    expect(a.output_tokens).toBe(3);
   });
 
   it("ingests OTLP traces idempotently and finalizes stale runs", async () => {
@@ -282,11 +288,15 @@ describe("integration and security", () => {
       const expectSig = createHmac("sha256", "hook-secret").update(hit.body).digest("hex");
       expect(hit.headers["x-traceguard-signature"]).toBe(expectSig);
       expect(JSON.parse(hit.body).tool).toBe("ghost");
-      const deliveries = await api.inject({ method: "GET",
-        url: "/v1/webhooks/deliveries", headers: key });
-      const row = deliveries.json().items.find(
-        (d: { subscription_id: string }) => d.subscription_id === sub.json().id);
-      expect(row.status).toBe("delivered");
+      // notify() writes the delivery row only after its fetch resolves, so
+      // poll for the row instead of racing it.
+      await vi.waitFor(async () => {
+        const deliveries = await api.inject({ method: "GET",
+          url: "/v1/webhooks/deliveries", headers: key });
+        const row = deliveries.json().items.find(
+          (d: { subscription_id: string }) => d.subscription_id === sub.json().id);
+        expect(row?.status).toBe("delivered");
+      }, { timeout: 30000 });
     } finally {
       stub.close();
     }
@@ -582,6 +592,121 @@ describe("integration and security", () => {
     for (const r of rows.rows) {
       expect(r.prev_hash).toBe(prev);
       prev = r.hash;
+    }
+  });
+
+  it("agent-scoped rules take effect when the call names its agent", async () => {
+    // Agent-scoped rules need a real agent row (FK), which ingest creates.
+    const agentName = `ag-deny-${tag}`;
+    const ingested = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ agent_name: agentName })] } });
+    expect(ingested.statusCode).toBe(200);
+    const agentA = (await pool.query("SELECT id FROM agents WHERE name = $1", [agentName])).rows[0].id;
+    await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+      payload: { name: `agent-deny-${tag}`, priority: 200, agent_id: agentA, effect: "deny" } });
+    const before = upstreamHits;
+    const hit = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: "hi" }, caller: "t", agent_id: agentA } });
+    expect(hit.statusCode).toBe(403);
+    expect(hit.json().reason).toContain(`agent-deny-${tag}`);
+    expect(upstreamHits).toBe(before);
+    const other = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: "hi" }, caller: "t", agent_id: randomUUID() } });
+    expect([200, 202]).toContain(other.statusCode);
+  });
+
+  it("records a denied gateway call as a denied span in the run trace", async () => {
+    const runId = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId })] } });
+    const denied = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "ghost", arguments: {}, caller: "t", run_id: runId } });
+    expect(denied.statusCode).toBe(403);
+    const trace = await api.inject({ method: "GET", url: `/v1/runs/${runId}/trace`, headers: key });
+    const span = trace.json().spans.find((s: { status: string }) => s.status === "denied");
+    expect(span).toBeDefined();
+    expect(span.error_type).toBe("policy_denied");
+    expect(span.attributes.tool).toBe("ghost");
+  });
+
+  it("consumes an approved call exactly once under concurrent retries", async () => {
+    const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: "racy" }, caller: "t" } });
+    expect(call.statusCode).toBe(202);
+    const approvalId = call.json().approval_id;
+    await gw.inject({ method: "POST", url: `/v1/approvals/${approvalId}/decision`, headers: approver,
+      payload: { approved: true } });
+    const before = upstreamHits;
+    const payload = { server_id: serverId, tool: "echo", arguments: { text: "racy" }, caller: "t",
+      approval_id: approvalId };
+    const [a, b] = await Promise.all([
+      gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key, payload }),
+      gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key, payload })
+    ]);
+    const codes = [a.statusCode, b.statusCode].sort((x, y) => x - y);
+    expect(codes).toEqual([200, 410]);
+    expect(upstreamHits).toBe(before + 1);
+  });
+
+  it("serializes concurrent budget checks against an exhausted limit", async () => {
+    const runId = randomUUID();
+    const budget = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: runId, limit_micro: 100, effect: "block" } });
+    const budgetId = budget.json().id;
+    const [a, b] = await Promise.all([
+      api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+        payload: { budget_id: budgetId, max_cost_micro: 60 } }),
+      api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+        payload: { budget_id: budgetId, max_cost_micro: 60 } })
+    ]);
+    const codes = [a.statusCode, b.statusCode].sort((x, y) => x - y);
+    expect(codes).toEqual([200, 409]);
+  });
+
+  it("does not re-issue a tool call after an upstream error", async () => {
+    let callRequests = 0;
+    const flaky = new McpServer({ name: "flaky-tools", version: "0.1.0" });
+    flaky.registerTool("boom", { description: "fails at the protocol level", inputSchema: {} },
+      async () => ({ content: [{ type: "text", text: "unused" }] }));
+    const flakyHttp = createServer(async (req, res) => {
+      if (req.method !== "POST") {
+        res.writeHead(404).end();
+        return;
+      }
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      const body = JSON.parse(raw) as { method?: string; id?: unknown };
+      if (body.method === "tools/call") {
+        // The upstream receives the call and answers with an error frame.
+        // A failed or lost response must not be auto-reissued: the call
+        // already reached the server, and the gateway cannot prove otherwise.
+        callRequests++;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id,
+          error: { code: -32000, message: "upstream exploded" } }));
+        return;
+      }
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      res.on("close", () => transport.close().catch(() => undefined));
+      await flaky.connect(transport);
+      await transport.handleRequest(req, res, body).catch(() => undefined);
+    });
+    await new Promise<void>((resolve) => flakyHttp.listen(0, "127.0.0.1", resolve));
+    const port = (flakyHttp.address() as { port: number }).port;
+    try {
+      const reg = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+        payload: { name: `flaky-${tag}`, base_url: `http://127.0.0.1:${port}/mcp` } });
+      const sid = reg.json().id;
+      await gw.inject({ method: "POST", url: `/v1/servers/${sid}/discover`, headers: key });
+      await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+        payload: { name: `flaky-allow-${tag}`, server_id: sid, tool_name: "boom", effect: "allow" } });
+      const res = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+        payload: { server_id: sid, tool: "boom", arguments: {}, caller: "t" } });
+      expect(res.statusCode).toBe(502);
+      expect(callRequests).toBe(1);
+    } finally {
+      flakyHttp.close();
+      flakyHttp.closeAllConnections();
     }
   });
 }, 60000);
