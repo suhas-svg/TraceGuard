@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { gwApi, type McpServer, type Policy } from "./api";
 import {
   Alert, Badge, Button, Card, Empty, Field, Input, Page,
-  Select, Table, Td, Th
+  Select, Spinner, Table, Td, Th
 } from "./components";
 
 const emptyForm = { name: "", server_id: "", tool_name: "", effect: "allow", priority: "0", conditions: "{}" };
@@ -108,23 +109,18 @@ const effectTone: Record<string, "ok" | "bad" | "warn"> = {
 };
 
 export default function PoliciesView() {
-  const [servers, setServers] = useState<McpServer[]>([]);
-  const [policies, setPolicies] = useState<Policy[]>([]);
   const [editing, setEditing] = useState<Policy | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [error, setError] = useState("");
+  const queryClient = useQueryClient();
+  const serversQuery = useQuery({ queryKey: ["mcp-servers"], queryFn: () => gwApi.servers() });
+  const policiesQuery = useQuery({ queryKey: ["policies"], queryFn: () => gwApi.policies() });
+  const servers = serversQuery.data?.items ?? [];
+  const policies = policiesQuery.data?.items ?? [];
+  const loadError = serversQuery.error ?? policiesQuery.error;
+  const loadFailed = loadError ? (loadError instanceof Error ? loadError.message : "load failed") : "";
 
-  const reload = () =>
-    Promise.all([gwApi.servers(), gwApi.policies()])
-      .then(([s, p]) => {
-        setServers(s.items);
-        setPolicies(p.items);
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : "load failed"));
-
-  useEffect(() => {
-    reload();
-  }, []);
+  const reload = () => queryClient.invalidateQueries();
 
   return (
     <Page
@@ -136,7 +132,7 @@ export default function PoliciesView() {
         </Button>
       }
     >
-      {error && <Alert>{error}</Alert>}
+      {(error || loadFailed) && <Alert>{error || loadFailed}</Alert>}
       <h3 className="mb-2 text-sm font-semibold text-ink-700">Upstream servers</h3>
       <Card className="mb-5 divide-y divide-ink-100">
         {servers.length === 0 && <p className="px-4 py-3 text-sm text-ink-500">No servers registered.</p>}
@@ -157,7 +153,9 @@ export default function PoliciesView() {
       {editing && (
         <PolicyForm servers={servers} initial={editing} onDone={() => { setEditing(null); reload(); }} />
       )}
-      {policies.length === 0 ? (
+      {policiesQuery.isPending ? (
+        <Spinner label="Loading rules..." />
+      ) : policies.length === 0 ? (
         <Empty hint="No rules yet. Unknown tools are denied by default." />
       ) : (
         <Table>

@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
-import { formatMicro, getTrace, getUsage, listRuns, settings, type RunItem, type Span } from "./api";
+import { useEffect, useState } from "react";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
+import { formatMicro, getTrace, getUsage, listRuns, settings, type Span } from "./api";
 import { buildTree, tokenTotal, type SpanNode } from "./tree";
+import { useHashRoute, type Tab } from "./router";
 import EvalsView from "./Evals";
 import PoliciesView from "./Policies";
 import ApprovalsView from "./Approvals";
@@ -10,10 +12,8 @@ import CostsView from "./Costs";
 import UsersView from "./Users";
 import {
   Alert, Badge, Button, Card, Empty, Field, Input, LinkButton,
-  NavIcon, Page, Segmented, Spinner, Stat, StatusBadge, Table, Td, Th
+  NavIcon, Page, Segmented, Stat, StatusBadge, Table, TableSkeleton, Td, Th
 } from "./components";
-
-type Tab = "runs" | "evals" | "policy" | "approvals" | "webhooks" | "retention" | "costs" | "users";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "runs", label: "Runs" },
@@ -81,12 +81,17 @@ function ConnectionDrawer({ open, onClose, onSaved }: {
   const [key, setKey] = useState(settings.key);
   const [gwUrl, setGwUrl] = useState(settings.gwUrl);
   const [approverKey, setApproverKey] = useState(settings.approverKey);
-  if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-label="Connection settings">
-      <div className="absolute inset-0 bg-black/50" onClick={onClose} />
+    <div
+      className={`fixed inset-0 z-50 flex justify-end transition-[visibility] duration-200 ${open ? "visible" : "invisible"}`}
+      role="dialog" aria-label="Connection settings" aria-hidden={!open}
+    >
+      <div
+        className={`absolute inset-0 bg-black/50 transition-opacity duration-200 ${open ? "opacity-100" : "opacity-0"}`}
+        onClick={onClose}
+      />
       <form
-        className="relative flex w-80 flex-col gap-3 bg-surface p-5 shadow-xl"
+        className={`relative flex w-80 flex-col gap-3 bg-surface p-5 shadow-xl transition-transform duration-200 ${open ? "translate-x-0" : "translate-x-full"}`}
         onSubmit={(e) => {
           e.preventDefault();
           settings.save(url, key, gwUrl, approverKey);
@@ -112,33 +117,16 @@ function ConnectionDrawer({ open, onClose, onSaved }: {
 }
 
 function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
-  const [runs, setRuns] = useState<RunItem[]>([]);
   const [status, setStatus] = useState("");
-  const [cursor, setCursor] = useState<string | null>(null);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  const load = useCallback(
-    async (next?: string | null, reset = false) => {
-      setLoading(true);
-      setError("");
-      try {
-        const res = await listRuns({ status: status || undefined, limit: 50, cursor: next ?? undefined });
-        setRuns((prev) => (reset ? res.items : [...prev, ...res.items]));
-        setCursor(res.next_cursor);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "load failed");
-      } finally {
-        setLoading(false);
-      }
-    },
-    [status]
-  );
-
-  useEffect(() => {
-    setRuns([]);
-    load(null, true);
-  }, [load]);
+  const runsQuery = useInfiniteQuery({
+    queryKey: ["runs", status],
+    queryFn: ({ pageParam }) => listRuns({ status: status || undefined, limit: 50, cursor: pageParam ?? undefined }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.next_cursor,
+    refetchInterval: 10_000
+  });
+  const runs = runsQuery.data?.pages.flatMap((p) => p.items) ?? [];
+  const error = runsQuery.error instanceof Error ? runsQuery.error.message : runsQuery.error ? "load failed" : "";
 
   const counts = runs.reduce<Record<string, number>>((m, r) => {
     m[r.status] = (m[r.status] ?? 0) + 1;
@@ -163,7 +151,7 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
               { value: "cancelled", label: "Cancelled" }
             ]}
           />
-          <Button onClick={() => load(null, true)}>Refresh</Button>
+          <Button onClick={() => runsQuery.refetch()}>Refresh</Button>
         </>
       }
     >
@@ -176,7 +164,9 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
         </div>
       )}
       {error && <Alert>{error}</Alert>}
-      {runs.length === 0 && !loading ? (
+      {runsQuery.isPending ? (
+        <TableSkeleton label="Loading runs..." />
+      ) : runs.length === 0 ? (
         <Empty hint="No runs yet. Run the demo agent to create one." />
       ) : (
         <Table>
@@ -204,10 +194,9 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
           </tbody>
         </Table>
       )}
-      {loading && <Spinner />}
       <div className="mt-3">
-        {cursor && (
-          <Button disabled={loading} onClick={() => load(cursor)}>
+        {runsQuery.hasNextPage && (
+          <Button disabled={runsQuery.isFetching} onClick={() => runsQuery.fetchNextPage()}>
             Load more
           </Button>
         )}
@@ -300,23 +289,16 @@ function SpanDetail({ span }: { span: Span }) {
 }
 
 function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
-  const [run, setRun] = useState<RunItem | null>(null);
-  const [spans, setSpans] = useState<Span[]>([]);
-  const [cost, setCost] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const [error, setError] = useState("");
+  const traceQuery = useQuery({ queryKey: ["trace", runId], queryFn: () => getTrace(runId) });
+  const usageQuery = useQuery({ queryKey: ["usage", runId], queryFn: () => getUsage(runId) });
 
-  useEffect(() => {
-    getTrace(runId)
-      .then((t) => {
-        setRun(t.run);
-        setSpans(t.spans);
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : "load failed"));
-    getUsage(runId)
-      .then((u) => setCost(`${formatMicro(u.estimated_cost_micro)}${u.cost_partial ? " (partial)" : ""}`))
-      .catch(() => setCost("n/a"));
-  }, [runId]);
+  const error = traceQuery.error instanceof Error ? traceQuery.error.message : traceQuery.error ? "load failed" : "";
+  const run = traceQuery.data?.run ?? null;
+  const spans: Span[] = traceQuery.data?.spans ?? [];
+  const cost = usageQuery.data
+    ? `${formatMicro(usageQuery.data.estimated_cost_micro)}${usageQuery.data.cost_partial ? " (partial)" : ""}`
+    : usageQuery.isError ? "n/a" : null;
 
   if (error) {
     return (
@@ -328,7 +310,7 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
   }
   if (!run) {
     return (
-      <Page title="Trace"><Spinner label="Loading trace..." /></Page>
+      <Page title="Trace"><TableSkeleton label="Loading trace..." /></Page>
     );
   }
 
@@ -374,22 +356,17 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
 }
 
 export default function App() {
-  const [openRun, setOpenRun] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>("runs");
-  const [settingsTick, setSettingsTick] = useState(0);
+  const [{ tab, runId: openRun }, navigate] = useHashRoute();
   const [drawer, setDrawer] = useState(false);
-  const [connected, setConnected] = useState<boolean | null>(null);
+  const queryClient = useQueryClient();
+  const health = useQuery({
+    queryKey: ["healthz"],
+    queryFn: async () => (await fetch(`${settings.url}/healthz`)).ok,
+    refetchInterval: 30_000
+  });
+  const connected = health.isError ? false : health.data ?? null;
 
-  useEffect(() => {
-    fetch(`${settings.url}/healthz`)
-      .then((r) => setConnected(r.ok))
-      .catch(() => setConnected(false));
-  }, [settingsTick]);
-
-  const go = (t: Tab) => {
-    setOpenRun(null);
-    setTab(t);
-  };
+  const go = (t: Tab) => navigate({ tab: t, runId: null });
 
   return (
     <div className="flex min-h-screen">
@@ -441,9 +418,9 @@ export default function App() {
         </div>
       </aside>
       <div className="min-w-0 flex-1">
-        <main key={settingsTick}>
+        <main>
           {tab === "evals" ? (
-            <EvalsView onOpenRun={(id) => { setOpenRun(id); setTab("runs"); }} />
+            <EvalsView onOpenRun={(id) => navigate({ tab: "runs", runId: id })} />
           ) : tab === "policy" ? (
             <PoliciesView />
           ) : tab === "approvals" ? (
@@ -457,13 +434,14 @@ export default function App() {
           ) : tab === "users" ? (
             <UsersView />
           ) : openRun ? (
-            <TraceView runId={openRun} onBack={() => setOpenRun(null)} />
+            <TraceView runId={openRun} onBack={() => navigate({ tab: "runs", runId: null })} />
           ) : (
-            <RunsList onOpen={setOpenRun} />
+            <RunsList onOpen={(id) => navigate({ tab: "runs", runId: id })} />
           )}
         </main>
       </div>
-      <ConnectionDrawer open={drawer} onClose={() => setDrawer(false)} onSaved={() => setSettingsTick((t) => t + 1)} />
+      <ConnectionDrawer open={drawer} onClose={() => setDrawer(false)}
+        onSaved={() => queryClient.invalidateQueries()} />
     </div>
   );
 }

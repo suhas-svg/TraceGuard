@@ -1,11 +1,11 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   compareEvalRuns,
   formatMicro,
   getEvalRun,
   listSuites,
-  type EvalResult,
-  type EvalSuite
+  type EvalResult
 } from "./api";
 import {
   Alert, Badge, Button, Card, Empty, Input, LinkButton,
@@ -43,19 +43,12 @@ function ResultRow({ r, onOpenRun }: { r: EvalResult; onOpenRun: (id: string) =>
 }
 
 function EvalRunView({ runId, onOpenRun }: { runId: string; onOpenRun: (id: string) => void }) {
-  const [run, setRun] = useState<{ agent_name: string; config_fingerprint: string; status: string } | null>(null);
-  const [results, setResults] = useState<EvalResult[]>([]);
-  const [error, setError] = useState("");
-  useEffect(() => {
-    getEvalRun(runId)
-      .then((t) => {
-        setRun(t.eval_run);
-        setResults(t.results);
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : "load failed"));
-  }, [runId]);
+  const runQuery = useQuery({ queryKey: ["eval-run", runId], queryFn: () => getEvalRun(runId) });
+  const error = runQuery.error instanceof Error ? runQuery.error.message : "";
   if (error) return <Alert>{error}</Alert>;
-  if (!run) return <p className="text-sm text-ink-500">Loading...</p>;
+  if (!runQuery.data) return <p className="text-sm text-ink-500">Loading...</p>;
+  const run = runQuery.data.eval_run;
+  const results = runQuery.data.results;
   const passed = results.filter((r) => r.passed).length;
   return (
     <Card className="mt-3 p-4">
@@ -88,14 +81,11 @@ function EvalRunView({ runId, onOpenRun }: { runId: string; onOpenRun: (id: stri
 }
 
 export default function EvalsView({ onOpenRun }: { onOpenRun: (id: string) => void }) {
-  const [suites, setSuites] = useState<EvalSuite[]>([]);
   const [openRun, setOpenRun] = useState("");
   const [compareIds, setCompareIds] = useState("");
   const [compare, setCompare] = useState<Record<string, unknown>[] | null>(null);
-
-  useEffect(() => {
-    listSuites().then((s) => setSuites(s.items));
-  }, []);
+  const suitesQuery = useQuery({ queryKey: ["eval-suites"], queryFn: () => listSuites() });
+  const suites = suitesQuery.data?.items ?? [];
 
   return (
     <Page

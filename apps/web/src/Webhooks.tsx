@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { opsApi, type Delivery, type Webhook } from "./api";
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { opsApi } from "./api";
 import {
   Alert, Button, Card, Empty, Field, Input, Page,
   StatusBadge, Table, Td, Th
@@ -8,22 +9,17 @@ import {
 const EVENTS = ["tool.denied", "approval.requested", "approval.decided", "budget.exceeded", "eval.completed"];
 
 export default function WebhooksView() {
-  const [hooks, setHooks] = useState<Webhook[]>([]);
-  const [deliveries, setDeliveries] = useState<Delivery[]>([]);
   const [form, setForm] = useState({ name: "", url: "", secret: "", events: ["tool.denied"] as string[] });
   const [error, setError] = useState("");
+  const queryClient = useQueryClient();
+  const hooksQuery = useQuery({ queryKey: ["webhooks"], queryFn: () => opsApi.webhooks() });
+  const deliveriesQuery = useQuery({ queryKey: ["webhook-deliveries"], queryFn: () => opsApi.deliveries() });
+  const hooks = hooksQuery.data?.items ?? [];
+  const deliveries = deliveriesQuery.data?.items ?? [];
+  const loadError = hooksQuery.error ?? deliveriesQuery.error;
+  const loadFailed = loadError ? (loadError instanceof Error ? loadError.message : "load failed") : "";
 
-  const reload = () =>
-    Promise.all([opsApi.webhooks(), opsApi.deliveries()])
-      .then(([h, d]) => {
-        setHooks(h.items);
-        setDeliveries(d.items);
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : "load failed"));
-
-  useEffect(() => {
-    reload();
-  }, []);
+  const reload = () => queryClient.invalidateQueries();
 
   const toggleEvent = (ev: string) =>
     setForm((f) => ({
@@ -36,7 +32,7 @@ export default function WebhooksView() {
       title="Webhooks"
       sub="HMAC-signed event delivery. Secrets are write-only; reads never return them."
     >
-      {error && <Alert>{error}</Alert>}
+      {(error || loadFailed) && <Alert>{error || loadFailed}</Alert>}
       <Card className="mb-5 max-w-2xl p-4">
         <form
           className="grid gap-3 text-sm"
