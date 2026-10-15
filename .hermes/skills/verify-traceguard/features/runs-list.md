@@ -10,6 +10,8 @@ filtering, cursor pagination, automatic refresh, and one click into a run's trac
 - `runs-paginate` appends older pages with `Load more` while `next_cursor` exists.
 - `runs-poll` refreshes the visible list in place every ~10 s without user action.
 - `runs-open` opens a run's trace view via its short-id button.
+- `runs-kpi` overview tiles above the table; `Failed` and `Running` are toggle buttons
+  (`aria-pressed`) that filter the list.
 
 ## How to get to it (user POV)
 
@@ -23,11 +25,17 @@ Preconditions:
 
 - Baseline met (`features/README.md`), ≥2 seeded runs, session `traceguard` on `#/runs`.
 - **Load.** Open the list. Run `new_tab("http://localhost:5173/#/runs")`, `wait_for_load()`.
-  `js("document.querySelectorAll('tbody tr').length")` is ≥2 and each row shows a status badge.
+  `js("document.querySelectorAll('tbody tr').length")` is ≥2, each row shows a status badge,
+  `Started` reads relative (`4m ago`, absolute time in the cell `title`), and a
+  `N runs loaded` caption sits under the table.
 - **Filter.** Press `Failed`. Run
   `js("[...document.querySelectorAll('[aria-label=\"Filter by status\"] button')].find(b=>b.textContent==='Failed').click()")`.
   `js("location.hash")` stays `#/runs`; every rendered row's status cell reads `failed`
   (or the empty state shows when none exist).
+- **KPI filter.** Press the `Failed` tile —
+  `js("[...document.querySelectorAll('button[aria-pressed]')].find(b=>b.textContent.startsWith('Failed')).click()")`.
+  That tile gains `aria-pressed="true"`, the segmented control moves to `Failed`, and pressing
+  the tile again clears the filter back to `All`.
 - **Reset filter.** Press `All` the same way; row count returns to ≥2.
 - **Paginate.** With >50 seeded runs, click `Load more`
   (`js("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Load more').click()")`).

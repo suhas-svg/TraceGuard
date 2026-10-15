@@ -22,7 +22,7 @@ export function Button({ variant = "secondary", size = "md", className = "", ...
   const sizes = { sm: "px-2.5 py-1 text-xs", md: "px-3 py-1.5 text-sm" };
   return (
     <button
-      className={`inline-flex items-center gap-1.5 rounded-lg font-medium transition-colors disabled:cursor-not-allowed ${variants[variant]} ${sizes[size]} ${className}`}
+      className={`inline-flex items-center gap-1.5 rounded-md font-medium transition-colors disabled:cursor-not-allowed ${variants[variant]} ${sizes[size]} ${className}`}
       {...rest}
     />
   );
@@ -66,7 +66,7 @@ export function StatusBadge({ status }: { status: string }) {
 // ---------- Forms ----------
 
 const inputCls =
-  "rounded-lg border border-ink-200 bg-surface px-2.5 py-1.5 text-sm text-ink-800 placeholder:text-ink-300 focus:border-brand-400";
+  "rounded-md border border-ink-200 bg-surface px-2.5 py-1.5 text-sm text-ink-800 placeholder:text-ink-300 focus:border-brand-400";
 
 export function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
   return <input {...props} className={`${inputCls} ${props.className ?? ""}`} />;
@@ -109,7 +109,7 @@ export function Page({ title, sub, actions, children }: {
 
 export function Card({ children, className = "" }: { children: ReactNode; className?: string }) {
   return (
-    <div className={`rounded-xl border border-ink-200 bg-surface shadow-[0_1px_2px_rgba(20,24,36,0.05)] ${className}`}>
+    <div className={`rounded-lg border border-ink-200 bg-surface shadow-[0_1px_2px_rgba(20,24,36,0.05)] ${className}`}>
       {children}
     </div>
   );
@@ -117,7 +117,7 @@ export function Card({ children, className = "" }: { children: ReactNode; classN
 
 export function Alert({ children }: { children: ReactNode }) {
   return (
-    <div role="alert" className="mb-3 rounded-lg border border-bad-700/20 bg-bad-100/60 px-3 py-2 text-sm text-bad-700">
+    <div role="alert" className="mb-3 rounded-md border border-bad-700/20 bg-bad-100/60 px-3 py-2 text-sm text-bad-700">
       {children}
     </div>
   );
@@ -125,24 +125,15 @@ export function Alert({ children }: { children: ReactNode }) {
 
 export function Empty({ hint, action }: { hint: string; action?: ReactNode }) {
   return (
-    <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-ink-200 bg-surface px-6 py-10 text-center">
+    <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed border-ink-200 bg-surface px-6 py-10 text-center">
       <p className="text-sm text-ink-500">{hint}</p>
       {action}
     </div>
   );
 }
 
-export function Spinner({ label = "Loading..." }: { label?: string }) {
-  return (
-    <div className="flex items-center gap-2 py-6 text-sm text-ink-500" role="status">
-      <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-ink-200 border-t-brand-500" />
-      {label}
-    </div>
-  );
-}
-
 export function Skeleton({ className = "" }: { className?: string }) {
-  return <div aria-hidden="true" className={`animate-pulse rounded-lg bg-ink-100 ${className}`} />;
+  return <div aria-hidden="true" className={`animate-pulse rounded-md bg-ink-100 ${className}`} />;
 }
 
 export function TableSkeleton({ rows = 6, label = "Loading..." }: { rows?: number; label?: string }) {
@@ -157,13 +148,54 @@ export function TableSkeleton({ rows = 6, label = "Loading..." }: { rows?: numbe
   );
 }
 
-export function Stat({ label, value, hint }: { label: string; value: ReactNode; hint?: string }) {
+// Card-shaped rows for the list views (approvals, policies).
+export function ListSkeleton({ rows = 3, label = "Loading..." }: { rows?: number; label?: string }) {
   return (
-    <Card className="px-4 py-3">
-      <div className="text-xs font-medium uppercase tracking-wide text-ink-400">{label}</div>
-      <div className="tg-nums mt-1 text-xl font-semibold text-ink-900">{value}</div>
-      {hint && <div className="mt-0.5 text-xs text-ink-500">{hint}</div>}
+    <Card className="p-3">
+      <div className="space-y-2" role="status" aria-label={label}>
+        {Array.from({ length: rows }).map((_, i) => (
+          <Skeleton key={i} className="h-16" />
+        ))}
+      </div>
     </Card>
+  );
+}
+
+const statTones: Record<string, string> = {
+  default: "text-ink-900",
+  ok: "text-ok-700",
+  bad: "text-bad-700",
+  warn: "text-warn-700"
+};
+
+// Overview number. Pass onClick and it becomes a filter button with a pressed
+// state, so a KPI can drive the list beneath it.
+export function Stat({ label, value, hint, tone = "default", active = false, onClick }: {
+  label: string;
+  value: ReactNode;
+  hint?: string;
+  tone?: keyof typeof statTones;
+  active?: boolean;
+  onClick?: () => void;
+}) {
+  const body = (
+    <>
+      <div className="text-xs font-medium text-ink-500">{label}</div>
+      <div className={`tg-nums mt-1 text-2xl font-semibold tracking-tight ${statTones[tone]}`}>{value}</div>
+      {hint && <div className="mt-0.5 text-xs text-ink-500">{hint}</div>}
+    </>
+  );
+  const base = "rounded-lg border bg-surface px-4 py-3 text-left shadow-[0_1px_2px_rgba(20,24,36,0.05)]";
+  if (!onClick) return <div className={`${base} border-ink-200`}>{body}</div>;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={`${base} transition-colors ${active ? "border-brand-400 bg-brand-50/50" : "border-ink-200 hover:border-ink-300 hover:bg-ink-50/60"}`}
+    >
+      {body}
+    </button>
   );
 }
 
@@ -177,13 +209,13 @@ export function Segmented<T extends string>({ options, value, onChange, label }:
 }) {
   return (
     <div role="group" aria-label={label}
-      className="inline-flex rounded-lg border border-ink-200 bg-surface p-0.5 shadow-sm">
+      className="inline-flex rounded-md border border-ink-200 bg-surface p-0.5 shadow-sm">
       {options.map((o) => (
         <button
           key={o.value}
           onClick={() => onChange(o.value)}
           aria-pressed={value === o.value}
-          className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+          className={`rounded-[5px] px-3 py-1.5 text-xs font-medium transition-colors ${
             value === o.value ? "bg-ink-800 text-ink-50 shadow-sm" : "text-ink-500 hover:text-ink-800"
           }`}
         >
@@ -196,7 +228,8 @@ export function Segmented<T extends string>({ options, value, onChange, label }:
 export function Table({ children }: { children: ReactNode }) {
   return (
     <Card className="overflow-hidden">
-      <div className="overflow-x-auto">
+      {/* Own scroll region so the header row stays put while a long table scrolls. */}
+      <div className="max-h-[70vh] overflow-auto overscroll-contain">
         <table className="tg-nums w-full border-collapse text-sm">{children}</table>
       </div>
     </Card>
@@ -205,14 +238,14 @@ export function Table({ children }: { children: ReactNode }) {
 
 export function Th({ children, className = "" }: { children?: ReactNode; className?: string }) {
   return (
-    <th className={`border-b border-ink-100 bg-ink-50/60 px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-ink-400 ${className}`}>
+    <th className={`sticky top-0 z-10 border-b border-ink-200 bg-ink-50 px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-ink-500 ${className}`}>
       {children}
     </th>
   );
 }
 
-export function Td({ children, className = "" }: { children?: ReactNode; className?: string }) {
-  return <td className={`border-b border-ink-100 px-3 py-2 align-top last:border-0 ${className}`}>{children}</td>;
+export function Td({ children, className = "", title }: { children?: ReactNode; className?: string; title?: string }) {
+  return <td title={title} className={`border-b border-ink-100 px-3 py-2 align-top last:border-0 ${className}`}>{children}</td>;
 }
 
 export function LinkButton({ children, onClick }: { children: ReactNode; onClick: () => void }) {
@@ -226,7 +259,7 @@ export function LinkButton({ children, onClick }: { children: ReactNode; onClick
 // ---------- Nav icons (inline SVG, no dependency) ----------
 
 const paths: Record<string, string> = {
-  runs: "M3 12l9-8 9 8M5 10v10h5v-6h4v6h5V10",
+  runs: "M5 4.5l13 7.5-13 7.5v-15z",
   evals: "M4 20V10M10 20V4M16 20v-8M22 20H2",
   policy: "M12 3l7 3v5c0 5-3.5 8-7 10-3.5-2-7-5-7-10V6l7-3z",
   approvals: "M5 13l4 4L19 7",

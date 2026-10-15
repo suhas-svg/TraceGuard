@@ -2,8 +2,8 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { gwApi, type McpServer, type Policy } from "./api";
 import {
-  Alert, Badge, Button, Card, Empty, Field, Input, Page,
-  Select, Spinner, Table, Td, Th
+  Alert, Badge, Button, Card, Empty, Field, Input, ListSkeleton, Page,
+  Select, Table, Td, Th
 } from "./components";
 
 const emptyForm = { name: "", server_id: "", tool_name: "", effect: "allow", priority: "0", conditions: "{}" };
@@ -139,7 +139,7 @@ export default function PoliciesView() {
         {servers.map((s) => (
           <div key={s.id} className="flex items-center gap-3 px-4 py-2.5 text-sm">
             <span className="font-medium text-ink-900">{s.name}</span>
-            <span className="truncate font-mono text-xs text-ink-400">{s.base_url}</span>
+            <span className="truncate font-mono text-xs text-ink-500">{s.base_url}</span>
             <span className="ml-auto">
               <Button size="sm" onClick={() => gwApi.discover(s.id).then(() => reload()).catch((e) => setError(String(e)))}>
                 Rediscover
@@ -154,7 +154,7 @@ export default function PoliciesView() {
         <PolicyForm servers={servers} initial={editing} onDone={() => { setEditing(null); reload(); }} />
       )}
       {policiesQuery.isPending ? (
-        <Spinner label="Loading rules..." />
+        <ListSkeleton rows={3} label="Loading rules..." />
       ) : policies.length === 0 ? (
         <Empty hint="No rules yet. Unknown tools are denied by default." />
       ) : (

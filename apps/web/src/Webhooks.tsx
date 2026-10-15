@@ -89,7 +89,7 @@ export default function WebhooksView() {
           {hooks.map((h) => (
             <div key={h.id} className="flex flex-wrap items-center gap-2 px-4 py-2.5 text-sm">
               <span className="font-medium text-ink-900">{h.name}</span>
-              <span className="truncate font-mono text-xs text-ink-400">{h.url}</span>
+              <span className="truncate font-mono text-xs text-ink-500">{h.url}</span>
               <span className="text-xs text-ink-500">{h.events.join(", ")}</span>
               <span className="ml-auto">
                 <Button size="sm" variant="ghost" className="text-bad-700 hover:bg-bad-100"

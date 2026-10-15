@@ -36,8 +36,8 @@ function UserCard({ u, workspaces, wsName, onChanged }: {
         <Badge tone={u.role === "admin" ? "info" : u.role === "approver" ? "warn" : "mute"}>{u.role}</Badge>
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
-        <span className="text-xs text-ink-400">workspaces:</span>
-        {u.workspaces.length === 0 && <span className="text-xs text-ink-400">none</span>}
+        <span className="text-xs text-ink-500">workspaces:</span>
+        {u.workspaces.length === 0 && <span className="text-xs text-ink-500">none</span>}
         {u.workspaces.map((w) => (
           <span key={w} className="inline-flex items-center gap-1 rounded-full bg-mute-100 px-2 py-0.5 text-xs text-mute-700">
             {wsName(w)}
@@ -61,10 +61,10 @@ function UserCard({ u, workspaces, wsName, onChanged }: {
             <span className="text-ink-500">{k.scopes.join(", ")}</span>
             {k.workspace_id && <span className="text-ink-500">pinned: {wsName(k.workspace_id)}</span>}
             {k.expires_at && (
-              <span className="text-ink-400">expires {new Date(k.expires_at).toLocaleDateString()}</span>
+              <span className="text-ink-500">expires {new Date(k.expires_at).toLocaleDateString()}</span>
             )}
             {k.last_used_at && (
-              <span className="text-ink-400">used {new Date(k.last_used_at).toLocaleDateString()}</span>
+              <span className="text-ink-500">used {new Date(k.last_used_at).toLocaleDateString()}</span>
             )}
             <span className="ml-auto">
               <Button size="sm" variant="ghost" className="text-bad-700 hover:bg-bad-100"
