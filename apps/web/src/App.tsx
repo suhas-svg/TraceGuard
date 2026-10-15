@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
-import { formatMicro, getTrace, getUsage, listRuns, settings, type Span } from "./api";
+import { formatMicro, getTrace, getUsage, gwApi, listRuns, settings, type Span } from "./api";
 import { buildTree, tokenTotal, type SpanNode } from "./tree";
+import { relTime } from "./format";
 import { useHashRoute, type Tab } from "./router";
 import EvalsView from "./Evals";
 import PoliciesView from "./Policies";
@@ -54,7 +55,7 @@ function ThemeToggle() {
       }}
       aria-label={mode === "dark" ? "Switch to light mode" : "Switch to dark mode"}
       title={mode === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-      className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
+      className="flex h-8 w-8 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
     >
       {mode === "dark" ? (
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}
@@ -132,6 +133,8 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
     m[r.status] = (m[r.status] ?? 0) + 1;
     return m;
   }, {});
+  // Clicking a KPI filters the list below it; clicking it again clears the filter.
+  const toggleStatus = (s: string) => setStatus((cur) => (cur === s ? "" : s));
 
   return (
     <Page
@@ -158,8 +161,14 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
       {runs.length > 0 && (
         <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
           <Stat label="Loaded" value={runs.length} />
-          <Stat label="Failed" value={counts.failed ?? 0} />
-          <Stat label="Running" value={counts.running ?? 0} />
+          <Stat
+            label="Failed" value={counts.failed ?? 0} tone={(counts.failed ?? 0) > 0 ? "bad" : "default"}
+            active={status === "failed"} onClick={() => toggleStatus("failed")}
+          />
+          <Stat
+            label="Running" value={counts.running ?? 0} tone={(counts.running ?? 0) > 0 ? "warn" : "default"}
+            active={status === "running"} onClick={() => toggleStatus("running")}
+          />
           <Stat label="Denied spans" value={counts.denied ?? 0} />
         </div>
       )}
@@ -186,13 +195,21 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
                 <Td><LinkButton onClick={() => onOpen(r.id)}>{short(r.id)}</LinkButton></Td>
                 <Td>{r.agent_name}</Td>
                 <Td><StatusBadge status={r.status} /></Td>
-                <Td className="whitespace-nowrap text-ink-500">{new Date(r.started_at).toLocaleString()}</Td>
+                <Td className="whitespace-nowrap text-ink-500" title={new Date(r.started_at).toLocaleString()}>
+                  {relTime(r.started_at)}
+                </Td>
                 <Td className="text-right">{r.span_count}</Td>
                 <Td className="whitespace-nowrap text-right">{r.input_tokens}/{r.output_tokens}</Td>
               </tr>
             ))}
           </tbody>
         </Table>
+      )}
+      {runs.length > 0 && (
+        <p className="mt-2 text-xs text-ink-500">
+          {runs.length} run{runs.length === 1 ? "" : "s"} loaded
+          {runsQuery.hasNextPage ? " · older runs load on demand" : ""} · refreshes every 10 s
+        </p>
       )}
       <div className="mt-3">
         {runsQuery.hasNextPage && (
@@ -225,7 +242,7 @@ function SpanRow({ node, depth, selected, onSelect, base, maxEnd }: {
   return (
     <>
       <button
-        className={`block w-full rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-ink-50 ${
+        className={`block w-full rounded-md px-2 py-1.5 text-left transition-colors hover:bg-ink-50 ${
           selected === s.id ? "bg-brand-50 ring-1 ring-brand-200" : ""
         }`}
         style={{ paddingLeft: `${depth * 1.25 + 0.5}rem` }}
@@ -236,7 +253,7 @@ function SpanRow({ node, depth, selected, onSelect, base, maxEnd }: {
           <span className="font-mono font-medium text-ink-800">{s.operation_type}</span>
           {s.model && <span className="truncate text-ink-500">{s.model}</span>}
           {s.error_type && <span className="text-bad-700">{s.error_type}</span>}
-          <span className="tg-nums ml-auto shrink-0 text-xs text-ink-400">
+          <span className="tg-nums ml-auto shrink-0 text-xs text-ink-500">
             {s.duration_ms != null ? `${s.duration_ms} ms` : ""}
           </span>
         </span>
@@ -273,14 +290,14 @@ function SpanDetail({ span }: { span: Span }) {
       <dl>
         {rows.map(([k, v]) => (
           <div key={k} className="flex gap-3 border-b border-ink-100 py-1.5 last:border-0">
-            <dt className="w-28 shrink-0 text-ink-400">{k}</dt>
+            <dt className="w-28 shrink-0 text-ink-500">{k}</dt>
             <dd className="text-ink-800">{v}</dd>
           </div>
         ))}
       </dl>
       <details className="mt-2">
         <summary className="cursor-pointer text-sm text-ink-500">attributes</summary>
-        <pre className="mt-1 max-h-64 overflow-auto rounded-lg bg-[#0b0e16] p-3 font-mono text-xs text-slate-100">
+        <pre className="mt-1 max-h-64 overflow-auto rounded-md bg-[#0b0e16] p-3 font-mono text-xs text-slate-100">
           {JSON.stringify(span.attributes, null, 2)}
         </pre>
       </details>
@@ -365,6 +382,14 @@ export default function App() {
     refetchInterval: 30_000
   });
   const connected = health.isError ? false : health.data ?? null;
+  // Same key as the Approvals view's default filter, so the badge rides the
+  // cache the view already warms.
+  const pendingApprovals = useQuery({
+    queryKey: ["approvals", "pending"],
+    queryFn: () => gwApi.approvals("pending"),
+    refetchInterval: 30_000,
+    retry: false
+  }).data?.items.length ?? 0;
 
   const go = (t: Tab) => navigate({ tab: t, runId: null });
 
@@ -389,7 +414,7 @@ export default function App() {
               key={t.id}
               onClick={() => go(t.id)}
               aria-current={tab === t.id && !openRun ? "page" : undefined}
-              className={`flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors ${
+              className={`flex items-center gap-2.5 rounded-md px-3 py-2 text-sm transition-colors ${
                 tab === t.id && !openRun
                   ? "bg-white/10 font-medium text-white"
                   : "text-slate-400 hover:bg-white/5 hover:text-white"
@@ -397,13 +422,21 @@ export default function App() {
             >
               <NavIcon name={t.id} />
               {t.label}
+              {t.id === "approvals" && pendingApprovals > 0 && (
+                <span
+                  className="tg-nums ml-auto rounded-full bg-brand-600 px-1.5 py-0.5 text-[11px] font-medium leading-none text-white"
+                  aria-label={`${pendingApprovals} pending`}
+                >
+                  {pendingApprovals}
+                </span>
+              )}
             </button>
           ))}
         </nav>
         <div className="mt-auto p-4">
           <button
             onClick={() => setDrawer(true)}
-            className="flex w-full items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-left text-xs text-slate-400 hover:bg-white/5"
+            className="flex w-full items-center gap-2 rounded-md border border-white/10 px-3 py-2 text-left text-xs text-slate-400 hover:bg-white/5"
           >
             <span
               className={`inline-block h-2 w-2 rounded-full ${

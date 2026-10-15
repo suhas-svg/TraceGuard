@@ -100,7 +100,8 @@ Stable handles (from `apps/web/src/`):
 | Span rows | buttons inside the left trace card; selected gets `bg-brand-50` |
 | Connection drawer | `[role="dialog"][aria-label="Connection settings"]`; toggle button is the status dot at the sidebar bottom |
 | Theme toggle | button `aria-label` "Switch to light/dark mode" |
-| Loading skeletons | `[role="status"][aria-label="Loading runs..."]` / `"Loading trace..."` |
+| Loading skeletons | `[role="status"][aria-label="Loading runs..."]` / `"Loading trace..."` / `"Loading approvals..."` / `"Loading rules..."` |
+| Runs KPI tiles | `button[aria-pressed]` whose text starts with `Failed` or `Running` (toggle filter) |
 
 Routing is hash-based (`src/router.ts`): `#/runs`, `#/runs/<runId>`, `#/evals`,
 `#/policy`, `#/approvals`, `#/webhooks`, `#/retention`, `#/costs`, `#/users`.

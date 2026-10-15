@@ -123,3 +123,19 @@ body {
 .tg-nums {
   font-variant-numeric: tabular-nums;
 }
+
+/* Preflight leaves buttons on the default arrow cursor; restore the
+   affordance for every enabled control in one place. */
+button:not(:disabled) {
+  cursor: pointer;
+}
+
+/* Motion is decorative here; respect the OS setting. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

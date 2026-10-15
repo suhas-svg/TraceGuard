@@ -82,7 +82,7 @@ export default function RetentionView() {
           {rules.map((r) => (
             <div key={r.id} className="flex flex-wrap items-center gap-2 px-4 py-2.5 text-sm">
               <span className="font-medium text-ink-900">{r.name}</span>
-              <span className="font-mono text-xs text-ink-400">{r.target} older than {r.older_than_days}d</span>
+              <span className="font-mono text-xs text-ink-500">{r.target} older than {r.older_than_days}d</span>
               <StatusBadge status={r.enabled ? "success" : "cancelled"} />
               <span className="ml-auto flex gap-1">
                 <Button size="sm" variant="ghost"
@@ -105,7 +105,7 @@ export default function RetentionView() {
         <Card className="divide-y divide-ink-100">
           {runs.map((r) => (
             <div key={r.id} className="flex flex-wrap items-center gap-2 px-4 py-2 text-sm">
-              <span className="font-mono text-xs text-ink-400">{new Date(r.started_at).toLocaleString()}</span>
+              <span className="font-mono text-xs text-ink-500">{new Date(r.started_at).toLocaleString()}</span>
               <StatusBadge status={r.status} />
               <span className="tg-nums text-ink-500">
                 {Object.entries(r.deleted_counts).map(([k, v]) => `${k}: ${v}`).join(", ")}

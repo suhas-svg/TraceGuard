@@ -28,6 +28,38 @@ function CostBars({ estimated, actual }: { estimated: number; actual: number | n
   );
 }
 
+// Share-of-window bar list for the same rows the table shows: the "where did
+// the money go" answer at a glance, above the per-model detail.
+function SpendByModel({ rows }: { rows: CompareRow[] }) {
+  const total = rows.reduce((sum, r) => sum + r.estimated_micro, 0);
+  if (total <= 0) return null;
+  const top = [...rows].sort((a, b) => b.estimated_micro - a.estimated_micro).slice(0, 8);
+  const max = top[0].estimated_micro;
+  return (
+    <Card className="mb-5 p-4">
+      <h3 className="text-sm font-semibold text-ink-900">Estimated spend by model</h3>
+      <p className="mb-3 text-xs text-ink-500">
+        Share of this window's estimate; bar width is relative to the largest model.
+      </p>
+      <ul className="space-y-2">
+        {top.map((r) => (
+          <li key={`${r.provider}/${r.model}`} className="grid grid-cols-[minmax(0,12rem)_1fr_auto] items-center gap-3 text-xs">
+            <span className="truncate font-mono text-ink-800" title={`${r.provider}/${r.model}`}>
+              {r.provider}/{r.model}
+            </span>
+            <span className="tg-track block h-2">
+              <span className="tg-bar block h-2 bg-brand-500/80" style={{ width: `${(r.estimated_micro / max) * 100}%` }} />
+            </span>
+            <span className="tg-nums whitespace-nowrap text-ink-500">
+              {formatMicro(r.estimated_micro)} · {Math.round((r.estimated_micro / total) * 100)}%
+            </span>
+          </li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
 export default function CostsView() {
   const [provider, setProvider] = useState("");
   const [days, setDays] = useState("30");
@@ -72,39 +104,42 @@ export default function CostsView() {
       ) : rows.length === 0 ? (
         <Empty hint="No usage in this window. Import actuals to compare against estimates." />
       ) : (
-        <Table>
-          <thead>
-            <tr>
-              <Th>Model</Th>
-              <Th>Tokens in/out</Th>
-              <Th>Split</Th>
-              <Th>Estimated</Th>
-              <Th>Billed</Th>
-              <Th>Variance</Th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr key={`${r.provider}/${r.model}`} className="transition-colors hover:bg-ink-50/70">
-                <Td className="font-mono text-[13px]">
-                  {r.provider}/{r.model}
-                  {r.missing_pricing && <Badge tone="warn">partial</Badge>}
-                </Td>
-                <Td className="whitespace-nowrap">{r.input_tokens}/{r.output_tokens}</Td>
-                <Td><CostBars estimated={r.estimated_micro} actual={r.actual_micro} /></Td>
-                <Td className="whitespace-nowrap">{formatMicro(r.estimated_micro)}</Td>
-                <Td className="whitespace-nowrap">
-                  {r.actual_micro === null ? <span className="text-ink-400">no actuals</span> : formatMicro(r.actual_micro)}
-                </Td>
-                <Td className="whitespace-nowrap">
-                  {r.variance_micro === null
-                    ? <span className="text-ink-400">n/a</span>
-                    : `${formatMicro(r.variance_micro)} (${fmtPct(r.variance_pct)})`}
-                </Td>
+        <>
+          <SpendByModel rows={rows} />
+          <Table>
+            <thead>
+              <tr>
+                <Th>Model</Th>
+                <Th>Tokens in/out</Th>
+                <Th>Split</Th>
+                <Th>Estimated</Th>
+                <Th>Billed</Th>
+                <Th>Variance</Th>
               </tr>
-            ))}
-          </tbody>
-        </Table>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={`${r.provider}/${r.model}`} className="transition-colors hover:bg-ink-50/70">
+                  <Td className="font-mono text-[13px]">
+                    {r.provider}/{r.model}
+                    {r.missing_pricing && <Badge tone="warn">partial</Badge>}
+                  </Td>
+                  <Td className="whitespace-nowrap">{r.input_tokens}/{r.output_tokens}</Td>
+                  <Td><CostBars estimated={r.estimated_micro} actual={r.actual_micro} /></Td>
+                  <Td className="whitespace-nowrap">{formatMicro(r.estimated_micro)}</Td>
+                  <Td className="whitespace-nowrap">
+                    {r.actual_micro === null ? <span className="text-ink-500">no actuals</span> : formatMicro(r.actual_micro)}
+                  </Td>
+                  <Td className="whitespace-nowrap">
+                    {r.variance_micro === null
+                      ? <span className="text-ink-500">n/a</span>
+                      : `${formatMicro(r.variance_micro)} (${fmtPct(r.variance_pct)})`}
+                  </Td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        </>
       )}
     </Page>
   );

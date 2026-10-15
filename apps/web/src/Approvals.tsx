@@ -2,8 +2,8 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { gwApi, type Approval } from "./api";
 import {
-  Alert, Button, Card, Empty, Input, Page,
-  Segmented, Spinner, StatusBadge
+  Alert, Button, Card, Empty, Input, ListSkeleton, Page,
+  Segmented, StatusBadge
 } from "./components";
 
 function ApprovalCard({ a, onChanged }: { a: Approval; onChanged: () => void }) {
@@ -44,7 +44,7 @@ function ApprovalCard({ a, onChanged }: { a: Approval; onChanged: () => void }) 
         <span className="font-mono font-semibold text-ink-900">{a.tool_name}</span>
         <StatusBadge status={a.status} />
         <span className="text-ink-500">from {a.caller}</span>
-        <span className="ml-auto text-xs text-ink-400">expires {new Date(a.expires_at).toLocaleString()}</span>
+        <span className="ml-auto text-xs text-ink-500">expires {new Date(a.expires_at).toLocaleString()}</span>
       </div>
       <pre className="mt-2 max-h-48 overflow-auto rounded-lg bg-[#0b0e16] p-3 font-mono text-xs text-slate-100">
         {JSON.stringify(a.args, null, 2)}
@@ -105,7 +105,7 @@ export default function ApprovalsView() {
     >
       {error && <Alert>{error}</Alert>}
       {approvalsQuery.isPending ? (
-        <Spinner label="Loading approvals..." />
+        <ListSkeleton rows={3} label="Loading approvals..." />
       ) : items.length === 0 ? (
         <Empty hint="Nothing here. Held calls appear under the pending filter." />
       ) : null}
