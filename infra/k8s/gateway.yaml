@@ -39,6 +39,10 @@ spec:
               valueFrom: { secretKeyRef: { name: traceguard-secrets, key: APPROVER_KEY } }
             - name: APPROVAL_ARGS_KEY
               valueFrom: { secretKeyRef: { name: traceguard-secrets, key: APPROVAL_ARGS_KEY } }
+            # Present-but-empty by default; keeps pending rows sealed under the
+            # previous key readable across a rotation.
+            - name: APPROVAL_ARGS_KEY_PREVIOUS
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: APPROVAL_ARGS_KEY_PREVIOUS, optional: true } }
             - name: GATEWAY_PORT
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: GATEWAY_PORT } }
             - name: APPROVAL_TTL_SECONDS
@@ -50,6 +54,9 @@ spec:
           livenessProbe:
             httpGet: { path: /healthz, port: 8091 }
             periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8091 }
+            periodSeconds: 5
           resources:
             requests: { memory: "128Mi", cpu: "100m" }
             limits: { memory: "512Mi" }
