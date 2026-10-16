@@ -26,6 +26,7 @@ export interface Principal {
 const WRITE_ALLOW: [string, string][] = [
   ["/v1/auth/login", "public"],
   ["/v1/auth/register", "public"],
+  ["/v1/auth/logout", "read"],
   ["/v1/budgets/check", "ingest"],
   ["/v1/budgets/settle", "ingest"],
   ["/v1/budgets/release", "ingest"],
@@ -66,6 +67,7 @@ const ROUTES: [string, string][] = [
   ["/v1/admin/", "admin"],
   ["/v1/users", "admin"],
   ["/v1/workspaces", "read"],
+  ["/v1/auth/me", "read"],
   ["/v1/auth/", "admin"]
 ];
 
