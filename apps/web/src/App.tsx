@@ -1,9 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
-import { formatMicro, getTrace, getUsage, gwApi, listRuns, settings, type Span } from "./api";
+import { formatMicro, getRunCounts, getTrace, getUsage, gwApi, listRuns, settings, type Span } from "./api";
 import { buildTree, tokenTotal, type SpanNode } from "./tree";
 import { relTime } from "./format";
 import { useHashRoute, type Tab } from "./router";
+import { filterRuns, sortRuns, type RunSortDir, type RunSortKey } from "./runsview";
+import type { PaletteItem } from "./palette";
+import { Palette } from "./CommandPalette";
 import EvalsView from "./Evals";
 import PoliciesView from "./Policies";
 import ApprovalsView from "./Approvals";
@@ -119,6 +122,8 @@ function ConnectionDrawer({ open, onClose, onSaved }: {
 
 function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
   const [status, setStatus] = useState("");
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState<{ key: RunSortKey; dir: RunSortDir } | null>(null);
   const runsQuery = useInfiniteQuery({
     queryKey: ["runs", status],
     queryFn: ({ pageParam }) => listRuns({ status: status || undefined, limit: 50, cursor: pageParam ?? undefined }),
@@ -129,10 +134,19 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
   const runs = runsQuery.data?.pages.flatMap((p) => p.items) ?? [];
   const error = runsQuery.error instanceof Error ? runsQuery.error.message : runsQuery.error ? "load failed" : "";
 
-  const counts = runs.reduce<Record<string, number>>((m, r) => {
-    m[r.status] = (m[r.status] ?? 0) + 1;
-    return m;
-  }, {});
+  // Global totals from the counts endpoint: the tiles keep their meaning while
+  // the list below is filtered.
+  const totalsQuery = useQuery({
+    queryKey: ["runs", "counts"],
+    queryFn: getRunCounts,
+    refetchInterval: 15_000
+  });
+  const totals = totalsQuery.data;
+  // Search and sort apply to the loaded pages; the server keeps owning paging.
+  const filtered = filterRuns(runs, query);
+  const visible = sort ? sortRuns(filtered, sort.key, sort.dir) : filtered;
+  const flipSort = (key: RunSortKey) =>
+    setSort((cur) => (cur?.key === key ? { key, dir: cur.dir === "desc" ? "asc" : "desc" } : { key, dir: "desc" }));
   // Clicking a KPI filters the list below it; clicking it again clears the filter.
   const toggleStatus = (s: string) => setStatus((cur) => (cur === s ? "" : s));
 
@@ -158,25 +172,36 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
         </>
       }
     >
-      {runs.length > 0 && (
-        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <Stat label="Loaded" value={runs.length} />
-          <Stat
-            label="Failed" value={counts.failed ?? 0} tone={(counts.failed ?? 0) > 0 ? "bad" : "default"}
-            active={status === "failed"} onClick={() => toggleStatus("failed")}
-          />
-          <Stat
-            label="Running" value={counts.running ?? 0} tone={(counts.running ?? 0) > 0 ? "warn" : "default"}
-            active={status === "running"} onClick={() => toggleStatus("running")}
-          />
-          <Stat label="Denied spans" value={counts.denied ?? 0} />
-        </div>
-      )}
+      <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Stat label="Total runs" value={totals ? totals.total : "–"} />
+        <Stat
+          label="Failed" value={totals ? totals.counts.failed ?? 0 : "–"}
+          tone={(totals?.counts.failed ?? 0) > 0 ? "bad" : "default"}
+          active={status === "failed"} onClick={() => toggleStatus("failed")}
+        />
+        <Stat
+          label="Running" value={totals ? totals.counts.running ?? 0 : "–"}
+          tone={(totals?.counts.running ?? 0) > 0 ? "warn" : "default"}
+          active={status === "running"} onClick={() => toggleStatus("running")}
+        />
+        <Stat label="Denied spans" value={totals ? totals.denied_spans : "–"} />
+      </div>
       {error && <Alert>{error}</Alert>}
+      <div className="mb-3">
+        <Input
+          aria-label="Search runs"
+          placeholder="Search by run id or agent..."
+          className="w-72"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+      </div>
       {runsQuery.isPending ? (
         <TableSkeleton label="Loading runs..." />
       ) : runs.length === 0 ? (
         <Empty hint="No runs yet. Run the demo agent to create one." />
+      ) : visible.length === 0 ? (
+        <Empty hint={`No loaded runs match "${query.trim()}".`} />
       ) : (
         <Table>
           <thead>
@@ -184,13 +209,15 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
               <Th>Run</Th>
               <Th>Agent</Th>
               <Th>Status</Th>
-              <Th>Started</Th>
-              <Th className="text-right">Spans</Th>
-              <Th className="text-right">Tokens in/out</Th>
+              <Th onSort={() => flipSort("started")} sorted={sort?.key === "started" ? sort.dir : undefined}>Started</Th>
+              <Th className="text-right" onSort={() => flipSort("spans")} sorted={sort?.key === "spans" ? sort.dir : undefined}>Spans</Th>
+              <Th className="text-right" onSort={() => flipSort("tokens")} sorted={sort?.key === "tokens" ? sort.dir : undefined}>
+                Tokens in/out
+              </Th>
             </tr>
           </thead>
           <tbody>
-            {runs.map((r) => (
+            {visible.map((r) => (
               <tr key={r.id} className="transition-colors hover:bg-ink-50/70">
                 <Td><LinkButton onClick={() => onOpen(r.id)}>{short(r.id)}</LinkButton></Td>
                 <Td>{r.agent_name}</Td>
@@ -207,7 +234,7 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
       )}
       {runs.length > 0 && (
         <p className="mt-2 text-xs text-ink-500">
-          {runs.length} run{runs.length === 1 ? "" : "s"} loaded
+          {query.trim() ? `Showing ${visible.length} of ${runs.length} loaded` : `${runs.length} run${runs.length === 1 ? "" : "s"} loaded`}
           {runsQuery.hasNextPage ? " · older runs load on demand" : ""} · refreshes every 10 s
         </p>
       )}
@@ -242,11 +269,23 @@ function SpanRow({ node, depth, selected, onSelect, base, maxEnd }: {
   return (
     <>
       <button
+        data-span={s.id}
         className={`block w-full rounded-md px-2 py-1.5 text-left transition-colors hover:bg-ink-50 ${
           selected === s.id ? "bg-brand-50 ring-1 ring-brand-200" : ""
         }`}
         style={{ paddingLeft: `${depth * 1.25 + 0.5}rem` }}
         onClick={() => onSelect(s.id)}
+        onKeyDown={(e) => {
+          // Arrows walk the flattened visible tree in DOM order.
+          if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+          e.preventDefault();
+          const all = [...document.querySelectorAll<HTMLButtonElement>("[data-span]")];
+          const next = all[all.indexOf(e.currentTarget) + (e.key === "ArrowDown" ? 1 : -1)];
+          if (next?.dataset.span) {
+            onSelect(next.dataset.span);
+            next.focus();
+          }
+        }}
       >
         <span className="flex items-center gap-2 text-sm">
           <StatusBadge status={s.status} />
@@ -359,6 +398,9 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
             <SpanRow key={n.span.id} node={n} depth={0} selected={selected} onSelect={setSelected} base={base} maxEnd={maxEnd} />
           ))}
           {roots.length === 0 && <p className="p-2 text-sm text-ink-500">No spans recorded.</p>}
+          {roots.length > 0 && (
+            <p className="px-2 py-1 text-xs text-ink-500">↑↓ moves through spans</p>
+          )}
         </Card>
         <div className="lg:sticky lg:top-4">
           {selectedSpan ? (
@@ -392,6 +434,30 @@ export default function App() {
   }).data?.items.length ?? 0;
 
   const go = (t: Tab) => navigate({ tab: t, runId: null });
+
+  // Ctrl/Cmd+K opens the switcher; Escape closes it from inside.
+  const [palette, setPalette] = useState(false);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPalette((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  // Rebuilt while the palette is open so recent runs reflect the live cache.
+  const paletteItems: PaletteItem[] = useMemo(() => {
+    const cached = queryClient.getQueryData<{ pages: { items: { id: string; agent_name: string }[] }[] }>(["runs", ""]);
+    const recent = (cached?.pages[0]?.items ?? []).slice(0, 6).map((r) => ({
+      id: `run-${r.id}`,
+      label: `Open run ${r.id.slice(0, 8)}`,
+      hint: r.agent_name,
+      action: () => navigate({ tab: "runs", runId: r.id })
+    }));
+    return [...TABS.map((t) => ({ id: `tab-${t.id}`, label: `Go to ${t.label}`, action: () => go(t.id) })), ...recent];
+  }, [palette]);
 
   return (
     <div className="flex min-h-screen">
@@ -473,6 +539,7 @@ export default function App() {
           )}
         </main>
       </div>
+      <Palette open={palette} onClose={() => setPalette(false)} items={paletteItems} />
       <ConnectionDrawer open={drawer} onClose={() => setDrawer(false)}
         onSaved={() => queryClient.invalidateQueries()} />
     </div>

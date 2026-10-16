@@ -77,6 +77,16 @@ export function listRuns(opts: { status?: string; limit?: number; cursor?: strin
   return get<{ items: RunItem[]; next_cursor: string | null }>(`/v1/runs?${p}`);
 }
 
+export interface RunCounts {
+  counts: Record<string, number>;
+  total: number;
+  denied_spans: number;
+}
+
+export function getRunCounts() {
+  return get<RunCounts>("/v1/runs/counts");
+}
+
 export function getTrace(runId: string) {
   return get<{ run: RunItem; spans: Span[] }>(`/v1/runs/${runId}/trace`);
 }

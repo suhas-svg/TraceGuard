@@ -10,8 +10,12 @@ filtering, cursor pagination, automatic refresh, and one click into a run's trac
 - `runs-paginate` appends older pages with `Load more` while `next_cursor` exists.
 - `runs-poll` refreshes the visible list in place every ~10 s without user action.
 - `runs-open` opens a run's trace view via its short-id button.
-- `runs-kpi` overview tiles above the table; `Failed` and `Running` are toggle buttons
-  (`aria-pressed`) that filter the list.
+- `runs-kpi` overview tiles read global totals from `/v1/runs/counts`; `Failed` and
+  `Running` are toggle buttons (`aria-pressed`) that filter the list.
+- `runs-search` filters the loaded pages by run-id prefix or agent name via the
+  `Search runs` input; the caption switches to `Showing N of M loaded`.
+- `runs-sort` sorts the loaded pages by Started / Spans / Tokens through the clickable
+  headers (`aria-sort`); the untouched order stays newest-first from the server.
 
 ## How to get to it (user POV)
 
@@ -36,6 +40,16 @@ Preconditions:
   `js("[...document.querySelectorAll('button[aria-pressed]')].find(b=>b.textContent.startsWith('Failed')).click()")`.
   That tile gains `aria-pressed="true"`, the segmented control moves to `Failed`, and pressing
   the tile again clears the filter back to `All`.
+- **KPI totals are global.** While a filter is active the tiles still read unfiltered
+  totals: read `js("[...document.querySelectorAll('button[aria-pressed]')].filter(b=>/^(Failed|Running)\\s*\\d/.test(b.textContent)).map(b=>b.textContent.replace(/\\s+/g,' '))")`
+  before and after filtering — the numbers match.
+- **Search.** `fill_input('input[aria-label="Search runs"]', 'ts-agent')`; the row count
+  drops to the matches and the caption reads `Showing N of M loaded`. Clearing the input
+  restores every loaded row.
+- **Sort.** Click a sortable header, e.g.
+  `js("[...document.querySelectorAll('thead th button')].find(b=>b.textContent.includes('Spans')).click()")`.
+  That `th` reports `aria-sort="descending"` and the first row holds the largest span count;
+  clicking again flips to `ascending`.
 - **Reset filter.** Press `All` the same way; row count returns to ≥2.
 - **Paginate.** With >50 seeded runs, click `Load more`
   (`js("[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Load more').click()")`).

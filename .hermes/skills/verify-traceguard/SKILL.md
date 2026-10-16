@@ -102,6 +102,9 @@ Stable handles (from `apps/web/src/`):
 | Theme toggle | button `aria-label` "Switch to light/dark mode" |
 | Loading skeletons | `[role="status"][aria-label="Loading runs..."]` / `"Loading trace..."` / `"Loading approvals..."` / `"Loading rules..."` |
 | Runs KPI tiles | `button[aria-pressed]` whose text starts with `Failed` or `Running` (toggle filter) |
+| Runs search | `input[aria-label="Search runs"]` |
+| Sortable headers | `thead th[aria-sort]`; the inner `button` toggles asc/desc |
+| Command palette | `[role="dialog"][aria-label="Command palette"]`; Ctrl/Cmd+K toggles it, input `aria-label="Command palette search"`, entries `[role="option"]` |
 
 Routing is hash-based (`src/router.ts`): `#/runs`, `#/runs/<runId>`, `#/evals`,
 `#/policy`, `#/approvals`, `#/webhooks`, `#/retention`, `#/costs`, `#/users`.

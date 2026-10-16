@@ -217,6 +217,35 @@ export function buildApp() {
     };
   });
 
+  // Dashboard tiles read global totals from here, so a filtered list cannot
+  // re-count itself. Same workspace scoping as the list.
+  app.get("/v1/runs/counts", async (req) => {
+    const params: unknown[] = [];
+    const scope = scopeClause(req.principal, params, "r.workspace_id");
+    const byStatus = await pool.query(
+      `SELECT r.status, COUNT(*)::int AS count
+         FROM runs r
+        ${scope ? "WHERE " + scope : ""}
+        GROUP BY r.status`,
+      params
+    );
+    const denied = await pool.query(
+      `SELECT COUNT(*)::int AS count
+         FROM spans s JOIN runs r ON r.id = s.run_id
+        WHERE s.status = 'denied' ${scope ? "AND " + scope : ""}`,
+      params
+    );
+    const counts: Record<string, number> = {};
+    for (const row of byStatus.rows as { status: string; count: number }[]) {
+      counts[row.status] = row.count;
+    }
+    return {
+      counts,
+      total: Object.values(counts).reduce((sum, n) => sum + n, 0),
+      denied_spans: (denied.rows[0] as { count: number }).count
+    };
+  });
+
   app.get("/v1/runs/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
     const res = await pool.query("SELECT * FROM runs WHERE id = $1", [id]);
