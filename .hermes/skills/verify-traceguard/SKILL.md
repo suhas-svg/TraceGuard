@@ -118,6 +118,9 @@ Stable handles (from `apps/web/src/`):
 | Runs search | `input[aria-label="Search runs"]` |
 | Sortable headers | `thead th[aria-sort]`; the inner `button` toggles asc/desc |
 | Command palette | `[role="dialog"][aria-label="Command palette"]`; Ctrl/Cmd+K toggles it, input `aria-label="Command palette search"`, entries `[role="option"]` |
+| Approval cards | the smallest `div` containing the tool name AND an `Approve` button (the name's own header div has none); a decided card leaves the current filter by design |
+| Users controls | per-card `select[aria-label="Workspace"]` (grants on change) and `button[aria-label="Remove from <workspace>"]`; `input[aria-label="New workspace name"]`; `input[type=email]`/`input[type=password]` for the user form |
+| Evaluations | `input[name="runId"]` (open one eval run) and `input[placeholder="run-id-1, run-id-2"]` (compare) — both real forms, submit with `requestSubmit()` |
 
 Routing is hash-based (`src/router.ts`): `#/runs`, `#/runs/<runId>`, `#/evals`,
 `#/policy`, `#/approvals`, `#/webhooks`, `#/retention`, `#/costs`, `#/users`.

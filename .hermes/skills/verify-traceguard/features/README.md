@@ -50,3 +50,4 @@ pairing user action → exact command → observable result), `Gotchas`.
 - [Webhooks](./webhooks.md) — subscriptions, delivery log, retry.
 - [Retention](./retention.md) — rules, run history, destructive-window discipline.
 - [Users](./users.md) — accounts, scoped keys (mint/revoke), workspace membership.
+- [Evaluations](./evals.md) — suites, open an evaluation run, compare runs.
