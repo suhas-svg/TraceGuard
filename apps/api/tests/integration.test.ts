@@ -76,6 +76,32 @@ describe("integration and security", () => {
     expect(trace.json().spans).toHaveLength(3);
   });
 
+  it("totals runs by status and denied spans, authenticated only", async () => {
+    const done = randomUUID();
+    const failed = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: {
+      events: [
+        ev({ run_id: done, event_type: "run.completed" }),
+        ev({ run_id: failed, status: "denied" })
+      ]
+    } });
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: {
+      events: [ev({ run_id: failed, event_type: "run.failed", error_type: "boom" })]
+    } });
+
+    const res = await api.inject({ method: "GET", url: "/v1/runs/counts", headers: key });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { counts: Record<string, number>; total: number; denied_spans: number };
+    expect(body.counts.success).toBeGreaterThanOrEqual(1);
+    expect(body.counts.failed).toBeGreaterThanOrEqual(1);
+    expect(body.denied_spans).toBeGreaterThanOrEqual(1);
+    // The tiles must agree with the list they sit above.
+    expect(body.total).toBe(Object.values(body.counts).reduce((a, b) => a + b, 0));
+
+    const unauth = await api.inject({ method: "GET", url: "/v1/runs/counts" });
+    expect(unauth.statusCode).toBe(401);
+  });
+
   it("rejects oversized batches and unauthenticated reads", async () => {
     const big = { events: Array.from({ length: 501 }, () => ev({})) };
     const res = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: big });

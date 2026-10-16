@@ -236,10 +236,30 @@ export function Table({ children }: { children: ReactNode }) {
   );
 }
 
-export function Th({ children, className = "" }: { children?: ReactNode; className?: string }) {
+export function Th({ children, className = "", onSort, sorted }: {
+  children?: ReactNode;
+  className?: string;
+  onSort?: () => void;
+  sorted?: "asc" | "desc";
+}) {
   return (
-    <th className={`sticky top-0 z-10 border-b border-ink-200 bg-ink-50 px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-ink-500 ${className}`}>
-      {children}
+    <th
+      aria-sort={onSort ? (sorted === "asc" ? "ascending" : sorted === "desc" ? "descending" : "none") : undefined}
+      className={`sticky top-0 z-10 border-b border-ink-200 bg-ink-50 px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-ink-500 ${className}`}
+    >
+      {onSort ? (
+        <button
+          onClick={onSort}
+          className="inline-flex items-center gap-1 uppercase tracking-wide transition-colors hover:text-ink-800"
+        >
+          {children}
+          <span aria-hidden="true" className="text-[10px] font-normal">
+            {sorted === "asc" ? "▲" : sorted === "desc" ? "▼" : "↕"}
+          </span>
+        </button>
+      ) : (
+        children
+      )}
     </th>
   );
 }
