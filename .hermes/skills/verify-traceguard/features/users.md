@@ -31,7 +31,18 @@ Preconditions:
   value into `checks.txt`, screenshots, or the transcript.
 - **Revoke.** Click that key row's `Revoke` — the row disappears and the card's `Revoke` count
   returns to its pre-mint value.
-- **Proof.** `checks.txt` records the two counts and a boolean for the plaintext element.
+- **Create a workspace.** Fill `input[aria-label="New workspace name"]` and submit that form;
+  `GET /v1/workspaces` lists it even when the page's own list does not visibly change.
+- **Create a user.** Fill `input[type=email]` and `input[type=password]` (12+ chars) in the
+  `New user` form; role defaults to `member`. The card appears with the list's own ordering
+  (oldest first), so find it by email rather than by position.
+- **Grant membership.** Each card owns a `select[aria-label="Workspace"]` whose change event
+  grants immediately (`grant...` is the blank option). Pick the workspace by option text.
+- **Revoke membership.** Click the chip's `button[aria-label="Remove from <workspace>"]`; the
+  chip disappears and the card reads `none` again.
+- **Proof.** `checks.txt` records the two counts, a boolean for the plaintext element, the
+  user's membership list from `GET /v1/users`, and the workspace's presence in
+  `GET /v1/workspaces`.
 
 ## Gotchas
 
@@ -43,3 +54,6 @@ Preconditions:
   include `Revoke` — the name span's own closest div has no buttons.
 - A minted key is shown once: after a reload it is unrecoverable, which is the intended design,
   not a bug to file.
+- Confirm a create/grant/revoke through the API (`GET /v1/users`, `GET /v1/workspaces`) before
+  calling it failed: with 200+ cards the page refetches lazily and a fresh row can be missing
+  from the DOM for several seconds after the request already succeeded.
