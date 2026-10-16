@@ -47,3 +47,6 @@ pairing user action → exact command → observable result), `Gotchas`.
 - [Approvals queue](./approvals-queue.md) — filter tabs, decision actions, pending vs terminal states.
 - [Policy center](./policy-center.md) — upstream servers, versioned rules, create/edit flow.
 - [Costs comparison](./costs-comparison.md) — window form, estimate-vs-billed bars, variance table.
+- [Webhooks](./webhooks.md) — subscriptions, delivery log, retry.
+- [Retention](./retention.md) — rules, run history, destructive-window discipline.
+- [Users](./users.md) — accounts, scoped keys (mint/revoke), workspace membership.

@@ -106,7 +106,13 @@ export function getUsage(runId: string) {
 async function postApi<T>(path: string, body: unknown, method = "POST"): Promise<T> {
   const res = await fetch(`${settings.url}${path}`, {
     method,
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${settings.key}` },
+    // A bodyless call must not declare a JSON body: Fastify answers 400 to
+    // Content-Type: application/json with an empty body, which broke every
+    // DELETE and revoke the dashboard sends.
+    headers: {
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      Authorization: `Bearer ${settings.key}`
+    },
     body: body === undefined ? undefined : JSON.stringify(body)
   });
   if (res.status === 401) throw new Error("unauthorized: check the API key in settings");
