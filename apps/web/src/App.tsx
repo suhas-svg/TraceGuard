@@ -563,7 +563,7 @@ export default function App() {
 
   return (
     <div className="flex min-h-screen">
-      <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col bg-[#0b0e16] text-slate-300">
+      <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r border-white/5 bg-gradient-to-b from-[#101528] via-[#0b0e16] to-[#07090f] text-slate-300">
         <div className="flex items-center gap-2 px-5 pb-5 pt-6">
           <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 font-mono text-sm font-bold text-white shadow-lg shadow-brand-600/30">
             TG
@@ -584,7 +584,7 @@ export default function App() {
               aria-current={tab === t.id && !openRun ? "page" : undefined}
               className={`flex items-center gap-2.5 rounded-md px-3 py-2 text-sm transition-colors ${
                 tab === t.id && !openRun
-                  ? "bg-white/10 font-medium text-white"
+                  ? "bg-gradient-to-r from-brand-600/40 to-brand-600/5 font-medium text-white ring-1 ring-inset ring-brand-500/30"
                   : "text-slate-400 hover:bg-white/5 hover:text-white"
               }`}
             >
