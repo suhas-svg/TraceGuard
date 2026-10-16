@@ -123,6 +123,21 @@ export function getOverview() {
   return get<Overview>("/v1/overview");
 }
 
+export interface Budget {
+  id: string;
+  scope: string;
+  ref_id: string;
+  limit_micro: number;
+  effect: string;
+  spent_micro: number;
+  reserved_micro: number;
+  remaining_micro: number;
+}
+
+export function listBudgets() {
+  return get<{ items: Budget[] }>("/v1/budgets");
+}
+
 export interface DiagnosticWarning {
   code: string;
   severity: string;

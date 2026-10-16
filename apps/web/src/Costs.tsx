@@ -1,9 +1,11 @@
 import { useState } from "react";
-import { formatMicro, opsApi, type CompareRow } from "./api";
+import { useQuery } from "@tanstack/react-query";
+import { formatMicro, listBudgets, opsApi, type CompareRow } from "./api";
 import {
   Alert, Badge, Button, Card, Empty, Field, Input,
   Page, Table, Td, Th
 } from "./components";
+import { ChartCard, Donut, Legend, Meter, type Slice } from "./charts";
 
 function fmtPct(v: number | null): string {
   if (v === null) return "n/a";
@@ -60,6 +62,40 @@ function SpendByModel({ rows }: { rows: CompareRow[] }) {
   );
 }
 
+// Budget health belongs next to spend: spent plus reserved against each
+// limit, with the traffic-light colors the gateway's block effect deserves.
+function BudgetUtilization() {
+  const q = useQuery({ queryKey: ["budgets"], queryFn: listBudgets, refetchInterval: 30_000 });
+  const items = q.data?.items ?? [];
+  if (items.length === 0) return null;
+  return (
+    <ChartCard
+      title="Budget utilization"
+      sub="Spent plus reserved against each limit; block budgets stop calls at 100%."
+      className="mb-5"
+    >
+      <div className="flex flex-col gap-3">
+        {items.map((b) => {
+          const used = b.spent_micro + b.reserved_micro;
+          const pct = b.limit_micro > 0 ? used / b.limit_micro : 0;
+          const color = pct >= 1 ? "var(--color-bad-700)" : pct >= 0.8 ? "var(--color-warn-700)" : "var(--color-ok-700)";
+          return (
+            <Meter
+              key={b.id}
+              label={`${b.scope} · ${b.ref_id.slice(0, 8)} · ${b.effect}`}
+              value={used}
+              max={Math.max(b.limit_micro, 1)}
+              color={color}
+              valueText={`${formatMicro(used)} / ${formatMicro(b.limit_micro)}`}
+              hint={`remaining ${formatMicro(Math.max(b.remaining_micro, 0))}`}
+            />
+          );
+        })}
+      </div>
+    </ChartCard>
+  );
+}
+
 export default function CostsView() {
   const [provider, setProvider] = useState("");
   const [days, setDays] = useState("30");
@@ -75,6 +111,13 @@ export default function CostsView() {
       .then((r) => setRows(r.rows))
       .catch((e) => setError(e instanceof Error ? e.message : "load failed"));
   };
+
+  const estTotal = rows?.reduce((sum, r) => sum + r.estimated_micro, 0) ?? 0;
+  const actTotal = rows?.reduce((sum, r) => sum + (r.actual_micro ?? 0), 0) ?? 0;
+  const splitSlices: Slice[] = [
+    { label: "Estimated", value: estTotal, color: "var(--color-brand-500)" },
+    { label: "Billed", value: actTotal, color: "var(--color-ok-700)" }
+  ].filter((s) => s.value > 0);
 
   return (
     <Page
@@ -99,13 +142,33 @@ export default function CostsView() {
           <Button variant="primary" type="submit">Compare</Button>
         </form>
       </Card>
+      <BudgetUtilization />
       {rows === null ? (
         <Empty hint="Pick a window and compare." action={<Button variant="primary" onClick={load}>Compare</Button>} />
-      ) : rows.length === 0 ? (
+      ) : rows.filter((r) => r.provider || r.model).length === 0 ? (
         <Empty hint="No usage in this window. Import actuals to compare against estimates." />
       ) : (
         <>
-          <SpendByModel rows={rows} />
+          {estTotal + actTotal > 0 && (
+            <ChartCard
+              title="Estimate vs billed"
+              sub="Indigo is our estimate, green is the provider invoice for this window."
+              className="mb-5"
+            >
+              <div className="flex flex-wrap items-center gap-6">
+                <Donut slices={splitSlices}>
+                  <span className="tg-nums text-lg font-semibold tracking-tight text-ink-900">
+                    {actTotal > 0 ? fmtPct((estTotal - actTotal) / actTotal) : "no actuals"}
+                  </span>
+                  <span className="text-[10px] uppercase tracking-wide text-ink-500">variance</span>
+                </Donut>
+                <div className="min-w-0 flex-1">
+                  <Legend slices={splitSlices} />
+                </div>
+              </div>
+            </ChartCard>
+          )}
+          <SpendByModel rows={rows.filter((r) => r.provider || r.model)} />
           <Table>
             <thead>
               <tr>
@@ -118,7 +181,7 @@ export default function CostsView() {
               </tr>
             </thead>
             <tbody>
-              {rows.map((r) => (
+              {rows.filter((r) => r.provider || r.model).map((r) => (
                 <tr key={`${r.provider}/${r.model}`} className="transition-colors hover:bg-ink-50/70">
                   <Td className="font-mono text-[13px]">
                     {r.provider}/{r.model}

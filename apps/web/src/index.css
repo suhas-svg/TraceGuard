@@ -89,6 +89,16 @@ body {
   color: var(--color-ink-800);
 }
 
+/* A faint brand glow keeps the dark theme from reading flat. Kept to the
+   dark background so the light theme stays crisp. */
+.dark body {
+  background:
+    radial-gradient(1100px 520px at 78% -8%, color-mix(in srgb, var(--color-brand-500) 16%, transparent), transparent 62%),
+    radial-gradient(900px 480px at -10% 108%, color-mix(in srgb, var(--color-info-700) 10%, transparent), transparent 55%),
+    var(--color-ink-50);
+  background-attachment: fixed;
+}
+
 /* Thin, quiet scrollbars for tables and code blocks. */
 *::-webkit-scrollbar {
   width: 8px;
@@ -117,6 +127,7 @@ body {
 .tg-bar {
   border-radius: 999px;
   min-width: 3px;
+  transition: width 0.5s ease;
 }
 
 /* Monospace numerals in tables so columns do not jitter. */
