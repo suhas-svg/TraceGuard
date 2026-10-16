@@ -11,7 +11,7 @@ import {
   stableStringify,
   type PolicyRule
 } from "./policy.js";
-import { callUpstreamTool, checkUpstreamUrl, definitionHash, discoverTools } from "./upstream.js";
+import { callUpstreamTool, checkUpstreamUrlResolved, definitionHash, discoverTools } from "./upstream.js";
 import { hashesEqual, parseKey, seal, tryOpen } from "./seal.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
 import { notify } from "./notify.js";
@@ -125,7 +125,7 @@ export function buildGateway() {
   app.post("/v1/servers", async (req, reply) => {
     const parsed = serverSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_server" });
-    const urlCheck = checkUpstreamUrl(parsed.data.base_url);
+    const urlCheck = await checkUpstreamUrlResolved(parsed.data.base_url);
     if (!urlCheck.ok) return reply.code(400).send({ error: "unsafe_upstream", reason: urlCheck.reason });
     const client = await pool.connect();
     try {
@@ -167,6 +167,12 @@ export function buildGateway() {
       const srv = await client.query("SELECT * FROM mcp_servers WHERE id = $1", [id]);
       if (!srv.rows[0]) return reply.code(404).send({ error: "server_not_found" });
       const server = srv.rows[0];
+      // Re-validate at discover time: a name that resolved publicly at
+      // registration must not quietly point at a private range now.
+      const recheck = await checkUpstreamUrlResolved(server.base_url);
+      if (!recheck.ok) {
+        return reply.code(400).send({ error: "unsafe_upstream", reason: recheck.reason });
+      }
       const tools = await discoverTools(server.base_url, server.auth_secret);
       await client.query("BEGIN");
       for (const t of tools) {
@@ -360,7 +366,44 @@ export function buildGateway() {
     decisionMeta: { approval_id?: string | null; policy_id?: string | null; policy_version?: number | null; matched?: unknown[] }
   ): Promise<unknown> {
     // Gateway fails closed: any upstream or policy error denies, never allows.
-    const result = await callUpstreamTool(server.base_url, server.auth_secret, tool, args);
+    // Re-validate before every forward; a failure surfaces through the
+    // caller's catch as 502 so the call fails closed instead of reaching a
+    // rebinding host.
+    const urlRecheck = await checkUpstreamUrlResolved(server.base_url);
+    if (!urlRecheck.ok) {
+      // The call never leaves, and the decision trail records why so the
+      // console can explain the failure next to the allow rules.
+      await recordDecision(client, {
+        workspace_id: server.workspace_id, caller, server_id: server.id, tool_name: tool,
+        args_hash: sha256Hex(stableStringify(args)), decision: "error",
+        policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
+        matched: decisionMeta.matched, reason: `upstream fails validation: ${urlRecheck.reason}`,
+        approval_id: decisionMeta.approval_id ?? null
+      });
+      await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
+        resource_type: "mcp_server", resource_id: server.id, result: "failed",
+        metadata: { tool, error: urlRecheck.reason } });
+      throw new Error(`upstream fails validation: ${urlRecheck.reason}`);
+    }
+    let result: unknown;
+    try {
+      result = await callUpstreamTool(server.base_url, server.auth_secret, tool, args);
+    } catch (err) {
+      // Allow-shaped decision, failed call: the trail keeps both the intent
+      // and the failure so the console can explain the eventual 502.
+      const detail = err instanceof Error ? err.message : String(err);
+      await recordDecision(client, {
+        workspace_id: server.workspace_id, caller, server_id: server.id, tool_name: tool,
+        args_hash: sha256Hex(stableStringify(args)), decision: "error",
+        policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
+        matched: decisionMeta.matched, reason: `upstream error: ${detail}`,
+        approval_id: decisionMeta.approval_id ?? null
+      });
+      await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
+        resource_type: "mcp_server", resource_id: server.id, result: "failed",
+        metadata: { tool, error: detail } });
+      throw err;
+    }
     await recordDecision(client, {
       workspace_id: server.workspace_id, caller, server_id: server.id, tool_name: tool,
       args_hash: sha256Hex(stableStringify(args)), decision: decisionMeta.approval_id ? "approved_retry" : "allow",
@@ -570,6 +613,19 @@ export function buildGateway() {
   app.get("/v1/approvals", async (req) => {
     const q = req.query as { status?: string; limit?: string };
     const limit = Math.min(Math.max(Number(q.limit ?? 50), 1), 200);
+    // Lazy expiry sweep: listing approvals flips any past-TTL pending row to
+    // expired (args dropped, redacted summary kept), so queues never show
+    // dead holds. The per-row pending guard keeps concurrent lists idempotent.
+    const stale = await pool.query(
+      "SELECT * FROM approvals WHERE status = 'pending' AND expires_at < now()"
+    );
+    for (const row of stale.rows) {
+      await pool.query(
+        `UPDATE approvals SET status='expired', args='{}'::jsonb, args_enc=false, args_summary=$2
+          WHERE id=$1 AND status='pending'`,
+        [row.id, safeSummary(row)]
+      );
+    }
     const params: unknown[] = [];
     const where: string[] = [];
     if (q.status) {

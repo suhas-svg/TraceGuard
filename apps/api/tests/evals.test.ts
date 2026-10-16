@@ -37,4 +37,34 @@ describe("deterministic assertions", () => {
     expect(runAssertion({ type: "status", value: "failed" }, ctx).passed).toBe(false);
     expect(runAssertion({ type: "judge" }, ctx).passed).toBe(false);
   });
+
+  it("tools names compare as an unordered multiset", () => {
+    expect(runAssertion({ type: "tools", names: ["write_file", "read_file"] }, ctx).passed).toBe(true);
+    expect(runAssertion({ type: "tools", names: ["read_file"] }, ctx).passed).toBe(false);
+    expect(runAssertion({ type: "tools", names: ["read_file", "read_file"] }, ctx).passed).toBe(false);
+    // The ordered form still exists and still cares about order.
+    expect(runAssertion({ type: "tools", sequence: ["write_file", "read_file"] }, ctx).passed).toBe(false);
+  });
+
+  it("json_schema validates nested objects, arrays, enums and integers", () => {
+    const nested = {
+      required: ["answer", "items", "state"],
+      properties: {
+        answer: { type: "integer" },
+        items: { type: "array", items: { type: "string" } },
+        state: { enum: ["on", "off"] }
+      }
+    };
+    const ok = { ...ctx, output: '{"answer": 42, "items": ["a", "b"], "state": "on"}' };
+    expect(runAssertion({ type: "json_schema", schema: nested }, ok).passed).toBe(true);
+    const badItem = { ...ctx, output: '{"answer": 42, "items": ["a", 2], "state": "on"}' };
+    expect(runAssertion({ type: "json_schema", schema: nested }, badItem).passed).toBe(false);
+    const badEnum = { ...ctx, output: '{"answer": 42, "items": ["a"], "state": "maybe"}' };
+    expect(runAssertion({ type: "json_schema", schema: nested }, badEnum).passed).toBe(false);
+    const float = { ...ctx, output: '{"answer": 4.5, "items": [], "state": "off"}' };
+    expect(runAssertion({ type: "json_schema", schema: nested }, float).passed).toBe(false);
+    // The flat string shorthand inside properties still works.
+    expect(runAssertion({ type: "json_schema",
+      schema: { required: ["answer"], properties: { answer: "number" } } }, ok).passed).toBe(true);
+  });
 });

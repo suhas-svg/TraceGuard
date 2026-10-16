@@ -19,10 +19,12 @@ async function defaultWorkspaceId(client: PoolClient): Promise<string> {
 
 interface ExecConfig {
   output?: string;
+  input?: string;
   model?: string;
   provider?: string;
   input_tokens?: number;
   output_tokens?: number;
+  cached_tokens?: number;
   latency_ms?: number;
   tools?: { tool: string; args?: Record<string, unknown>; status?: string; error_type?: string }[];
   fail?: string;
@@ -52,25 +54,29 @@ async function executeCase(
     client.query(
       `INSERT INTO spans
          (id, run_id, parent_span_id, event_id, operation_type, name, started_at,
-          duration_ms, status, provider, model, input_tokens, output_tokens,
+          duration_ms, status, provider, model, input_tokens, output_tokens, cached_tokens,
           usage_source, error_type, attributes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb)`,
       [id, runId, parent, `evt-${randomUUID()}`, op, op, now,
        extra.duration_ms ?? null, (extra.status as string) ?? "success",
        extra.provider ?? null, extra.model ?? null,
-       extra.input_tokens ?? null, extra.output_tokens ?? null,
+       extra.input_tokens ?? null, extra.output_tokens ?? null, extra.cached_tokens ?? null,
        extra.input_tokens == null && extra.output_tokens == null ? "unavailable" : "provider_reported",
        extra.error_type ?? null, JSON.stringify(extra.attributes ?? {})]
     );
 
-  await addSpan(rootId, null, "run.started", {});
+  // Dataset-authored input rides the run's first span for provenance; it is
+  // dataset content, not a runtime prompt, and passes the same redaction
+  // pass as every other span attribute.
+  await addSpan(rootId, null, "run.started",
+    exec.input === undefined ? {} : { attributes: { input: exec.input } });
   // Bounded pretend work so latency is measured, not asserted.
   await new Promise((r) => setTimeout(r, Math.min(Math.max(exec.latency_ms ?? 0, 0), 2000)));
   const tools = exec.tools ?? [];
   await addSpan(randomUUID(), rootId, "model.request", {
     duration_ms: Date.now() - started, provider: exec.provider ?? "scripted",
     model: exec.model ?? model, input_tokens: exec.input_tokens ?? null,
-    output_tokens: exec.output_tokens ?? null
+    output_tokens: exec.output_tokens ?? null, cached_tokens: exec.cached_tokens ?? null
   });
   const toolNames: string[] = [];
   for (const t of tools) {
@@ -93,7 +99,7 @@ async function executeCase(
   // usage endpoint; comparisons must not read "no price" as "$0.00").
   const priced = price.rows[0] != null && (exec.input_tokens != null || exec.output_tokens != null);
   const cost = priced
-    ? estimateCostMicro(exec.input_tokens ?? 0, exec.output_tokens ?? 0, 0, {
+    ? estimateCostMicro(exec.input_tokens ?? 0, exec.output_tokens ?? 0, Number(exec.cached_tokens ?? 0), {
         input_price_per_million: Number(price.rows[0].input_price_per_million),
         output_price_per_million: Number(price.rows[0].output_price_per_million),
         cached_input_price_per_million: Number(price.rows[0].cached_input_price_per_million)
@@ -232,6 +238,11 @@ export function registerEvalRoutes(app: FastifyInstance) {
           }
           const exec = { ...((c.exec_config ?? {}) as ExecConfig),
             ...((cfg.exec_overrides[c.name] ?? {}) as Partial<ExecConfig>) };
+          // Cases authored with input_payload/expected and no explicit exec
+          // config still replay deterministically: a string expected value
+          // becomes the scripted output, and the input rides the run spans.
+          if (exec.output === undefined && typeof c.expected === "string") exec.output = c.expected;
+          if (exec.input === undefined) exec.input = c.input_payload as string | undefined;
           const out = await executeCase(client, workspaceId, agent.rows[0].id,
             cfg.agent_name, exec, cfg.model);
           // Unknown costs cannot count against the cap; the cap is a guard,
@@ -306,8 +317,9 @@ export function registerEvalRoutes(app: FastifyInstance) {
       const res = await pool.query("SELECT * FROM eval_results WHERE eval_run_id = $1", [r.id]);
       const lat = res.rows.map((x) => Number(x.latency_ms));
       const denied = await pool.query(
-        `SELECT COUNT(*) AS n FROM spans s JOIN eval_results e ON e.agent_run_id = s.run_id
-         WHERE e.eval_run_id = $1 AND s.status = 'denied'`, [r.id]
+        `SELECT COUNT(*) AS n, COUNT(*) FILTER (WHERE s.status = 'denied') AS denied
+           FROM spans s JOIN eval_results e ON e.agent_run_id = s.run_id
+          WHERE e.eval_run_id = $1`, [r.id]
       );
       const passed = res.rows.filter((x) => x.passed).length;
       const costs = res.rows.map((x) => (x.cost_micro == null ? null : Number(x.cost_micro)))
@@ -328,7 +340,8 @@ export function registerEvalRoutes(app: FastifyInstance) {
         cost_micro: costs.length ? costs.reduce((a, b) => a + b, 0) : null,
         input_tokens: num(tokens.rows[0].input_tokens),
         output_tokens: num(tokens.rows[0].output_tokens),
-        violations: Number(denied.rows[0]?.n ?? 0)
+        // A run whose spans are gone counts as unknown, not as zero.
+        violations: Number(denied.rows[0]?.n ?? 0) > 0 ? Number(denied.rows[0].denied) : null
       });
     }
     return { runs: out };

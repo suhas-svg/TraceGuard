@@ -61,6 +61,19 @@ describe("otlp mapping", () => {
     expect(failed.errorType).toBe("ToolTimeout");
   });
 
+  it("maps cached input tokens when the provider reports them", () => {
+    const m = mapOtlpSpan(
+      { ...base, attributes: [
+        ...base.attributes,
+        { key: "gen_ai.usage.cache_read_input_tokens", value: { intValue: "40" } }
+      ] },
+      resource
+    )!;
+    expect(m.cachedTokens).toBe(40);
+    const plain = mapOtlpSpan(base, resource)!;
+    expect(plain.cachedTokens).toBeNull();
+  });
+
   it("drops spans without ids and marks missing usage unavailable", () => {
     expect(mapOtlpSpan({ ...base, traceId: "" }, resource)).toBeNull();
     const m = mapOtlpSpan({ ...base, attributes: [] }, {})!;
