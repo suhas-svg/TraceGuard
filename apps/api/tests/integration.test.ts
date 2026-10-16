@@ -978,10 +978,15 @@ describe("integration and security", () => {
   });
 
   it("lists agents for the dashboard filter", async () => {
+    // Self-contained: on long-lived dev databases the 500-name page can push
+    // older entries past the cutoff, so plant an agent whose name sorts first.
+    const listed = `aaa-list-${tag}`;
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ agent_name: listed, event_type: "run.started" })] } });
     const res = await api.inject({ method: "GET", url: "/v1/agents", headers: key });
     expect(res.statusCode).toBe(200);
     const names = res.json().items.map((a: { name: string }) => a.name);
-    expect(names).toContain(`sec-${tag}`);
+    expect(names).toContain(listed);
     const unauth = await api.inject({ method: "GET", url: "/v1/agents" });
     expect(unauth.statusCode).toBe(401);
   });
