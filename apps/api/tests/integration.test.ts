@@ -74,6 +74,7 @@ describe("integration and security", () => {
     expect(retry.json()).toMatchObject({ accepted: 0, duplicates: 3 });
     const trace = await api.inject({ method: "GET", url: `/v1/runs/${runId}/trace`, headers: key });
     expect(trace.json().spans).toHaveLength(3);
+    expect(trace.json().run.agent_name).toBe(`sec-${tag}`);
   });
 
   it("totals runs by status and denied spans, authenticated only", async () => {
@@ -114,6 +115,11 @@ describe("integration and security", () => {
     const bad = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `bad-${tag}`, base_url: "ftp://evil/x" } });
     expect(bad.statusCode).toBe(400);
+    // Cloud metadata addresses are never valid upstreams, even when private
+    // upstreams are allowed.
+    const metadata = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `meta-${tag}`, base_url: "http://169.254.169.254/mcp" } });
+    expect(metadata.statusCode).toBe(400);
     const res = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `mock-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`, auth_secret: "s3cret" } });
     expect(res.statusCode).toBe(201);
@@ -744,6 +750,19 @@ describe("integration and security", () => {
         payload: { server_id: sid, tool: "boom", arguments: {}, caller: "t" } });
       expect(res.statusCode).toBe(502);
       expect(callRequests).toBe(1);
+      // The failure is evidence too: the decision row and audit both record
+      // it, so operators can see why a managed call died.
+      const decision = await pool.query(
+        "SELECT decision, reason FROM policy_decisions WHERE server_id = $1 ORDER BY timestamp DESC LIMIT 1",
+        [sid]
+      );
+      expect(decision.rows[0].decision).toBe("error");
+      expect(String(decision.rows[0].reason)).toContain("upstream error");
+      const audited = await pool.query(
+        "SELECT result FROM audit_events WHERE action = 'tool.execute' AND resource_id = $1 ORDER BY timestamp DESC LIMIT 1",
+        [sid]
+      );
+      expect(audited.rows[0].result).toBe("failed");
     } finally {
       flakyHttp.close();
       flakyHttp.closeAllConnections();
@@ -1061,5 +1080,74 @@ describe("integration and security", () => {
     expect(after.statusCode).toBe(401);
     const unauth = await api.inject({ method: "GET", url: "/v1/auth/me" });
     expect(unauth.statusCode).toBe(401);
+  });
+
+  it("bills cached tokens at the cached rate and never double", async () => {
+    const prov = `cache-${tag}`;
+    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+      payload: { provider: prov, model: "m1", input_price_per_million: 1_000_000,
+        output_price_per_million: 0, cached_input_price_per_million: 4_000_000 } });
+    const runId = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId, provider: prov, model: "m1",
+        input_tokens: 1000, output_tokens: 0, cached_tokens: 600,
+        timestamp: new Date().toISOString() })] } });
+    const usage = await api.inject({ method: "GET", url: `/v1/runs/${runId}/usage`, headers: key });
+    expect(usage.statusCode).toBe(200);
+    // 400 fresh input tokens * 1M/M + 600 cached * 4M/M = 400 + 2400 = 2800 micro.
+    // Billing cached at the full input rate would read 1000 here.
+    expect(usage.json().estimated_cost_micro).toBe(2800);
+    expect(usage.json().spans[0].cached_tokens).toBe(600);
+  });
+
+  it("sweeps expired approvals out of the pending queue on list", async () => {
+    const reg = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `sweep-upstream-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp` } });
+    const sweepServerId = reg.json().id;
+    await gw.inject({ method: "POST", url: `/v1/servers/${sweepServerId}/discover`, headers: key });
+    await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+      payload: { name: `sweep-hold-${tag}`, priority: 90, server_id: sweepServerId, effect: "require_approval" } });
+    const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: sweepServerId, tool: "echo", arguments: { text: `sweep-${tag}` },
+        caller: "t", request_id: `sweep-${tag}` } });
+    expect(call.statusCode).toBe(202);
+    const id = call.json().approval_id;
+    await pool.query("UPDATE approvals SET expires_at = now() - interval '1 second' WHERE id = $1", [id]);
+    // Listing pending runs the sweep: the dead hold leaves the queue.
+    const pending = await gw.inject({ method: "GET", url: "/v1/approvals?status=pending", headers: key });
+    expect(pending.json().items.find((a: { id: string }) => a.id === id)).toBeUndefined();
+    const expired = await gw.inject({ method: "GET", url: "/v1/approvals?status=expired", headers: key });
+    const row = expired.json().items.find((a: { id: string }) => a.id === id);
+    expect(row).toBeDefined();
+    expect(row.args).toEqual({});
+    expect(row.args_summary).toContain("sweep");
+  });
+
+  it("reports evaluation violations as unknown when the spans are gone", async () => {
+    const suite = await api.inject({ method: "POST", url: "/v1/evaluations/suites", headers: key,
+      payload: { name: `viol-${tag}` } });
+    const suiteId = suite.json().id;
+    await api.inject({ method: "POST", url: `/v1/evaluations/suites/${suiteId}/cases`, headers: key,
+      payload: { name: "c1", assertions: [{ type: "status", value: "success" }],
+        exec_config: { output: "ok" } } });
+    const runA = await api.inject({ method: "POST", url: `/v1/evaluations/suites/${suiteId}/runs`,
+      headers: key, payload: { agent_name: `viol-${tag}`, config_fingerprint: "v" } });
+    const runB = await api.inject({ method: "POST", url: `/v1/evaluations/suites/${suiteId}/runs`,
+      headers: key, payload: { agent_name: `viol-${tag}`, config_fingerprint: "v" } });
+    const aId = runA.json().eval_run.id;
+    const bId = runB.json().eval_run.id;
+    const rowFor = (body: { runs: { eval_run_id: string; violations: unknown }[] }) =>
+      body.runs.find((r) => r.eval_run_id === aId);
+    // Spans still exist: a clean run reports zero violations, not unknown.
+    const before = await api.inject({ method: "GET",
+      url: `/v1/evaluations/runs/compare?ids=${aId},${bId}`, headers: key });
+    expect(rowFor(before.json())?.violations).toBe(0);
+    // Delete the first run's spans: the count is now unknown, not zero.
+    const results = await pool.query(
+      "SELECT agent_run_id FROM eval_results WHERE eval_run_id = $1", [aId]);
+    await pool.query("DELETE FROM spans WHERE run_id = $1", [results.rows[0].agent_run_id]);
+    const after = await api.inject({ method: "GET",
+      url: `/v1/evaluations/runs/compare?ids=${aId},${bId}`, headers: key });
+    expect(rowFor(after.json())?.violations).toBeNull();
   });
 }, 60000);

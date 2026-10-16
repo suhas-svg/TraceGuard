@@ -43,7 +43,11 @@ test.beforeAll(async ({ request }) => {
 });
 
 async function openTab(page: Page, label: string) {
-  await page.getByRole("navigation", { name: "Primary" }).getByRole("button", { name: label, exact: true }).click();
+  // The Approvals nav button's accessible name gains the pending-approval
+  // badge ("1 pending") once the query resolves, so match by prefix.
+  await page.getByRole("navigation", { name: "Primary" })
+    .getByRole("button", { name: new RegExp(`^${label}`) })
+    .click();
 }
 
 test("scenario A: a successful run is visible end to end", async ({ page, request }) => {

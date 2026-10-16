@@ -138,6 +138,14 @@ export function listBudgets() {
   return get<{ items: Budget[] }>("/v1/budgets");
 }
 
+export function createBudget(b: { scope: string; ref_id: string; limit_micro: number; effect: string }) {
+  return postApi<Budget>("/v1/budgets", b);
+}
+
+export function updateBudget(id: string, b: { limit_micro?: number; effect?: string }) {
+  return postApi<Budget>(`/v1/budgets/${id}`, b, "PUT");
+}
+
 export interface DiagnosticWarning {
   code: string;
   severity: string;
@@ -259,6 +267,18 @@ export function compareEvalRuns(ids: string[]) {
   return get<{ runs: Record<string, unknown>[] }>(`/v1/evaluations/runs/compare?ids=${ids.join(",")}`);
 }
 
+export function createSuite(body: { name: string; description?: string }) {
+  return postApi<EvalSuite>("/v1/evaluations/suites", body);
+}
+
+export function addCase(suiteId: string, body: Record<string, unknown>) {
+  return postApi<EvalCase>(`/v1/evaluations/suites/${suiteId}/cases`, body);
+}
+
+export function runSuite(suiteId: string, body: Record<string, unknown>) {
+  return postApi<{ eval_run: EvalRun }>(`/v1/evaluations/suites/${suiteId}/runs`, body);
+}
+
 // Gateway calls go to the gateway process with the agent key. Approval
 // decisions are the one call that uses the approver key instead.
 async function gw<T>(path: string, init?: RequestInit, approver = false): Promise<T> {
@@ -310,8 +330,22 @@ export interface Approval {
   decision_reason: string;
 }
 
+export interface AuditEvent {
+  id: string;
+  timestamp: string;
+  actor_type: string;
+  actor_id: string;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  result: string;
+  metadata: Record<string, unknown>;
+}
+
 export const gwApi = {
   servers: () => gw<{ items: McpServer[] }>("/v1/servers"),
+  createServer: (s: { name: string; base_url: string; auth_secret?: string }) =>
+    gw<McpServer>("/v1/servers", { method: "POST", body: JSON.stringify(s) }),
   discover: (id: string) => gw<{ tools: { tool_name: string; quarantined: boolean }[] }>(`/v1/servers/${id}/discover`, { method: "POST", body: "{}" }),
   policies: () => gw<{ items: Policy[] }>("/v1/policies"),
   createPolicy: (p: Record<string, unknown>) =>
@@ -325,7 +359,14 @@ export const gwApi = {
       { method: "POST", body: JSON.stringify({ approved, reason }) }, true),
   call: (body: Record<string, unknown>) =>
     gw<{ result?: unknown; approval_id?: string; status?: string; expires_at?: string }>(
-      "/v1/gateway/tools/call", { method: "POST", body: JSON.stringify(body) })
+      "/v1/gateway/tools/call", { method: "POST", body: JSON.stringify(body) }),
+  quarantine: (serverId: string, tool: string, quarantined: boolean) =>
+    gw<{ ok: boolean }>(
+      `/v1/servers/${serverId}/tools/${encodeURIComponent(tool)}/quarantine`,
+      { method: "PUT", body: JSON.stringify({ quarantined }) }
+    ),
+  audit: (action?: string) =>
+    gw<{ items: AuditEvent[] }>(`/v1/audit-events${action ? `?action=${encodeURIComponent(action)}` : ""}`)
 };
 
 export interface Webhook {

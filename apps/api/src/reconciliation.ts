@@ -115,7 +115,8 @@ export function registerReconciliationRoutes(app: FastifyInstance) {
                 COALESCE(SUM(
                   CASE WHEN s.input_tokens IS NULL AND s.output_tokens IS NULL THEN 0
                        WHEN p.id IS NULL THEN 0
-                       ELSE ((COALESCE(s.input_tokens,0) * p.input_price_per_million
+                       ELSE ((GREATEST(COALESCE(s.input_tokens,0) - COALESCE(s.cached_tokens,0), 0) * p.input_price_per_million
+                            + COALESCE(s.cached_tokens,0) * p.cached_input_price_per_million
                             + COALESCE(s.output_tokens,0) * p.output_price_per_million) / 1000000)::BIGINT
                   END), 0) AS estimated_micro,
                 BOOL_OR(p.id IS NULL AND (s.input_tokens IS NOT NULL OR s.output_tokens IS NOT NULL)) AS missing_pricing

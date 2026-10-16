@@ -1,15 +1,19 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  addCase,
   compareEvalRuns,
+  createSuite,
   formatMicro,
   getEvalRun,
   listSuites,
-  type EvalResult
+  runSuite,
+  type EvalResult,
+  type EvalSuite
 } from "./api";
 import {
-  Alert, Badge, Button, Card, Empty, Input, LinkButton,
-  Page, Stat, Table, Td, Th
+  Alert, Badge, Button, Card, Empty, Field, Input, LinkButton,
+  Page, Select, Stat, Table, Td, Th
 } from "./components";
 
 function ResultRow({ r, onOpenRun }: { r: EvalResult; onOpenRun: (id: string) => void }) {
@@ -80,20 +84,228 @@ function EvalRunView({ runId, onOpenRun }: { runId: string; onOpenRun: (id: stri
   );
 }
 
+function SuitePicker({
+  suites, value, onChange
+}: { suites: EvalSuite[]; value: string; onChange: (v: string) => void }) {
+  return (
+    <Field label="Suite">
+      <Select value={value} onChange={(e) => onChange(e.target.value)}>
+        <option value="">Pick a suite</option>
+        {suites.map((s) => (
+          <option key={s.id} value={s.id}>
+            {s.name} v{s.version}
+          </option>
+        ))}
+      </Select>
+    </Field>
+  );
+}
+
+function NewSuiteForm({ onDone, onError }: { onDone: () => void; onError: (m: string) => void }) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [busy, setBusy] = useState(false);
+  return (
+    <Card className="mb-5 p-4">
+      <h3 className="text-sm font-semibold text-ink-900">New suite</h3>
+      <p className="mb-3 text-xs text-ink-500">
+        Suites are versioned datasets. Editing one after its first run creates a new version.
+      </p>
+      <form
+        className="flex flex-wrap items-end gap-2 text-sm"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!name.trim()) return;
+          setBusy(true);
+          onError("");
+          createSuite({ name: name.trim(), description: description.trim() || undefined })
+            .then(() => {
+              setName("");
+              setDescription("");
+              onDone();
+            })
+            .catch((err) => onError(err instanceof Error ? err.message : "create failed"))
+            .finally(() => setBusy(false));
+        }}
+      >
+        <Field label="Name">
+          <Input className="w-48" value={name} onChange={(e) => setName(e.target.value)} />
+        </Field>
+        <Field label="Description">
+          <Input className="w-72" value={description} onChange={(e) => setDescription(e.target.value)} />
+        </Field>
+        <Button variant="primary" type="submit" disabled={busy || !name.trim()}>
+          {busy ? "Creating..." : "Create suite"}
+        </Button>
+      </form>
+    </Card>
+  );
+}
+
+function AddCaseForm({
+  suites, onDone, onError
+}: { suites: EvalSuite[]; onDone: () => void; onError: (m: string) => void }) {
+  const [suiteId, setSuiteId] = useState("");
+  const [name, setName] = useState("");
+  const [assertions, setAssertions] = useState('[{"type": "contains", "value": "hello"}]');
+  const [execConfig, setExecConfig] = useState('{"output": "hello world"}');
+  const [expected, setExpected] = useState("");
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="mt-6">
+      <h3 className="mb-2 text-sm font-semibold text-ink-700">Add a case</h3>
+      <Card className="p-4">
+        <form
+          className="flex flex-col gap-3 text-sm"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!suiteId || !name.trim()) return;
+            let parsedAssertions: unknown;
+            let parsedExec: unknown;
+            try {
+              parsedAssertions = JSON.parse(assertions);
+            } catch {
+              onError("assertions must be valid JSON");
+              return;
+            }
+            try {
+              parsedExec = JSON.parse(execConfig);
+            } catch {
+              onError("exec config must be valid JSON");
+              return;
+            }
+            const body: Record<string, unknown> = {
+              name: name.trim(),
+              assertions: parsedAssertions,
+              exec_config: parsedExec
+            };
+            if (expected.trim()) body.expected = expected.trim();
+            setBusy(true);
+            onError("");
+            addCase(suiteId, body)
+              .then(() => {
+                setName("");
+                onDone();
+              })
+              .catch((err) => onError(err instanceof Error ? err.message : "add case failed"))
+              .finally(() => setBusy(false));
+          }}
+        >
+          <div className="flex flex-wrap items-end gap-2">
+            <SuitePicker suites={suites} value={suiteId} onChange={setSuiteId} />
+            <Field label="Case name">
+              <Input className="w-44" value={name} onChange={(e) => setName(e.target.value)} />
+            </Field>
+            <Field label="Expected (optional, used when exec config has no output)">
+              <Input className="w-64" value={expected} onChange={(e) => setExpected(e.target.value)} />
+            </Field>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <Field label="Assertions (JSON)">
+              <textarea
+                aria-label="Assertions JSON"
+                className="h-24 w-full rounded-md border border-ink-200 bg-surface px-2.5 py-1.5 font-mono text-xs text-ink-800"
+                value={assertions}
+                onChange={(e) => setAssertions(e.target.value)}
+              />
+            </Field>
+            <Field label="Execution config (JSON)">
+              <textarea
+                aria-label="Execution config JSON"
+                className="h-24 w-full rounded-md border border-ink-200 bg-surface px-2.5 py-1.5 font-mono text-xs text-ink-800"
+                value={execConfig}
+                onChange={(e) => setExecConfig(e.target.value)}
+              />
+            </Field>
+          </div>
+          <div>
+            <Button variant="primary" type="submit" disabled={busy || !suiteId || !name.trim()}>
+              {busy ? "Adding..." : "Add case"}
+            </Button>
+          </div>
+        </form>
+      </Card>
+    </div>
+  );
+}
+
+function RunSuiteForm({
+  suites, onStarted, onError
+}: { suites: EvalSuite[]; onStarted: (evalRunId: string) => void; onError: (m: string) => void }) {
+  const [suiteId, setSuiteId] = useState("");
+  const [agentName, setAgentName] = useState("eval-agent");
+  const [model, setModel] = useState("scripted-1");
+  const [trials, setTrials] = useState("1");
+  const [fingerprint, setFingerprint] = useState("");
+  const [costCap, setCostCap] = useState("");
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="mt-6">
+      <h3 className="mb-2 text-sm font-semibold text-ink-700">Run a suite</h3>
+      <Card className="p-4">
+        <form
+          className="flex flex-wrap items-end gap-2 text-sm"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!suiteId) return;
+            setBusy(true);
+            onError("");
+            runSuite(suiteId, {
+              agent_name: agentName.trim() || "eval-agent",
+              model: model.trim() || "scripted-1",
+              trials: Math.min(Math.max(Number(trials) || 1, 1), 5),
+              config_fingerprint: fingerprint.trim() || undefined,
+              cost_cap_micro: costCap.trim() ? Math.round(Number(costCap) * 1_000_000) : undefined
+            })
+              .then((r) => onStarted(r.eval_run.id))
+              .catch((err) => onError(err instanceof Error ? err.message : "run failed"))
+              .finally(() => setBusy(false));
+          }}
+        >
+          <SuitePicker suites={suites} value={suiteId} onChange={setSuiteId} />
+          <Field label="Agent name">
+            <Input className="w-36" value={agentName} onChange={(e) => setAgentName(e.target.value)} />
+          </Field>
+          <Field label="Model">
+            <Input className="w-32" value={model} onChange={(e) => setModel(e.target.value)} />
+          </Field>
+          <Field label="Fingerprint">
+            <Input className="w-32" value={fingerprint} onChange={(e) => setFingerprint(e.target.value)} />
+          </Field>
+          <Field label="Trials">
+            <Input className="w-16" value={trials} onChange={(e) => setTrials(e.target.value)} />
+          </Field>
+          <Field label="Cost cap ($)">
+            <Input className="w-24" value={costCap} onChange={(e) => setCostCap(e.target.value)} />
+          </Field>
+          <Button variant="primary" type="submit" disabled={busy || !suiteId}>
+            {busy ? "Running..." : "Run suite"}
+          </Button>
+        </form>
+      </Card>
+    </div>
+  );
+}
+
 export default function EvalsView({ onOpenRun }: { onOpenRun: (id: string) => void }) {
   const [openRun, setOpenRun] = useState("");
   const [compareIds, setCompareIds] = useState("");
   const [compare, setCompare] = useState<Record<string, unknown>[] | null>(null);
+  const [error, setError] = useState("");
+  const queryClient = useQueryClient();
   const suitesQuery = useQuery({ queryKey: ["eval-suites"], queryFn: () => listSuites() });
   const suites = suitesQuery.data?.items ?? [];
+  const reload = () => queryClient.invalidateQueries({ queryKey: ["eval-suites"] });
 
   return (
     <Page
       title="Evaluation suites"
       sub="Versioned datasets replayed against agent configs, with pass rate, latency, and cost."
     >
+      {error && <Alert>{error}</Alert>}
+      <NewSuiteForm onDone={reload} onError={setError} />
       {suites.length === 0 ? (
-        <Empty hint="No suites yet. Create one through the API to start comparing configs." />
+        <Empty hint="No suites yet. Create one above to start comparing configs." />
       ) : (
         <Card className="divide-y divide-ink-100">
           {suites.map((s) => (
@@ -107,6 +319,15 @@ export default function EvalsView({ onOpenRun }: { onOpenRun: (id: string) => vo
           ))}
         </Card>
       )}
+      <AddCaseForm suites={suites} onDone={reload} onError={setError} />
+      <RunSuiteForm
+        suites={suites}
+        onStarted={(id) => {
+          setOpenRun(id);
+          reload();
+        }}
+        onError={setError}
+      />
       <div className="mt-6">
         <h3 className="mb-2 text-sm font-semibold text-ink-700">Open an evaluation run</h3>
         <form
@@ -163,7 +384,7 @@ export default function EvalsView({ onOpenRun }: { onOpenRun: (id: string) => vo
                     <Td>{r.latency_ms ? `${(r.latency_ms as { mean: number }).mean}ms` : "n/a"}</Td>
                     <Td>{r.cost_micro == null ? "n/a" : formatMicro(Number(r.cost_micro))}</Td>
                     <Td>{r.input_tokens == null && r.output_tokens == null ? "n/a" : `${r.input_tokens ?? "?"}/${r.output_tokens ?? "?"}`}</Td>
-                    <Td>{String(r.violations)}</Td>
+                    <Td>{r.violations == null ? "n/a" : String(r.violations)}</Td>
                   </tr>
                 ))}
               </tbody>

@@ -148,9 +148,9 @@ export function buildApp() {
         const res = await client.query(
           `INSERT INTO spans
              (id, run_id, parent_span_id, event_id, operation_type, name, started_at, ended_at,
-              duration_ms, status, provider, model, input_tokens, output_tokens,
+              duration_ms, status, provider, model, input_tokens, output_tokens, cached_tokens,
               usage_source, error_type, attributes)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
            ON CONFLICT (event_id) DO NOTHING`,
           [
             e.span_id,
@@ -167,6 +167,7 @@ export function buildApp() {
             e.model ?? null,
             e.input_tokens ?? null,
             e.output_tokens ?? null,
+            e.cached_tokens ?? null,
             e.input_tokens == null && e.output_tokens == null
               ? "unavailable"
               : (e.usage_source ?? "provider_reported"),
@@ -330,15 +331,17 @@ export function buildApp() {
       `SELECT COALESCE(SUM(t.cost_micro), 0)::bigint AS estimated_cost_micro,
               COUNT(*) FILTER (WHERE t.cost_micro IS NULL AND (t.input_tokens IS NOT NULL OR t.output_tokens IS NOT NULL))::int AS missing_pricing_spans
          FROM (
-           SELECT s.input_tokens, s.output_tokens,
+           SELECT s.input_tokens, s.output_tokens, s.cached_tokens,
                   CASE WHEN s.input_tokens IS NULL AND s.output_tokens IS NULL THEN NULL
                        WHEN p.id IS NULL THEN NULL
-                       ELSE ((COALESCE(s.input_tokens, 0)::bigint * p.input_price_per_million
+                       ELSE ((GREATEST(COALESCE(s.input_tokens, 0) - COALESCE(s.cached_tokens, 0), 0)::bigint * p.input_price_per_million
+                            + COALESCE(s.cached_tokens, 0)::bigint * p.cached_input_price_per_million
                             + COALESCE(s.output_tokens, 0)::bigint * p.output_price_per_million) / 1000000)::bigint
                   END AS cost_micro
              FROM spans s JOIN runs r ON r.id = s.run_id
              LEFT JOIN LATERAL (
-               SELECT pr.id, pr.input_price_per_million, pr.output_price_per_million
+               SELECT pr.id, pr.input_price_per_million, pr.output_price_per_million,
+                      pr.cached_input_price_per_million
                  FROM pricing pr
                 WHERE pr.provider = s.provider AND pr.model = s.model AND pr.effective_from <= s.started_at
                 ORDER BY pr.effective_from DESC LIMIT 1
@@ -421,7 +424,13 @@ export function buildApp() {
 
   app.get("/v1/runs/:id/trace", async (req, reply) => {
     const { id } = req.params as { id: string };
-    const run = await pool.query("SELECT * FROM runs WHERE id = $1", [id]);
+    // Join the agent so the trace header can name it, matching the list view.
+    const run = await pool.query(
+      `SELECT r.*, a.name AS agent_name FROM runs r
+       LEFT JOIN agents a ON a.id = r.agent_id
+       WHERE r.id = $1`,
+      [id]
+    );
     if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id)) {
       return reply.code(404).send({ error: "run_not_found" });
     }
@@ -532,13 +541,13 @@ export function buildApp() {
           const res = await client.query(
             `INSERT INTO spans
                (id, run_id, parent_span_id, event_id, operation_type, name, started_at, ended_at,
-                duration_ms, status, provider, model, input_tokens, output_tokens,
+                duration_ms, status, provider, model, input_tokens, output_tokens, cached_tokens,
                 usage_source, error_type, attributes)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
              ON CONFLICT (event_id) DO NOTHING`,
             [m.spanId, m.runId, m.parentSpanId, m.eventId, m.operationType, m.name,
              m.startedAt, endedAt, m.durationMs, m.status, m.provider, m.model,
-             m.inputTokens, m.outputTokens, m.usageSource, m.errorType, JSON.stringify(m.attributes)]
+             m.inputTokens, m.outputTokens, m.cachedTokens, m.usageSource, m.errorType, JSON.stringify(m.attributes)]
           );
           if (res.rowCount === 0) duplicates++;
           else accepted++;

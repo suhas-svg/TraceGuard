@@ -22,11 +22,13 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 - Gateway on :8091: upstream registry, tool discovery with definition pinning, allow/deny/approval policies, single-use bound approvals, hash-chained audit.
 - Budgets with atomic reserve-and-settle plus a Python `BudgetGuard` wrapper.
 - Evaluations: versioned suites, scripted replay, deterministic assertions, run comparison.
-- The dashboard has Runs, Evaluations, Policy, Approvals, Webhooks,
-  Retention, Costs, and Users tabs: run search and traces, suite results
-  with comparison, rule editing, the approval queue, webhook subscriptions
-  with delivery log, retention rules with run history, cost variance, and
-  team, key, and workspace management.
+- The dashboard has Overview, Runs, Evaluations, Policy, Approvals, Webhooks,
+  Retention, Costs, and Users tabs: KPI tiles with usage and spend charts, run
+  search and traces, suite creation and runs with comparison, server
+  registration with tool quarantine, budget management and audit history,
+  the approval queue, webhook subscriptions with delivery log, retention
+  rules with run history, cost variance, and team, key, and workspace
+  management.
 - `POST /v1/traces` accepts OpenTelemetry OTLP/HTTP JSON with GenAI
   conventions, so instrumented frameworks land without a new SDK. Set
   `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` on the exporter. Spans in one
@@ -57,8 +59,9 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 - `POST /v1/pricing` versions model prices, old versions stay so past
   estimates keep meaning. Money is integer micro-dollars, never floats.
 - `GET /v1/runs/:id/usage` breaks tokens and cost down per span against the
-  price in force at the time. Spans with no matching price report NULL and
-  list under `missing_pricing`, never zero.
+  price in force at the time. Cached input tokens bill once at the cached
+  rate, never on top of the full input rate; spans with no matching price
+  report NULL and list under `missing_pricing`, never zero.
 - `POST /v1/budgets` sets run or agent limits with block or warn effects.
   The managed path reserves before the call under a row lock, then settles
   to the measured cost. A blocked call gets 409 and the SDK raises
@@ -70,8 +73,11 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 ## Phase 5: evaluation workbench
 
 - Suites version on creation and lock on first use. Cases carry scripted
-  behavior plus deterministic assertions: exact, contains, regex, a small
-  JSON schema subset, tool sequence, and final status.
+  behavior plus deterministic assertions: exact, contains, regex, a JSON
+  schema subset with nested objects, arrays, and enums, tool names or an
+  ordered sequence, and final status. A case with an `expected` value and
+  no scripted output replays it, and `input_payload` rides the run's first
+  span for provenance.
 - Starting a run replays every case for N trials, writes real runs you can
   open in the dashboard, and records pass state, latency, cost, and the
   config fingerprint. Per-run overrides let a second version run the same
@@ -99,7 +105,9 @@ Unit checks: `npm install && npm test`.
 - `POST /v1/servers`, `POST /v1/servers/:id/discover` register Streamable HTTP
   upstreams and pin each tool definition hash. Changed definitions quarantine
   until re-approved. Upstream credentials stay in the gateway and are never
-  returned by reads.
+  returned by reads. Upstream URLs are validated at registration, discovery,
+  and call time; private ranges need `ALLOW_PRIVATE_UPSTREAMS=true` and cloud
+  metadata addresses are always refused.
 - Policy effects are allow, deny, and require_approval. Deny overrides
   everything, priority only orders rules with the same effect, and unmatched
   calls are denied. Conditions use a fixed operator set: required fields plus
@@ -108,7 +116,8 @@ Unit checks: `npm install && npm test`.
   makes no upstream contact. The client retries with the approval id after a
   human decides with the separate approver key. Approvals are single-use and
   bound to caller, server, tool, canonical args, and request id. Agent keys
-  get 401 on the decision endpoint.
+  get 401 on the decision endpoint. Expired holds flip to expired on the next
+  list, so queues never show dead entries.
 - Every decision lands in `policy_decisions` citing the exact policy version,
   and every admin or execution outcome lands in the hash-chained `audit_events`
   table. Policies are immutable versions: an update supersedes, never edits.
@@ -139,7 +148,7 @@ memberships, and OTLP ingestion landed on top; their sections are under
   agent itself, not just the recorded execution config.
 - Projects as a first-class policy target (agent, project, server, tool), with
   per-project budgets that carry a reporting period.
-- Cost explorer drill-downs: per-agent breakdowns, budget utilization, and an
+- Cost explorer drill-downs: per-agent breakdowns and an
   input-vs-output cost split.
 - OTLP export from TraceGuard, plus log ingestion alongside traces.
 - SSO/OIDC for the dashboard, replacing bearer-token login.

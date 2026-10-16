@@ -26,6 +26,7 @@ export const eventEnvelopeSchema = z.object({
   model: z.string().max(128).nullable().optional(),
   input_tokens: z.number().int().min(0).nullable().optional(),
   output_tokens: z.number().int().min(0).nullable().optional(),
+  cached_tokens: z.number().int().min(0).nullable().optional(),
   usage_source: z.enum(["provider_reported", "estimated", "unavailable"]).nullable().optional(),
   error_type: z.string().max(128).nullable().optional(),
   attributes: z.record(z.unknown()).default({})

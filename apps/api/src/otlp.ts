@@ -41,6 +41,7 @@ export interface MappedSpan {
   model: string | null;
   inputTokens: number | null;
   outputTokens: number | null;
+  cachedTokens: number | null;
   usageSource: string;
   errorType: string | null;
   agentName: string;
@@ -110,8 +111,10 @@ export function mapOtlpSpan(
   const startMs = span.startTimeUnixNano ? Number(BigInt(span.startTimeUnixNano) / 1_000_000n) : null;
   const inTok = get("gen_ai.usage.input_tokens");
   const outTok = get("gen_ai.usage.output_tokens");
+  const cacheTok = get("gen_ai.usage.cache_read_input_tokens") ?? get("gen_ai.usage.cached_input_tokens");
   const inputTokens = typeof inTok === "number" ? inTok : null;
   const outputTokens = typeof outTok === "number" ? outTok : null;
+  const cachedTokens = typeof cacheTok === "number" ? cacheTok : null;
 
   return {
     runId: uuidV5(TRACE_NAMESPACE, span.traceId),
@@ -130,6 +133,7 @@ export function mapOtlpSpan(
       null,
     inputTokens,
     outputTokens,
+    cachedTokens,
     usageSource: inputTokens === null && outputTokens === null ? "unavailable" : "provider_reported",
     errorType,
     agentName: (resource["service.name"] as string | undefined) ?? "otel-agent",

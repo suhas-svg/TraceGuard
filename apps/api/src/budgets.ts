@@ -292,10 +292,11 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     }
     const spans = await pool.query(
       `SELECT s.id, s.operation_type, s.provider, s.model, s.input_tokens, s.output_tokens,
-              s.started_at, p.id AS pricing_id,
+              s.started_at, s.cached_tokens, p.id AS pricing_id,
               CASE WHEN s.input_tokens IS NULL AND s.output_tokens IS NULL THEN NULL
                    WHEN p.id IS NULL THEN NULL
-                   ELSE ((COALESCE(s.input_tokens,0) * p.input_price_per_million
+                   ELSE ((GREATEST(COALESCE(s.input_tokens,0) - COALESCE(s.cached_tokens,0), 0) * p.input_price_per_million
+                        + COALESCE(s.cached_tokens,0) * p.cached_input_price_per_million
                         + COALESCE(s.output_tokens,0) * p.output_price_per_million) / 1000000)::BIGINT
               END AS cost_micro
        FROM spans s LEFT JOIN LATERAL (
