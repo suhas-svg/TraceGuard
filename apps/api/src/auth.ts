@@ -45,6 +45,8 @@ const ROUTES: [string, string][] = [
   ["/v1/gateway/tools/call", "gateway"],
   ["/v1/approvals/", "approve"],
   ["/v1/approvals", "read"],
+  ["/v1/overview", "read"],
+  ["/v1/agents", "read"],
   ["/v1/runs", "read"],
   ["/v1/pricing", "read"],
   ["/v1/budgets", "read"],

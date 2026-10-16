@@ -8,6 +8,7 @@ import { workspaceAllowed } from "./auth.js";
 import { estimateCostMicro } from "./cost.js";
 import { runAssertion } from "./assertions.js";
 import { notify } from "./notify.js";
+import { captureRawEnabled, redactDeep } from "./redact.js";
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
   const found = await client.query("SELECT id FROM workspaces WHERE name = 'default'");
@@ -76,7 +77,7 @@ async function executeCase(
     toolNames.push(t.tool);
     await addSpan(randomUUID(), rootId, "tool.invocation", {
       duration_ms: 5, status: t.status ?? "success", error_type: t.error_type ?? null,
-      attributes: { tool: t.tool, args: t.args ?? {} }
+      attributes: redactDeep({ tool: t.tool, args: t.args ?? {} }, { captureRaw: captureRawEnabled() })
     });
   }
   const failedTool = tools.find((t) => (t.status ?? "success") === "failed");

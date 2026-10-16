@@ -279,6 +279,7 @@ export function LinkButton({ children, onClick }: { children: ReactNode; onClick
 // ---------- Nav icons (inline SVG, no dependency) ----------
 
 const paths: Record<string, string> = {
+  overview: "M4 13h6V4H4v9zm10 7h6v-9h-6v9zM4 20h6v-4H4v4zm10-11h6V4h-6v5z",
   runs: "M5 4.5l13 7.5-13 7.5v-15z",
   evals: "M4 20V10M10 20V4M16 20v-8M22 20H2",
   policy: "M12 3l7 3v5c0 5-3.5 8-7 10-3.5-2-7-5-7-10V6l7-3z",

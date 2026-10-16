@@ -69,12 +69,69 @@ async function get<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-export function listRuns(opts: { status?: string; limit?: number; cursor?: string }) {
+export function listRuns(opts: {
+  status?: string;
+  agent_id?: string;
+  since?: string;
+  until?: string;
+  provider?: string;
+  model?: string;
+  eval_run_id?: string;
+  limit?: number;
+  cursor?: string;
+}) {
   const p = new URLSearchParams();
   if (opts.status) p.set("status", opts.status);
+  if (opts.agent_id) p.set("agent_id", opts.agent_id);
+  if (opts.since) p.set("since", opts.since);
+  if (opts.until) p.set("until", opts.until);
+  if (opts.provider) p.set("provider", opts.provider);
+  if (opts.model) p.set("model", opts.model);
+  if (opts.eval_run_id) p.set("eval_run_id", opts.eval_run_id);
   if (opts.limit) p.set("limit", String(opts.limit));
   if (opts.cursor) p.set("cursor", opts.cursor);
   return get<{ items: RunItem[]; next_cursor: string | null }>(`/v1/runs?${p}`);
+}
+
+export interface AgentItem {
+  id: string;
+  name: string;
+  adapter_type: string;
+  created_at: string;
+}
+
+export function listAgents() {
+  return get<{ items: AgentItem[] }>("/v1/agents");
+}
+
+export interface Overview {
+  since: string | null;
+  runs: { total: number; by_status: Record<string, number> };
+  tokens: {
+    input_tokens: number;
+    output_tokens: number;
+    spans_with_usage: number;
+    spans_without_usage: number;
+  };
+  cost: { estimated_cost_micro: number; cost_partial: boolean; missing_pricing_spans: number };
+  latency_ms: { median: number | null; p95: number | null };
+  denied_spans: number;
+  pending_approvals: number;
+}
+
+export function getOverview() {
+  return get<Overview>("/v1/overview");
+}
+
+export interface DiagnosticWarning {
+  code: string;
+  severity: string;
+  message: string;
+  details: Record<string, unknown>;
+}
+
+export function getDiagnostics(runId: string) {
+  return get<{ run_id: string; warnings: DiagnosticWarning[] }>(`/v1/runs/${runId}/diagnostics`);
 }
 
 export interface RunCounts {
@@ -97,6 +154,13 @@ export interface RunUsage {
   estimated_cost_micro: number;
   cost_partial: boolean;
   missing_pricing: string[];
+  spans: {
+    id: string;
+    input_tokens: number | null;
+    output_tokens: number | null;
+    cost_micro: number | null;
+    pricing_id: string | null;
+  }[];
 }
 
 export function getUsage(runId: string) {

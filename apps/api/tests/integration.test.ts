@@ -169,6 +169,10 @@ describe("integration and security", () => {
     const decided = await gw.inject({ method: "POST", url: `/v1/approvals/${approvalId}/decision`,
       headers: approver, payload: { approved: true, reason: "test" } });
     expect(decided.json().status).toBe("approved");
+    // Sealed at rest while pending/approved: ciphertext, never the plaintext.
+    const stored = await pool.query("SELECT args_enc, args FROM approvals WHERE id = $1", [approvalId]);
+    expect(stored.rows[0].args_enc).toBe(true);
+    expect(JSON.stringify(stored.rows[0].args)).not.toContain("wait");
     const retry = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: "wait" }, caller: "t",
         request_id: `r-${tag}`, approval_id: approvalId } });
@@ -179,10 +183,14 @@ describe("integration and security", () => {
         request_id: `r-${tag}`, approval_id: approvalId } });
     expect(replay.statusCode).toBe(410);
     expect(upstreamHits).toBe(before + 1);
-    // Sealed at rest: the stored row carries ciphertext, never the plaintext.
-    const stored = await pool.query("SELECT args_enc, args FROM approvals WHERE id = $1", [approvalId]);
-    expect(stored.rows[0].args_enc).toBe(true);
-    expect(JSON.stringify(stored.rows[0].args)).not.toContain("wait");
+    // Consumption drops the sealed arguments: only the redacted summary and
+    // the args hash remain once the call has executed.
+    const consumed = await pool.query(
+      "SELECT status, args_enc, args, args_summary FROM approvals WHERE id = $1", [approvalId]);
+    expect(consumed.rows[0].status).toBe("consumed");
+    expect(consumed.rows[0].args_enc).toBe(false);
+    expect(consumed.rows[0].args).toEqual({});
+    expect(consumed.rows[0].args_summary).toContain("wait");
     const call2 = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: "late" }, caller: "t", request_id: `r2-${tag}` } });
     const approval2 = call2.json().approval_id;
@@ -192,6 +200,12 @@ describe("integration and security", () => {
         request_id: `r2-${tag}`, approval_id: approval2 } });
     expect(late.statusCode).toBe(410);
     expect(upstreamHits).toBe(before + 1);
+    // Expiry clears the sealed arguments too, keeping the summary.
+    const expired = await pool.query(
+      "SELECT status, args_enc, args_summary FROM approvals WHERE id = $1", [approval2]);
+    expect(expired.rows[0].status).toBe("expired");
+    expect(expired.rows[0].args_enc).toBe(false);
+    expect(expired.rows[0].args_summary).toContain("late");
   });
 
   it("blocks managed calls past a hard budget", async () => {
@@ -734,5 +748,246 @@ describe("integration and security", () => {
       flakyHttp.close();
       flakyHttp.closeAllConnections();
     }
+  });
+  it("re-evaluates policy on approval retry: a newer deny beats the approval", async () => {
+    const staleArgs = { text: `stale-${tag}` };
+    const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: staleArgs, caller: "t",
+        request_id: `stale-${tag}` } });
+    expect(call.statusCode).toBe(202);
+    const approvalId = call.json().approval_id;
+    const decided = await gw.inject({ method: "POST", url: `/v1/approvals/${approvalId}/decision`,
+      headers: approver, payload: { approved: true, reason: "looked fine then" } });
+    expect(decided.statusCode).toBe(200);
+    // A deny rule lands after the approval was issued. It must win: an
+    // approval never overrides an unconditional deny.
+    const deny = await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+      payload: { name: `late-deny-${tag}`, priority: 300, server_id: serverId, tool_name: "echo",
+        effect: "deny", conditions: { arguments: { text: { enum: [staleArgs.text] } } } } });
+    expect(deny.statusCode).toBe(201);
+    const before = upstreamHits;
+    const retry = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: staleArgs, caller: "t",
+        request_id: `stale-${tag}`, approval_id: approvalId } });
+    expect(retry.statusCode).toBe(403);
+    expect(retry.json().reason).toContain(`late-deny-${tag}`);
+    expect(upstreamHits).toBe(before);
+    // The denied retry did not consume the approval.
+    const row = await pool.query("SELECT status FROM approvals WHERE id = $1", [approvalId]);
+    expect(row.rows[0].status).toBe("approved");
+  });
+
+  it("denies gateway calls once a covering block budget is exhausted", async () => {
+    const runId = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId, event_type: "run.started" })] } });
+    const budget = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: runId, limit_micro: 100, effect: "block" } });
+    expect(budget.statusCode).toBe(201);
+    await pool.query("UPDATE budgets SET spent_micro = 100 WHERE id = $1", [budget.json().id]);
+    const before = upstreamHits;
+    const denied = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: "afford?" }, caller: "t",
+        run_id: runId } });
+    expect(denied.statusCode).toBe(403);
+    expect(denied.json().error).toBe("budget_exceeded");
+    expect(denied.json().budget_id).toBe(budget.json().id);
+    expect(upstreamHits).toBe(before);
+    // The denial is visible in the run trace, citing the budget.
+    const trace = await api.inject({ method: "GET", url: `/v1/runs/${runId}/trace`, headers: key });
+    const span = trace.json().spans.find((s: { status: string }) => s.status === "denied");
+    expect(span?.attributes?.reason).toContain("budget exhausted");
+  });
+
+  it("settles a reservation exactly once under concurrent retries", async () => {
+    const budget = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: randomUUID(), limit_micro: 1000000, effect: "block" } });
+    const budgetId = budget.json().id;
+    const reserve = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+      payload: { budget_id: budgetId, max_cost_micro: 500 } });
+    expect(reserve.statusCode).toBe(200);
+    const reservationId = reserve.json().reservation_id;
+    const [a, b] = await Promise.all([
+      api.inject({ method: "POST", url: "/v1/budgets/settle", headers: key,
+        payload: { reservation_id: reservationId, actual_cost_micro: 70 } }),
+      api.inject({ method: "POST", url: "/v1/budgets/settle", headers: key,
+        payload: { reservation_id: reservationId, actual_cost_micro: 70 } })
+    ]);
+    const codes = [a.statusCode, b.statusCode].sort((x, y) => x - y);
+    expect(codes).toEqual([200, 409]);
+    // One settle landed: spent counted once, the hold fully released.
+    const row = await pool.query(
+      "SELECT spent_micro::float8 AS spent, reserved_micro::float8 AS reserved FROM budgets WHERE id = $1",
+      [budgetId]);
+    expect(row.rows[0].spent).toBe(70);
+    expect(row.rows[0].reserved).toBe(0);
+  });
+
+  it("redacts secrets at ingest and withholds raw content unless capture is on", async () => {
+    const secret = `sk-live-${randomUUID().replace(/-/g, "")}`;
+    const runId = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId, attributes: {
+        api_key: secret, prompt: "the raw prompt", nested: { token: secret } } })] } });
+    const trace = await api.inject({ method: "GET", url: `/v1/runs/${runId}/trace`, headers: key });
+    const attrs = trace.json().spans[0].attributes;
+    expect(JSON.stringify(attrs)).not.toContain(secret);
+    expect(attrs.prompt).toBe("[NOT CAPTURED]");
+    expect(attrs.nested.token).toBe("[REDACTED]");
+    // Capture mode is opt-in: content survives, secrets never do.
+    process.env.CAPTURE_RAW_ATTRIBUTES = "true";
+    try {
+      const runId2 = randomUUID();
+      await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+        payload: { events: [ev({ run_id: runId2, attributes: { prompt: "the raw prompt", api_key: secret } })] } });
+      const t2 = await api.inject({ method: "GET", url: `/v1/runs/${runId2}/trace`, headers: key });
+      const a2 = t2.json().spans[0].attributes;
+      expect(a2.prompt).toBe("the raw prompt");
+      expect(JSON.stringify(a2)).not.toContain(secret);
+    } finally {
+      delete process.env.CAPTURE_RAW_ATTRIBUTES;
+    }
+  });
+
+  it("keeps only a redacted summary when an approval is denied or consumed", async () => {
+    const secret = `sk-live-${randomUUID().replace(/-/g, "")}`;
+    const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: secret }, caller: "t",
+        request_id: `summ-${tag}` } });
+    expect(call.statusCode).toBe(202);
+    const deniedId = call.json().approval_id;
+    const dec = await gw.inject({ method: "POST", url: `/v1/approvals/${deniedId}/decision`,
+      headers: approver, payload: { approved: false, reason: "no" } });
+    expect(dec.statusCode).toBe(200);
+    const deniedRow = (await pool.query(
+      "SELECT status, args_enc, args, args_summary FROM approvals WHERE id = $1", [deniedId])).rows[0];
+    expect(deniedRow.status).toBe("denied");
+    expect(deniedRow.args_enc).toBe(false);
+    expect(deniedRow.args).toEqual({});
+    expect(deniedRow.args_summary).toContain("[REDACTED]");
+    expect(deniedRow.args_summary).not.toContain(secret);
+    // Consumed: the call executes, then the sealed arguments are dropped.
+    const call2 = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: `ok-${tag}` }, caller: "t",
+        request_id: `summ2-${tag}` } });
+    expect(call2.statusCode).toBe(202);
+    const okId = call2.json().approval_id;
+    await gw.inject({ method: "POST", url: `/v1/approvals/${okId}/decision`, headers: approver,
+      payload: { approved: true } });
+    const midRow = (await pool.query("SELECT args_enc, args FROM approvals WHERE id = $1", [okId])).rows[0];
+    expect(midRow.args_enc).toBe(true);
+    expect(JSON.stringify(midRow.args)).not.toContain(`ok-${tag}`);
+    const retry = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: `ok-${tag}` }, caller: "t",
+        request_id: `summ2-${tag}`, approval_id: okId } });
+    expect(retry.statusCode).toBe(200);
+    const goneRow = (await pool.query(
+      "SELECT status, args_enc, args, args_summary FROM approvals WHERE id = $1", [okId])).rows[0];
+    expect(goneRow.status).toBe("consumed");
+    expect(goneRow.args_enc).toBe(false);
+    expect(goneRow.args).toEqual({});
+    expect(goneRow.args_summary).toContain(`ok-${tag}`);
+  });
+
+  it("flags loop-shaped runs in diagnostics without blocking anything", async () => {
+    const runId = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId, event_type: "run.started" })] } });
+    const failing = Array.from({ length: 3 }, () =>
+      ev({ run_id: runId, event_type: "tool.invocation", status: "failed",
+        error_type: "tool_error", attributes: { server_id: "s1", tool: "flaky" } }));
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: failing } });
+    const res = await api.inject({ method: "GET", url: `/v1/runs/${runId}/diagnostics`, headers: key });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { warnings: { code: string }[] };
+    expect(body.warnings.map((w) => w.code)).toContain("repeated_tool_failures");
+    const missing = await api.inject({ method: "GET",
+      url: `/v1/runs/${randomUUID()}/diagnostics`, headers: key });
+    expect(missing.statusCode).toBe(404);
+    const unauth = await api.inject({ method: "GET", url: `/v1/runs/${runId}/diagnostics` });
+    expect(unauth.statusCode).toBe(401);
+  });
+
+  it("serves an overview with usage, spend, latency and queue totals", async () => {
+    const runId = randomUUID();
+    const prov = `ov-${tag}`;
+    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+      payload: { provider: prov, model: "m", input_price_per_million: 1000000,
+        output_price_per_million: 1000000 } });
+    const startedAt = new Date(Date.now() - 5000).toISOString();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: {
+      events: [
+        // Timestamp after the pricing row so the effective_from LATERAL
+        // join resolves it; the `since` window below still includes it.
+        ev({ run_id: runId, event_type: "model.request", timestamp: new Date().toISOString(),
+          provider: prov, model: "m", input_tokens: 100, output_tokens: 10,
+          usage_source: "provider_reported" }),
+        ev({ run_id: runId, event_type: "run.completed", timestamp: new Date().toISOString() })
+      ]
+    } });
+    const res = await api.inject({ method: "GET",
+      url: `/v1/overview?since=${encodeURIComponent(startedAt)}`, headers: key });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.runs.total).toBeGreaterThanOrEqual(1);
+    expect(body.tokens.input_tokens).toBeGreaterThanOrEqual(100);
+    // (100 in + 10 out) micro-tokens at 1M micro per million = 110 micro.
+    expect(body.cost.estimated_cost_micro).toBeGreaterThanOrEqual(110);
+    expect(typeof body.cost.cost_partial).toBe("boolean");
+    expect(typeof body.denied_spans).toBe("number");
+    expect(typeof body.pending_approvals).toBe("number");
+    expect(body.latency_ms.median === null || body.latency_ms.median >= 0).toBe(true);
+    const unauth = await api.inject({ method: "GET", url: "/v1/overview" });
+    expect(unauth.statusCode).toBe(401);
+  });
+
+  it("filters runs by date window, provider, model and evaluation run", async () => {
+    const runId = randomUUID();
+    const prov = `flt-${tag}`;
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: {
+      events: [ev({ run_id: runId, provider: prov, model: "fm", event_type: "model.request",
+        timestamp: new Date(Date.now() - 60000).toISOString() })]
+    } });
+    const anHourAgo = encodeURIComponent(new Date(Date.now() - 3600000).toISOString());
+    const listed = await api.inject({ method: "GET",
+      url: `/v1/runs?provider=${prov}&model=fm&since=${anHourAgo}&limit=50`, headers: key });
+    const ids = listed.json().items.map((r: { id: string }) => r.id);
+    expect(ids).toContain(runId);
+    // A window that ends before the run started excludes it.
+    const before = await api.inject({ method: "GET",
+      url: `/v1/runs?provider=${prov}&until=${anHourAgo}`, headers: key });
+    expect(before.json().items).toHaveLength(0);
+    const none = await api.inject({ method: "GET", url: `/v1/runs?provider=nope-${tag}`, headers: key });
+    expect(none.json().items).toHaveLength(0);
+    // eval_run_id narrows to the agent runs replayed by one evaluation run.
+    const suite = await api.inject({ method: "POST", url: "/v1/evaluations/suites", headers: key,
+      payload: { name: `flt-suite-${tag}` } });
+    await api.inject({ method: "POST", url: `/v1/evaluations/suites/${suite.json().id}/cases`, headers: key,
+      payload: { name: "c1", assertions: [{ type: "contains", value: "yes" }],
+        exec_config: { output: "yes", latency_ms: 1 } } });
+    const evalRun = await api.inject({ method: "POST", url: `/v1/evaluations/suites/${suite.json().id}/runs`,
+      headers: key, payload: { agent_name: `flt-ea-${tag}` } });
+    const evalRunId = evalRun.json().eval_run.id;
+    const agentRunId = evalRun.json().results[0].agent_run_id;
+    const byEval = await api.inject({ method: "GET",
+      url: `/v1/runs?eval_run_id=${evalRunId}&limit=200`, headers: key });
+    const evalIds = byEval.json().items.map((r: { id: string }) => r.id);
+    expect(evalIds).toContain(agentRunId);
+    expect(evalIds).toHaveLength(1);
+  });
+
+  it("lists agents for the dashboard filter", async () => {
+    // Self-contained: on long-lived dev databases the 500-name page can push
+    // older entries past the cutoff, so plant an agent whose name sorts first.
+    const listed = `aaa-list-${tag}`;
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ agent_name: listed, event_type: "run.started" })] } });
+    const res = await api.inject({ method: "GET", url: "/v1/agents", headers: key });
+    expect(res.statusCode).toBe(200);
+    const names = res.json().items.map((a: { name: string }) => a.name);
+    expect(names).toContain(listed);
+    const unauth = await api.inject({ method: "GET", url: "/v1/agents" });
+    expect(unauth.statusCode).toBe(401);
   });
 }, 60000);

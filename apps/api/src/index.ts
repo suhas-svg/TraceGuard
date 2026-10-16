@@ -11,6 +11,8 @@ import { attrsToObject, mapOtlpSpan, type OtlpSpan } from "./otlp.js";
 import { decodeTraceRequest, encodeEmptyTraceResponse } from "./otlp_proto.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
 import { registerUserRoutes } from "./users.js";
+import { captureRawEnabled, redactDeep } from "./redact.js";
+import { computeWarnings, thresholdsFromEnv } from "./diagnostics.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
 // The browser dashboard fetches cross-origin, so the API answers CORS.
@@ -20,6 +22,13 @@ const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN ?? "http://localhost:5173"
 
 export function buildApp() {
   const app = Fastify({ logger: true, genReqId: () => randomUUID() });
+
+  // Privacy default check. Raw-capture mode is opt-in and loud: it weakens
+  // the "no raw prompt/response/args unless asked" guarantee on every
+  // persistence path (ingest, OTLP, evals, approvals).
+  if (captureRawEnabled()) {
+    app.log.warn("CAPTURE_RAW_ATTRIBUTES=true: raw prompt/response/tool-argument content may be persisted. See docs/security.md.");
+  }
 
   // OTLP exporters speak binary protobuf by default. This parser hands the
   // raw bytes to the protobuf decoder instead of the JSON parser.
@@ -162,7 +171,7 @@ export function buildApp() {
               ? "unavailable"
               : (e.usage_source ?? "provider_reported"),
             e.error_type ?? null,
-            JSON.stringify(e.attributes ?? {})
+            JSON.stringify(redactDeep(e.attributes ?? {}, { captureRaw: captureRawEnabled() }))
           ]
         );
         if (res.rowCount === 0) duplicates++;
@@ -180,7 +189,10 @@ export function buildApp() {
   });
 
   app.get("/v1/runs", async (req) => {
-    const q = req.query as { agent_id?: string; status?: string; limit?: string; cursor?: string };
+    const q = req.query as {
+      agent_id?: string; status?: string; limit?: string; cursor?: string;
+      since?: string; until?: string; provider?: string; model?: string; eval_run_id?: string;
+    };
     const limit = Math.min(Math.max(Number(q.limit ?? 50), 1), 200);
     const params: unknown[] = [];
     const where: string[] = [];
@@ -191,6 +203,31 @@ export function buildApp() {
     if (q.status) {
       params.push(q.status);
       where.push(`r.status = $${params.length}`);
+    }
+    // Date range filters use the run's start time, which the cursor also
+    // orders by. Unparseable timestamps are ignored rather than guessed at.
+    if (q.since && !Number.isNaN(Date.parse(q.since))) {
+      params.push(q.since);
+      where.push(`r.started_at >= $${params.length}`);
+    }
+    if (q.until && !Number.isNaN(Date.parse(q.until))) {
+      params.push(q.until);
+      where.push(`r.started_at <= $${params.length}`);
+    }
+    // Provider/model/eval-run filters narrow by what the run actually used:
+    // a span with that provider or model, or an eval result linking the run
+    // to the named evaluation run.
+    if (q.provider) {
+      params.push(q.provider);
+      where.push(`EXISTS (SELECT 1 FROM spans s WHERE s.run_id = r.id AND s.provider = $${params.length})`);
+    }
+    if (q.model) {
+      params.push(q.model);
+      where.push(`EXISTS (SELECT 1 FROM spans s WHERE s.run_id = r.id AND s.model = $${params.length})`);
+    }
+    if (q.eval_run_id && /^[0-9a-fA-F-]{36}$/.test(q.eval_run_id)) {
+      params.push(q.eval_run_id);
+      where.push(`EXISTS (SELECT 1 FROM eval_results er WHERE er.agent_run_id = r.id AND er.eval_run_id = $${params.length})`);
     }
     if (q.cursor) {
       params.push(q.cursor);
@@ -248,6 +285,130 @@ export function buildApp() {
     };
   });
 
+  // Dashboard overview: one workspace-scoped read for the KPI row — run
+  // totals, token usage, estimated spend with an explicit partial flag,
+  // median/p95 run latency, denial count, and the live approval queue.
+  app.get("/v1/overview", async (req) => {
+    const q = req.query as { since?: string };
+    const since = q.since && !Number.isNaN(Date.parse(q.since)) ? q.since : null;
+    // Every run-scoped aggregate shares the same workspace + date filter.
+    const base = (extra: string[] = []) => {
+      const params: unknown[] = [];
+      const where: string[] = [];
+      const scope = scopeClause(req.principal, params, "r.workspace_id");
+      if (scope) where.push(scope);
+      if (since) {
+        params.push(since);
+        where.push(`r.started_at >= $${params.length}`);
+      }
+      where.push(...extra);
+      return { params, sql: where.length ? "WHERE " + where.join(" AND ") : "" };
+    };
+
+    const runsBase = base();
+    const statuses = await pool.query(
+      `SELECT r.status, COUNT(*)::int AS count FROM runs r ${runsBase.sql} GROUP BY r.status`,
+      runsBase.params
+    );
+    const byStatus: Record<string, number> = {};
+    for (const row of statuses.rows as { status: string; count: number }[]) {
+      byStatus[row.status] = row.count;
+    }
+
+    const usage = await pool.query(
+      `SELECT COALESCE(SUM(s.input_tokens), 0)::bigint AS input_tokens,
+              COALESCE(SUM(s.output_tokens), 0)::bigint AS output_tokens,
+              COUNT(*) FILTER (WHERE s.input_tokens IS NOT NULL OR s.output_tokens IS NOT NULL)::int AS spans_with_usage,
+              COUNT(*) FILTER (WHERE s.input_tokens IS NULL AND s.output_tokens IS NULL)::int AS spans_without_usage
+         FROM spans s JOIN runs r ON r.id = s.run_id ${runsBase.sql}`,
+      runsBase.params
+    );
+
+    // Spend uses the price in force at each span's start. Spans with usage
+    // but no matching price are counted, never billed as zero.
+    const cost = await pool.query(
+      `SELECT COALESCE(SUM(t.cost_micro), 0)::bigint AS estimated_cost_micro,
+              COUNT(*) FILTER (WHERE t.cost_micro IS NULL AND (t.input_tokens IS NOT NULL OR t.output_tokens IS NOT NULL))::int AS missing_pricing_spans
+         FROM (
+           SELECT s.input_tokens, s.output_tokens,
+                  CASE WHEN s.input_tokens IS NULL AND s.output_tokens IS NULL THEN NULL
+                       WHEN p.id IS NULL THEN NULL
+                       ELSE ((COALESCE(s.input_tokens, 0)::bigint * p.input_price_per_million
+                            + COALESCE(s.output_tokens, 0)::bigint * p.output_price_per_million) / 1000000)::bigint
+                  END AS cost_micro
+             FROM spans s JOIN runs r ON r.id = s.run_id
+             LEFT JOIN LATERAL (
+               SELECT pr.id, pr.input_price_per_million, pr.output_price_per_million
+                 FROM pricing pr
+                WHERE pr.provider = s.provider AND pr.model = s.model AND pr.effective_from <= s.started_at
+                ORDER BY pr.effective_from DESC LIMIT 1
+             ) p ON true
+             ${runsBase.sql}
+         ) t`,
+      runsBase.params
+    );
+
+    const latency = await pool.query(
+      `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (r.ended_at - r.started_at)) * 1000) AS median_ms,
+              percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (r.ended_at - r.started_at)) * 1000) AS p95_ms
+         FROM runs r ${base(["r.ended_at IS NOT NULL"]).sql}`,
+      base(["r.ended_at IS NOT NULL"]).params
+    );
+
+    const denied = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM spans s JOIN runs r ON r.id = s.run_id
+        ${base(["s.status = 'denied'"]).sql}`,
+      base(["s.status = 'denied'"]).params
+    );
+
+    // Pending approvals live on the gateway but share this database. Expired
+    // rows are excluded even before any sweeper touches them.
+    const apParams: unknown[] = [];
+    const apScope = scopeClause(req.principal, apParams, "a.workspace_id");
+    const pending = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM approvals a
+        WHERE a.status = 'pending' AND a.expires_at > now() ${apScope ? "AND " + apScope : ""}`,
+      apParams
+    );
+
+    const round1 = (v: unknown): number | null => (v == null ? null : Math.round(Number(v) * 10) / 10);
+    const usageRow = usage.rows[0];
+    const costRow = cost.rows[0];
+    const latRow = latency.rows[0] as { median_ms: unknown; p95_ms: unknown };
+    return {
+      since,
+      runs: { total: Object.values(byStatus).reduce((sum, n) => sum + n, 0), by_status: byStatus },
+      tokens: {
+        input_tokens: Number(usageRow.input_tokens),
+        output_tokens: Number(usageRow.output_tokens),
+        spans_with_usage: usageRow.spans_with_usage,
+        spans_without_usage: usageRow.spans_without_usage
+      },
+      cost: {
+        estimated_cost_micro: Number(costRow.estimated_cost_micro),
+        cost_partial: costRow.missing_pricing_spans > 0,
+        missing_pricing_spans: costRow.missing_pricing_spans
+      },
+      latency_ms: { median: round1(latRow.median_ms), p95: round1(latRow.p95_ms) },
+      denied_spans: (denied.rows[0] as { count: number }).count,
+      pending_approvals: (pending.rows[0] as { count: number }).count
+    };
+  });
+
+  // Agent directory for dashboard filters. Workspace-scoped like everything
+  // else; names repeat across workspaces, so ids are the filter key.
+  app.get("/v1/agents", async (req) => {
+    const params: unknown[] = [];
+    const scope = scopeClause(req.principal, params, "workspace_id");
+    const rows = await pool.query(
+      `SELECT id, name, adapter_type, created_at FROM agents
+        ${scope ? "WHERE " + scope : ""}
+        ORDER BY name ASC LIMIT 500`,
+      params
+    );
+    return { items: rows.rows };
+  });
+
   app.get("/v1/runs/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
     const res = await pool.query("SELECT * FROM runs WHERE id = $1", [id]);
@@ -268,6 +429,29 @@ export function buildApp() {
       id
     ]);
     return { run: run.rows[0], spans: spans.rows };
+  });
+
+  // FR-010 loop and usage diagnostics. Advisory heuristics over the run's
+  // recorded spans; recomputed per request so it always reflects current
+  // data and never blocks or mutates anything.
+  app.get("/v1/runs/:id/diagnostics", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const run = await pool.query("SELECT * FROM runs WHERE id = $1", [id]);
+    if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id)) {
+      return reply.code(404).send({ error: "run_not_found" });
+    }
+    const spans = await pool.query(
+      `SELECT operation_type, name, status, error_type, started_at, ended_at,
+              input_tokens, output_tokens, attributes
+         FROM spans WHERE run_id = $1`,
+      [id]
+    );
+    const thresholds = thresholdsFromEnv();
+    return {
+      run_id: id,
+      warnings: computeWarnings(run.rows[0], spans.rows, thresholds),
+      thresholds
+    };
   });
 
   registerBudgetRoutes(app);
