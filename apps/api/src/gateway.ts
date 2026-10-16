@@ -77,6 +77,8 @@ export function buildGateway() {
   app.addHook("onRequest", async (req, reply) => {
     reply.header("Access-Control-Allow-Origin", DASHBOARD_ORIGIN);
     reply.header("Access-Control-Allow-Headers", "authorization, content-type");
+    // Browsers reject PUT/DELETE preflights without an explicit method list.
+    reply.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     if (req.method === "OPTIONS") return reply.code(204).send();
     // One scoped-auth table for every route. Agent keys carry gateway scope
     // only, so they can never reach the approval decision endpoint no

@@ -41,6 +41,8 @@ Preconditions:
 
 - The dashboard is read-mostly for policy writes: it uses the gateway's policy API with
   the configured key; a 403 means the key lacks scope, not a UI failure.
+- `Save as vN` is a PUT: if it fails with `Failed to fetch` while `Create rule` works,
+  the gateway is missing `Access-Control-Allow-Methods` (see `../SKILL.md` → Doctor).
 - Invalid conditions JSON shows `conditions must be valid JSON` inline and does NOT
   create a rule — assert the alert and the absent row.
 - Edits create a new version; `policies` list shows one row per rule (newest version),

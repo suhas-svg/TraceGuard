@@ -83,6 +83,19 @@ migrations were not applied. A 401 anywhere means the wrong key is configured â€
 dashboard defaults (`dev_key_change_me`, `dev_approver_change_me`) match the compose
 defaults, so only localStorage overrides break this.
 
+**Edit/delete actions failing with `Failed to fetch` while reads work** is a CORS preflight
+problem, not an auth one: the browser blocks PUT/DELETE unless the response carries an
+explicit method list. Probe it directly:
+
+```sh
+curl -s -i -X OPTIONS http://localhost:8091/v1/policies/x \
+  -H "Origin: http://localhost:5173" -H "Access-Control-Request-Method: PUT" | grep -i allow-methods
+```
+
+An empty result means every PUT/DELETE in the dashboard (policy edit, webhook delete, key
+revoke, retention delete) is dead while POST creates still work â€” POST is a CORS-safelisted
+method and never trips the check.
+
 ## Drive
 
 Harness: `browser_exec` (the Python helper: `new_tab(url)`, `goto_url(url)`,
