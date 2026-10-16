@@ -13,6 +13,6 @@
   "scripts": {
     "build": "npm run build --workspaces",
     "test": "npm run test --workspaces --if-present",
-    "db:migrate": "psql $DATABASE_URL -f apps/api/migrations/001_init.sql"
+    "db:migrate": "for f in apps/api/migrations/*.sql; do psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f \"$f\" || exit 1; done"
   }
 }

@@ -10,6 +10,17 @@ spec:
   template:
     spec:
       restartPolicy: OnFailure
+      # The Job is applied at the same time as postgres, so the container must
+      # wait for the database itself — compose does this with depends_on.
+      initContainers:
+        - name: wait-for-postgres
+          image: traceguard/migrate:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - until pg_isready -h postgres -p 5432; do echo waiting for postgres; sleep 2; done
+          resources:
+            requests: { memory: "32Mi", cpu: "50m" }
+            limits: { memory: "128Mi" }
       containers:
         - name: migrate
           image: traceguard/migrate:latest
@@ -23,3 +34,6 @@ spec:
           env:
             - name: DATABASE_URL
               valueFrom: { secretKeyRef: { name: traceguard-secrets, key: DATABASE_URL } }
+          resources:
+            requests: { memory: "64Mi", cpu: "100m" }
+            limits: { memory: "256Mi" }

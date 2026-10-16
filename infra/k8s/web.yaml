@@ -29,6 +29,12 @@ spec:
           image: traceguard/web:latest
           ports:
             - containerPort: 80
+          livenessProbe:
+            httpGet: { path: /, port: 80 }
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+            periodSeconds: 5
           resources:
             requests: { memory: "32Mi", cpu: "50m" }
             limits: { memory: "128Mi" }
