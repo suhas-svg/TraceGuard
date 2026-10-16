@@ -22,6 +22,27 @@ caller supplies, not authenticated identity; policy scoping on them tells
 cooperative agents apart, not adversaries. Give each agent its own key when
 identity must be authenticated.
 
+## Sensitive data inventory
+
+Raw prompts, responses, and tool arguments are not stored by default: known
+content keys in span attributes are replaced with `[NOT CAPTURED]` before
+persistence. Setting `CAPTURE_RAW_ATTRIBUTES=true` opts into capture (the
+api logs a startup warning). Recognized secret patterns are always redacted
+first, even with capture enabled: PEM private keys, `sk-…`/`sk-ant-…` API
+keys, GitHub `gh[pousr]_` tokens, AWS key ids (`AKIA…`), Slack `xox…` tokens,
+JWTs, and `Bearer` tokens. The same pass runs at ingest, OTLP ingestion,
+evaluation replay, and gateway-denial span writes.
+
+| Field | Handling |
+|---|---|
+| `spans.attributes` | content keys `[NOT CAPTURED]` unless capture is on; recognized secrets always `[REDACTED]` |
+| `approvals.args` / `args_enc` | sealed with AES-256-GCM while pending; wiped on deny, expiry, and consumption |
+| `approvals.args_summary` | redacted summary kept after terminal states |
+| `approvals.args_hash` | argument hash bound into the approval; kept |
+| `policy_decisions.args_hash` | hash only; decisions never store arguments |
+| `audit_events.metadata` | actions and rule ids; never tool arguments or output |
+| `users.password_hash`, `api_keys.key_hash` | scrypt and SHA-256 hashes only; plaintext is never stored |
+
 ## Retention
 
 Execution data does not live forever. Retention rules name a target

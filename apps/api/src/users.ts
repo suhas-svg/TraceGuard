@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { pool } from "./db.js";
@@ -47,6 +48,42 @@ export function registerUserRoutes(app: FastifyInstance) {
       [user.id, hash, JSON.stringify(ROLE_SCOPES[user.role] ?? []), expires.toISOString()]
     );
     return { token: plaintext, expires_at: expires.toISOString(), role: user.role };
+  });
+
+  app.get("/v1/auth/me", async (req, reply) => {
+    const p = req.principal;
+    if (!p) return reply.code(401).send({ error: "unauthorized" });
+    let email: string | null = null;
+    let role: string | null = null;
+    if (p.userId) {
+      const row = await pool.query("SELECT email, role FROM users WHERE id = $1", [p.userId]);
+      email = row.rows[0]?.email ?? null;
+      role = row.rows[0]?.role ?? null;
+    }
+    return {
+      kind: p.kind,
+      user_id: p.userId ?? null,
+      email,
+      role,
+      scopes: p.scopes,
+      workspaces: p.workspaces
+    };
+  });
+
+  // Login keys are revocable; env keys are not. Logout deletes the presented
+  // login key row, so its bearer stops working everywhere at once.
+  app.post("/v1/auth/logout", async (req, reply) => {
+    const p = req.principal;
+    if (!p) return reply.code(401).send({ error: "unauthorized" });
+    if (p.kind !== "user") {
+      return reply.code(400).send({ error: "env_key_not_revocable" });
+    }
+    const presented = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+    const keyHash = createHash("sha256").update(presented).digest("hex");
+    const deleted = await pool.query("DELETE FROM api_keys WHERE key_hash = $1 RETURNING id", [keyHash]);
+    await audit(pool, { actor_type: "user", actor_id: p.userId ?? undefined, action: "key.logout",
+      resource_type: "api_key", resource_id: deleted.rows[0]?.id ?? "", result: "success", metadata: {} });
+    return { ok: true, revoked: (deleted.rowCount ?? 0) > 0 };
   });
 
   app.post("/v1/users", async (req, reply) => {

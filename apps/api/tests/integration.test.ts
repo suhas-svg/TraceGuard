@@ -990,4 +990,76 @@ describe("integration and security", () => {
     const unauth = await api.inject({ method: "GET", url: "/v1/agents" });
     expect(unauth.statusCode).toBe(401);
   });
+
+  it("keeps historical estimates on the price version in force at span time", async () => {
+    const prov = `hist-${tag}`;
+    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+      payload: { provider: prov, model: "m1", input_price_per_million: 1_000_000, output_price_per_million: 0 } });
+    const runId = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId, provider: prov, model: "m1",
+        input_tokens: 1000, output_tokens: 0, timestamp: new Date().toISOString() })] } });
+    const before = await api.inject({ method: "GET", url: `/v1/runs/${runId}/usage`, headers: key });
+    expect(before.json().estimated_cost_micro).toBe(1000);
+    // A newer price must not rewrite history: estimates pin the price in
+    // force when the span ran, not the latest row on the price list.
+    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+      payload: { provider: prov, model: "m1", input_price_per_million: 9_000_000, output_price_per_million: 0 } });
+    const after = await api.inject({ method: "GET", url: `/v1/runs/${runId}/usage`, headers: key });
+    expect(after.json().estimated_cost_micro).toBe(1000);
+  });
+
+  it("warn budgets surface a warning without blocking the call", async () => {
+    // Self-contained upstream: other tests may be skipped in filtered runs,
+    // and the shared server may not exist yet.
+    const reg = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `warn-upstream-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp` } });
+    const warnServerId = reg.json().id;
+    await gw.inject({ method: "POST", url: `/v1/servers/${warnServerId}/discover`, headers: key });
+    await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+      payload: { name: `warn-allow-${tag}`, server_id: warnServerId, tool_name: "echo", effect: "allow" } });
+    const runId = randomUUID();
+    const budget = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: runId, limit_micro: 100, effect: "warn" } });
+    const check = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+      payload: { budget_id: budget.json().id, max_cost_micro: 1000 } });
+    expect(check.statusCode).toBe(200);
+    expect(check.json().warning).toBeTruthy();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId, event_type: "run.started" })] } });
+    const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: warnServerId, tool: "echo", arguments: { text: "warned" }, caller: "t", run_id: runId } });
+    // Warn never blocks: the call may still need approval (202), never 403.
+    expect(call.statusCode).not.toBe(403);
+    expect([200, 202], `call body: ${call.body}`).toContain(call.statusCode);
+  });
+
+  it("exposes the caller identity and revokes login keys on logout", async () => {
+    const me = await api.inject({ method: "GET", url: "/v1/auth/me", headers: key });
+    expect(me.statusCode).toBe(200);
+    expect(me.json()).toMatchObject({ kind: "env", user_id: null });
+    expect(me.json().scopes).toContain("admin");
+    const envLogout = await api.inject({ method: "POST", url: "/v1/auth/logout", headers: key });
+    expect(envLogout.statusCode).toBe(400);
+    expect(envLogout.json().error).toBe("env_key_not_revocable");
+    const email = `logout-${tag}@example.com`;
+    await api.inject({ method: "POST", url: "/v1/users", headers: key,
+      payload: { email, password: "long-password-777", role: "member" } });
+    const login = await api.inject({ method: "POST", url: "/v1/auth/login",
+      payload: { email, password: "long-password-777" } });
+    expect(login.statusCode).toBe(200);
+    const bearer = { authorization: `Bearer ${login.json().token}` };
+    const mine = await api.inject({ method: "GET", url: "/v1/auth/me", headers: bearer });
+    expect(mine.statusCode).toBe(200);
+    expect(mine.json()).toMatchObject({ kind: "user", email });
+    expect(mine.json().scopes).toEqual(expect.arrayContaining(["read", "ingest", "gateway"]));
+    const out = await api.inject({ method: "POST", url: "/v1/auth/logout", headers: bearer });
+    expect(out.statusCode).toBe(200);
+    expect(out.json().ok).toBe(true);
+    // The revoked bearer is dead everywhere.
+    const after = await api.inject({ method: "GET", url: "/v1/auth/me", headers: bearer });
+    expect(after.statusCode).toBe(401);
+    const unauth = await api.inject({ method: "GET", url: "/v1/auth/me" });
+    expect(unauth.statusCode).toBe(401);
+  });
 }, 60000);
