@@ -211,7 +211,10 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      const r = await client.query("SELECT * FROM budget_reservations WHERE id = $1", [parsed.data.reservation_id]);
+      // Lock the reservation row: two concurrent settles serialize here, so
+      // only the first can flip held -> settled; the second reads 'settled'
+      // and gets 409 instead of adding the amount to spent_micro twice.
+      const r = await client.query("SELECT * FROM budget_reservations WHERE id = $1 FOR UPDATE", [parsed.data.reservation_id]);
       if (!r.rows[0]) {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "reservation_not_found" });
@@ -253,7 +256,9 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      const r = await client.query("SELECT * FROM budget_reservations WHERE id = $1", [parsed.data.reservation_id]);
+      // Same lock as settle: concurrent releases cannot both subtract the
+      // reserved amount, and one that loses the race sees 'released'.
+      const r = await client.query("SELECT * FROM budget_reservations WHERE id = $1 FOR UPDATE", [parsed.data.reservation_id]);
       if (!r.rows[0] || r.rows[0].status !== "held") {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "reservation_not_found" });

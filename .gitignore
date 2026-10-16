@@ -5,3 +5,6 @@ __pycache__/
 .env
 pgdata/
 infra/k8s/secrets.yaml
+.pytest_cache/
+test-results/
+playwright-report/

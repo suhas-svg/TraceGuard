@@ -127,7 +127,7 @@ export function registerRetentionRoutes(app: FastifyInstance) {
     return { ok: true };
   });
 
-  app.post("/v1/retention/run", async (req, reply) => {
+  app.post("/v1/retention/run", async () => {
     const client = await pool.connect();
     try {
       const rules = await client.query(

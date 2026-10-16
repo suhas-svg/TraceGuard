@@ -128,7 +128,19 @@ memberships, and OTLP ingestion landed on top; their sections are under
 ## Scope decisions from the review
 
 - Streamable HTTP only for MCP upstreams. No stdio process spawning in the gateway.
-- Pending approval arguments stay encrypted with a TTL, then only a redacted summary and hash remain.
+- Approval arguments are sealed (AES-256-GCM) while a request is pending. Once it is denied, expires, or executes, the sealed arguments are cleared and only a redacted summary and the argument hash remain.
 - Deny overrides allow. Priority breaks ties within the same effect only.
 - Money uses NUMERIC or integer micro-dollars, never floats. Unknown model means NULL cost, not zero.
 - Gateway fails closed. SDK telemetry fails open. Budget wrapper fails closed.
+
+## Roadmap: next integrations
+
+- Live evaluation adapters: register a real agent endpoint so replays exercise the
+  agent itself, not just the recorded execution config.
+- Projects as a first-class policy target (agent, project, server, tool), with
+  per-project budgets that carry a reporting period.
+- Cost explorer drill-downs: per-agent breakdowns, budget utilization, and an
+  input-vs-output cost split.
+- OTLP export from TraceGuard, plus log ingestion alongside traces.
+- SSO/OIDC for the dashboard, replacing bearer-token login.
+- Alerting integrations (Slack, PagerDuty) on top of the existing webhook events.

@@ -10,7 +10,7 @@ describe("hash routes", () => {
   });
 
   it("parses every top-level tab", () => {
-    for (const tab of ["runs", "evals", "policy", "approvals", "webhooks", "retention", "costs", "users"]) {
+    for (const tab of ["overview", "runs", "evals", "policy", "approvals", "webhooks", "retention", "costs", "users"]) {
       expect(parseRoute(`#/${tab}`)).toEqual({ tab, runId: null });
     }
   });

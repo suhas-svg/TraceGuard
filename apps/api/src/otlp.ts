@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { captureRawEnabled, redactDeep } from "./redact.js";
 
 // OTLP/HTTP JSON receiver for OpenTelemetry GenAI spans. Supports the JSON
 // encoding only (exporters: OTEL_EXPORTER_OTLP_PROTOCOL=http/json). Binary
@@ -6,7 +7,7 @@ import { createHash } from "node:crypto";
 // Pinned subset of the GenAI conventions: gen_ai.system, gen_ai.request.model,
 // gen_ai.response.model, gen_ai.usage.input_tokens, gen_ai.usage.output_tokens,
 // gen_ai.tool.name, plus exception events. Unknown attributes ride along in
-// the span attributes column untouched.
+// the span attributes column after secret redaction and the capture policy.
 
 export interface OtlpKeyValue {
   key: string;
@@ -133,6 +134,6 @@ export function mapOtlpSpan(
     errorType,
     agentName: (resource["service.name"] as string | undefined) ?? "otel-agent",
     workspaceName: (resource["traceguard.workspace"] as string | undefined) ?? "default",
-    attributes: attrs
+    attributes: redactDeep(attrs, { captureRaw: captureRawEnabled() }) as Record<string, unknown>
   };
 }

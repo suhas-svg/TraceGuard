@@ -3,11 +3,11 @@ import { useEffect, useState } from "react";
 // URL is the single source of truth for "where am I": back/forward, refresh,
 // and shared links all land on the right screen.
 
-export type Tab = "runs" | "evals" | "policy" | "approvals" | "webhooks" | "retention" | "costs" | "users";
+export type Tab = "overview" | "runs" | "evals" | "policy" | "approvals" | "webhooks" | "retention" | "costs" | "users";
 
 export type Route = { tab: Tab; runId: string | null };
 
-const TABS: readonly string[] = ["runs", "evals", "policy", "approvals", "webhooks", "retention", "costs", "users"];
+const TABS: readonly string[] = ["overview", "runs", "evals", "policy", "approvals", "webhooks", "retention", "costs", "users"];
 
 export function parseRoute(hash: string): Route {
   const parts = hash.replace(/^#\/?/, "").split("/").filter(Boolean);

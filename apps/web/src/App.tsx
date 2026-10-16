@@ -1,12 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
-import { formatMicro, getRunCounts, getTrace, getUsage, gwApi, listRuns, settings, type Span } from "./api";
+import {
+  formatMicro, getDiagnostics, getRunCounts, getTrace, getUsage, gwApi, listAgents, listRuns,
+  settings, type Span
+} from "./api";
 import { buildTree, tokenTotal, type SpanNode } from "./tree";
 import { relTime } from "./format";
 import { useHashRoute, type Tab } from "./router";
 import { filterRuns, sortRuns, type RunSortDir, type RunSortKey } from "./runsview";
 import type { PaletteItem } from "./palette";
 import { Palette } from "./CommandPalette";
+import OverviewView from "./Overview";
 import EvalsView from "./Evals";
 import PoliciesView from "./Policies";
 import ApprovalsView from "./Approvals";
@@ -16,10 +20,11 @@ import CostsView from "./Costs";
 import UsersView from "./Users";
 import {
   Alert, Badge, Button, Card, Empty, Field, Input, LinkButton,
-  NavIcon, Page, Segmented, Stat, StatusBadge, Table, TableSkeleton, Td, Th
+  NavIcon, Page, Segmented, Select, Stat, StatusBadge, Table, TableSkeleton, Td, Th
 } from "./components";
 
 const TABS: { id: Tab; label: string }[] = [
+  { id: "overview", label: "Overview" },
   { id: "runs", label: "Runs" },
   { id: "evals", label: "Evaluations" },
   { id: "policy", label: "Policy" },
@@ -124,9 +129,28 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
   const [status, setStatus] = useState("");
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState<{ key: RunSortKey; dir: RunSortDir } | null>(null);
+  // Server-side filters: these narrow what the API returns, including runs
+  // that have not been paged in yet. The search box below stays client-side
+  // over the loaded pages.
+  const [agentId, setAgentId] = useState("");
+  const [provider, setProvider] = useState("");
+  const [model, setModel] = useState("");
+  const [since, setSince] = useState("");
+  const [until, setUntil] = useState("");
+  const [evalRunId, setEvalRunId] = useState("");
+  const agentsQuery = useQuery({ queryKey: ["agents"], queryFn: listAgents, staleTime: 60_000 });
+  const filters = {
+    status: status || undefined,
+    agent_id: agentId || undefined,
+    provider: provider.trim() || undefined,
+    model: model.trim() || undefined,
+    since: since ? new Date(`${since}T00:00:00`).toISOString() : undefined,
+    until: until ? new Date(`${until}T23:59:59.999`).toISOString() : undefined,
+    eval_run_id: evalRunId.trim() || undefined
+  };
   const runsQuery = useInfiniteQuery({
-    queryKey: ["runs", status],
-    queryFn: ({ pageParam }) => listRuns({ status: status || undefined, limit: 50, cursor: pageParam ?? undefined }),
+    queryKey: ["runs", filters],
+    queryFn: ({ pageParam }) => listRuns({ ...filters, limit: 50, cursor: pageParam ?? undefined }),
     initialPageParam: null as string | null,
     getNextPageParam: (last) => last.next_cursor,
     refetchInterval: 10_000
@@ -187,14 +211,52 @@ function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
         <Stat label="Denied spans" value={totals ? totals.denied_spans : "–"} />
       </div>
       {error && <Alert>{error}</Alert>}
-      <div className="mb-3">
-        <Input
-          aria-label="Search runs"
-          placeholder="Search by run id or agent..."
-          className="w-72"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
+      <div className="mb-3 flex flex-wrap items-end gap-2">
+        <Field label="Search loaded">
+          <Input
+            aria-label="Search runs"
+            placeholder="run id or agent..."
+            className="w-52"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </Field>
+        <Field label="Agent">
+          <Select aria-label="Filter by agent" className="w-44" value={agentId}
+            onChange={(e) => setAgentId(e.target.value)}>
+            <option value="">All agents</option>
+            {(agentsQuery.data?.items ?? []).map((a) => (
+              <option key={a.id} value={a.id}>{a.name}</option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="Provider">
+          <Input aria-label="Filter by provider" className="w-32" placeholder="any"
+            value={provider} onChange={(e) => setProvider(e.target.value)} />
+        </Field>
+        <Field label="Model">
+          <Input aria-label="Filter by model" className="w-32" placeholder="any"
+            value={model} onChange={(e) => setModel(e.target.value)} />
+        </Field>
+        <Field label="From">
+          <Input aria-label="Started after" type="date" value={since}
+            onChange={(e) => setSince(e.target.value)} />
+        </Field>
+        <Field label="To">
+          <Input aria-label="Started before" type="date" value={until}
+            onChange={(e) => setUntil(e.target.value)} />
+        </Field>
+        <Field label="Eval run">
+          <Input aria-label="Filter by evaluation run" className="w-40" placeholder="eval run id"
+            value={evalRunId} onChange={(e) => setEvalRunId(e.target.value)} />
+        </Field>
+        {(agentId || provider || model || since || until || evalRunId) && (
+          <Button variant="ghost" size="sm" onClick={() => {
+            setAgentId(""); setProvider(""); setModel(""); setSince(""); setUntil(""); setEvalRunId("");
+          }}>
+            Clear filters
+          </Button>
+        )}
       </div>
       {runsQuery.isPending ? (
         <TableSkeleton label="Loading runs..." />
@@ -307,19 +369,33 @@ function SpanRow({ node, depth, selected, onSelect, base, maxEnd }: {
   );
 }
 
-function SpanDetail({ span }: { span: Span }) {
+function SpanDetail({ span, costMicro }: { span: Span; costMicro?: number | null }) {
   // Denials come from policy rules or exhausted budgets. The stored reason
   // names the cause; the label only says denied.
   const denialCause =
     (span.attributes?.reason as string | undefined) ?? span.error_type ?? "policy";
+  // Reasons that already read as a sentence ("denied by rule ...",
+  // "budget exhausted ...") replace the "denied by" prefix instead of
+  // doubling it.
+  const statusText =
+    span.status !== "denied" ? span.status
+    : /^(denied|budget)/.test(denialCause) ? denialCause
+    : `denied by ${denialCause}`;
+  // Cost comes from the usage endpoint's per-span breakdown: undefined while
+  // it is still loading, null when no pricing row covers the span.
+  const hasUsage = span.input_tokens != null || span.output_tokens != null;
+  const costText =
+    costMicro === undefined ? "…" : !hasUsage ? "n/a"
+    : costMicro === null ? "unpriced (no pricing row)" : formatMicro(costMicro);
   const rows: [string, React.ReactNode][] = [
     ["Operation", <span className="font-mono">{span.operation_type}</span>],
-    ["Status", span.status === "denied" ? `denied by ${denialCause}` : span.status],
+    ["Status", statusText],
     ["Started", new Date(span.started_at).toLocaleString()],
     ["Duration", span.duration_ms != null ? `${span.duration_ms} ms` : "n/a"],
     ["Provider", span.provider ?? "n/a"],
     ["Model", span.model ?? "n/a"],
     ["Tokens", `${span.input_tokens ?? "unknown"} in / ${span.output_tokens ?? "unknown"} out`],
+    ["Cost", costText],
     ["Usage source", span.usage_source ?? "n/a"],
     ["Error", span.error_type ?? "none"]
   ];
@@ -348,10 +424,17 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
   const [selected, setSelected] = useState<string | null>(null);
   const traceQuery = useQuery({ queryKey: ["trace", runId], queryFn: () => getTrace(runId) });
   const usageQuery = useQuery({ queryKey: ["usage", runId], queryFn: () => getUsage(runId) });
+  const diagnosticsQuery = useQuery({
+    queryKey: ["diagnostics", runId],
+    queryFn: () => getDiagnostics(runId),
+    retry: false
+  });
 
   const error = traceQuery.error instanceof Error ? traceQuery.error.message : traceQuery.error ? "load failed" : "";
   const run = traceQuery.data?.run ?? null;
   const spans: Span[] = traceQuery.data?.spans ?? [];
+  const costBySpan = new Map((usageQuery.data?.spans ?? []).map((u) => [u.id, u.cost_micro]));
+  const warnings = diagnosticsQuery.data?.warnings ?? [];
   const cost = usageQuery.data
     ? `${formatMicro(usageQuery.data.estimated_cost_micro)}${usageQuery.data.cost_partial ? " (partial)" : ""}`
     : usageQuery.isError ? "n/a" : null;
@@ -392,6 +475,15 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
         <span className="tg-nums text-sm text-ink-500">{totals.input} in / {totals.output} out</span>
         {cost && <span className="tg-nums text-sm text-ink-500">est. {cost}</span>}
       </div>
+      {warnings.length > 0 && (
+        <div
+          role="status"
+          className="mb-4 rounded-md border border-warn-100 bg-warn-100/50 px-3 py-2 text-sm text-warn-700"
+        >
+          <span className="font-medium">Diagnostics: </span>
+          {warnings.map((w) => w.message).join(" · ")}
+        </div>
+      )}
       <div className="grid items-start gap-4 lg:grid-cols-2">
         <Card className="space-y-0.5 p-2">
           {roots.map((n) => (
@@ -404,7 +496,10 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
         </Card>
         <div className="lg:sticky lg:top-4">
           {selectedSpan ? (
-            <SpanDetail span={selectedSpan} />
+            <SpanDetail
+              span={selectedSpan}
+              costMicro={usageQuery.data ? costBySpan.get(selectedSpan.id) ?? null : undefined}
+            />
           ) : (
             <Empty hint="Select a span to inspect its timing, tokens, and error." />
           )}
@@ -449,7 +544,14 @@ export default function App() {
   }, []);
   // Rebuilt while the palette is open so recent runs reflect the live cache.
   const paletteItems: PaletteItem[] = useMemo(() => {
-    const cached = queryClient.getQueryData<{ pages: { items: { id: string; agent_name: string }[] }[] }>(["runs", ""]);
+    // Any loaded runs page works for "recent": the unfiltered list is
+    // preferred, but a filtered one beats showing nothing.
+    const cached = queryClient
+      .getQueriesData<{ pages: { items: { id: string; agent_name: string }[] }[] }>({
+        queryKey: ["runs"]
+      })
+      .map(([, data]) => data)
+      .find((d) => d?.pages?.[0]?.items?.length);
     const recent = (cached?.pages[0]?.items ?? []).slice(0, 6).map((r) => ({
       id: `run-${r.id}`,
       label: `Open run ${r.id.slice(0, 8)}`,
@@ -518,7 +620,9 @@ export default function App() {
       </aside>
       <div className="min-w-0 flex-1">
         <main>
-          {tab === "evals" ? (
+          {tab === "overview" ? (
+            <OverviewView />
+          ) : tab === "evals" ? (
             <EvalsView onOpenRun={(id) => navigate({ tab: "runs", runId: id })} />
           ) : tab === "policy" ? (
             <PoliciesView />

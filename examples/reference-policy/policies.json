@@ -1,0 +1,33 @@
+[
+  {
+    "name": "allow-read-file",
+    "enabled": true,
+    "priority": 0,
+    "server_id": "REPLACE_WITH_SERVER_ID",
+    "tool_name": "read_file",
+    "effect": "allow",
+    "conditions": {}
+  },
+  {
+    "name": "deny-destructive-wipe",
+    "enabled": true,
+    "priority": 100,
+    "server_id": "REPLACE_WITH_SERVER_ID",
+    "tool_name": "wipe_disk",
+    "effect": "deny",
+    "conditions": {}
+  },
+  {
+    "name": "approval-for-sensitive-paths",
+    "enabled": true,
+    "priority": 50,
+    "server_id": "REPLACE_WITH_SERVER_ID",
+    "tool_name": "read_file",
+    "effect": "require_approval",
+    "conditions": {
+      "arguments": {
+        "path": { "enum": ["/approval-needed.txt"] }
+      }
+    }
+  }
+]
