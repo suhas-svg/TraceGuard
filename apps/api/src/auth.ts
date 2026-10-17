@@ -33,6 +33,7 @@ const WRITE_ALLOW: [string, string][] = [
   ["/v1/ingest", "ingest"],
   ["/v1/traces", "ingest"],
   ["/v1/gateway/tools/call", "gateway"],
+  ["/mcp", "gateway"],
   ["/v1/approvals/", "approve"]
 ];
 const ROUTES: [string, string][] = [
@@ -44,6 +45,7 @@ const ROUTES: [string, string][] = [
   ["/v1/ingest", "ingest"],
   ["/v1/traces", "ingest"],
   ["/v1/gateway/tools/call", "gateway"],
+  ["/mcp", "gateway"],
   ["/v1/approvals/", "approve"],
   ["/v1/approvals", "read"],
   ["/v1/overview", "read"],
@@ -177,7 +179,7 @@ declare module "fastify" {
 }
 
 export async function authHook(req: FastifyRequest, reply: FastifyReply): Promise<void> {
-  if (!req.url.startsWith("/v1/")) return;
+  if (!req.url.startsWith("/v1/") && !req.url.startsWith("/mcp")) return;
   const scope = requiredScope(req.url, req.method);
   if (scope === "public") return;
   const principal = await resolvePrincipal(req.headers.authorization ?? "");

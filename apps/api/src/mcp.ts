@@ -1,0 +1,300 @@
+import type { FastifyInstance } from "fastify";
+import { pool } from "./db.js";
+import { audit } from "./audit.js";
+import { evaluate, type PolicyRule } from "./policy.js";
+import type { Principal } from "./auth.js";
+
+// The agent-facing boundary is the MCP Streamable HTTP profile of the
+// 2026-07-28 revision: stateless requests, per-request metadata, and only
+// server/discover, tools/list and tools/call. Everything else is rejected and
+// never forwarded upstream (§7.2).
+export const MCP_PROTOCOL_VERSION = "2026-07-28";
+const META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion";
+const META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
+const META_LOGICAL_REQUEST_ID = "io.traceguard/logical_request_id";
+const TOOLS_TTL_MS = 60_000;
+
+type JsonRpcId = string | number;
+
+function rpcResult(id: JsonRpcId, result: unknown) {
+  return { jsonrpc: "2.0", id, result };
+}
+
+function rpcError(id: JsonRpcId | null, code: number, message: string, data?: unknown) {
+  return { jsonrpc: "2.0", id, error: { code, message, ...(data === undefined ? {} : { data }) } };
+}
+
+export function gatewayAlias(name: string): string {
+  const alias = name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 32);
+  return alias || "server";
+}
+
+async function resolveWorkspace(principal?: Principal): Promise<string | null> {
+  if (principal && Array.isArray(principal.workspaces)) return principal.workspaces[0] ?? null;
+  const found = await pool.query("SELECT id FROM workspaces WHERE name = 'default'");
+  return (found.rows[0]?.id as string | undefined) ?? null;
+}
+
+async function loadRules(workspaceId: string): Promise<PolicyRule[]> {
+  const rows = await pool.query(
+    "SELECT * FROM policies WHERE workspace_id = $1 AND superseded_by IS NULL", [workspaceId]
+  );
+  return rows.rows.map((r) => ({
+    id: r.id, version: r.version, name: r.name, enabled: r.enabled, priority: r.priority,
+    agent_id: r.agent_id, server_id: r.server_id, tool_name: r.tool_name,
+    effect: r.effect, conditions: (r.conditions ?? {}) as PolicyRule["conditions"]
+  }));
+}
+
+interface RpcEnvelope {
+  id: JsonRpcId;
+  method: string;
+  params: Record<string, unknown>;
+}
+
+function parseEnvelope(body: unknown):
+  | { ok: true; env: RpcEnvelope }
+  | { ok: false; id: JsonRpcId | null; message: string } {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { ok: false, id: null, message: "body must be a JSON-RPC object" };
+  }
+  const b = body as Record<string, unknown>;
+  if (b.jsonrpc !== "2.0") return { ok: false, id: null, message: "jsonrpc must be \"2.0\"" };
+  // v1 is request-only: no notifications, no server-initiated messages.
+  if (typeof b.id !== "string" && typeof b.id !== "number") {
+    return { ok: false, id: null, message: "a request id is required" };
+  }
+  if (typeof b.method !== "string" || !b.method) {
+    return { ok: false, id: b.id, message: "method is required" };
+  }
+  const params = b.params === undefined ? {} : b.params;
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    return { ok: false, id: b.id, message: "params must be an object" };
+  }
+  return { ok: true, env: { id: b.id, method: b.method, params: params as Record<string, unknown> } };
+}
+
+// The three header/body checks the revision requires: a supported protocol
+// version, the method repeated in Mcp-Method, and the tool name repeated in
+// Mcp-Name for tools/call. Routing on one representation while authorising
+// another is exactly the gap this closes.
+function protocolIssue(
+  headers: Record<string, string | string[] | undefined>, env: RpcEnvelope
+): string | null {
+  const version = headers["mcp-protocol-version"];
+  if (version !== MCP_PROTOCOL_VERSION) {
+    return `MCP-Protocol-Version must be ${MCP_PROTOCOL_VERSION}`;
+  }
+  if (headers["mcp-method"] !== env.method) {
+    return "Mcp-Method does not match the JSON-RPC method";
+  }
+  if (env.method === "tools/call") {
+    const name = env.params.name;
+    if (typeof name !== "string" || headers["mcp-name"] !== name) {
+      return "Mcp-Name does not match params.name";
+    }
+  }
+  const meta = env.params._meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return "params._meta is required";
+  }
+  const fields = meta as Record<string, unknown>;
+  if (fields[META_PROTOCOL_VERSION] !== MCP_PROTOCOL_VERSION) {
+    return `${META_PROTOCOL_VERSION} must be ${MCP_PROTOCOL_VERSION}`;
+  }
+  const caps = fields[META_CLIENT_CAPABILITIES];
+  if (!caps || typeof caps !== "object" || Array.isArray(caps)) {
+    return `${META_CLIENT_CAPABILITIES} is required`;
+  }
+  return null;
+}
+
+async function callTool(app: FastifyInstance, req: { headers: Record<string, string | string[] | undefined>; principal?: Principal; }, env: RpcEnvelope) {
+  const name = env.params.name;
+  if (typeof name !== "string" || !name) {
+    return rpcError(env.id, -32602, "Invalid params", { error: "tool name is required" });
+  }
+  const sep = name.indexOf("__");
+  if (sep <= 0 || sep + 2 >= name.length) {
+    return rpcError(env.id, -32602, "Invalid params", { error: "tool name must be <server-alias>__<tool>" });
+  }
+  const alias = name.slice(0, sep);
+  const tool = name.slice(sep + 2);
+  const rawArgs = env.params.arguments;
+  if (rawArgs !== undefined && (!rawArgs || typeof rawArgs !== "object" || Array.isArray(rawArgs))) {
+    return rpcError(env.id, -32602, "Invalid params", { error: "arguments must be an object" });
+  }
+  const args = (rawArgs ?? {}) as Record<string, unknown>;
+
+  const workspaceId = await resolveWorkspace(req.principal);
+  if (!workspaceId) {
+    return rpcError(env.id, -32003, "Tool not found", { error: "workspace_not_found" });
+  }
+  const serverRow = await pool.query(
+    "SELECT * FROM mcp_servers WHERE workspace_id = $1 AND gateway_alias = $2",
+    [workspaceId, alias]
+  );
+  const server = serverRow.rows[0];
+  if (!server) {
+    return rpcError(env.id, -32003, "Tool not found", { error: "unknown_server_alias", name });
+  }
+
+  // The authenticated principal is the caller; MCP clientInfo is diagnostic
+  // only (§9.1). The env key has no human identity and is a dev profile.
+  const caller = req.principal?.userId ?? "agent";
+  const meta = env.params._meta as Record<string, unknown>;
+  const logicalRaw = meta[META_LOGICAL_REQUEST_ID];
+  const logicalId = typeof logicalRaw === "string" && logicalRaw.length > 0 && logicalRaw.length <= 128
+    ? logicalRaw
+    : undefined;
+
+  // §9.5: an approval needing call without the shim's stable logical id is
+  // refused explicitly rather than silently creating an unmatchable hold.
+  if (!logicalId) {
+    const verdict = evaluate(await loadRules(workspaceId), {
+      caller, agent_id: null, server_id: server.id, tool_name: tool, args
+    });
+    if (verdict.decision === "need_approval") {
+      return rpcError(env.id, -32005, "Approval client required", {
+        error: "APPROVAL_CLIENT_REQUIRED",
+        detail: `send ${META_LOGICAL_REQUEST_ID} so the retry can match its approval`
+      });
+    }
+  }
+
+  // A retry presents the same logical request id, so the approval is found
+  // durably rather than being a reusable token in the payload.
+  let approvalId: string | undefined;
+  if (logicalId) {
+    const ap = await pool.query(
+      "SELECT id FROM approvals WHERE request_id = $1 AND caller = $2 AND workspace_id = $3",
+      [logicalId, caller, workspaceId]
+    );
+    approvalId = ap.rows[0]?.id as string | undefined;
+  }
+
+  // Reuse the enforcing call path rather than reimplementing it: the REST
+  // route applies quarantine, policy, budgets, approval consume and upstream
+  // credential injection in one place.
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/gateway/tools/call",
+    headers: { authorization: typeof req.headers.authorization === "string" ? req.headers.authorization : "" },
+    payload: {
+      server_id: server.id,
+      tool,
+      arguments: args,
+      caller,
+      ...(logicalId ? { request_id: logicalId } : {}),
+      ...(approvalId ? { approval_id: approvalId } : {})
+    }
+  });
+  const body = res.json() as Record<string, unknown> & { result?: unknown };
+
+  if (res.statusCode === 200) {
+    const result = body.result;
+    if (result && typeof result === "object") {
+      const r = result as Record<string, unknown>;
+      // A tool server must not smuggle unsupported multi-round-trip input
+      // requests through tools/call; do not deliver them to the agent.
+      if (r.resultType === "input_required" || Array.isArray(r.inputRequests)) {
+        await audit(pool, {
+          actor_type: "agent", actor_id: caller, action: "mcp.protocol_rejected",
+          resource_type: "server_tool", resource_id: `${server.id}/${tool}`,
+          result: "rejected", metadata: { reason: "input_required" }
+        });
+        return rpcError(env.id, -32006, "Unsupported result", {
+          error: "UNSUPPORTED_RESULT", detail: "input_required results are not supported in v1"
+        });
+      }
+    }
+    return rpcResult(env.id, result);
+  }
+  switch (res.statusCode) {
+    case 202:
+      return rpcError(env.id, -32002, "Approval pending", {
+        error: "APPROVAL_PENDING",
+        approval_id: body.approval_id,
+        logical_request_id: logicalId ?? null,
+        expires_at: body.expires_at,
+        status: body.status
+      });
+    case 403:
+      return rpcError(env.id, -32001, "Denied", {
+        error: body.error ?? "denied", reason: body.reason ?? null
+      });
+    case 404:
+      return rpcError(env.id, -32003, "Not found", { error: body.error ?? "not_found" });
+    case 409:
+      return rpcError(env.id, -32004, "Approval not pending", {
+        error: body.error ?? "approval_not_pending", status: body.status ?? null
+      });
+    case 410:
+      return rpcError(env.id, -32004, "Approval terminal", {
+        error: body.error ?? "approval_terminal", status: body.status ?? null
+      });
+    case 502:
+      return rpcError(env.id, -32603, "Upstream failed", { error: "UPSTREAM_FAILED" });
+    default:
+      return rpcError(env.id, -32603, "Internal error", { error: body.error ?? "internal_error" });
+  }
+}
+
+export function registerMcpRoutes(app: FastifyInstance): void {
+  app.post("/mcp", async (req, reply) => {
+    const parsed = parseEnvelope(req.body);
+    if (!parsed.ok) {
+      return reply.code(400).send(rpcError(parsed.id, -32600, "Invalid Request", { error: parsed.message }));
+    }
+    const env = parsed.env;
+    const issue = protocolIssue(req.headers, env);
+    if (issue) {
+      return reply.code(400).send(rpcError(env.id, -32600, "Invalid Request", { error: issue }));
+    }
+    switch (env.method) {
+      case "server/discover":
+        return rpcResult(env.id, {
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          serverInfo: { name: "traceguard-gateway", version: "0.1.0" },
+          capabilities: { tools: { listChanged: false } },
+          resultType: "complete"
+        });
+      case "tools/list": {
+        const workspaceId = await resolveWorkspace(req.principal);
+        if (!workspaceId) {
+          return rpcResult(env.id, {
+            tools: [], ttlMs: TOOLS_TTL_MS, cacheScope: "workspace", resultType: "complete"
+          });
+        }
+        const rows = await pool.query(
+          `SELECT s.gateway_alias, t.tool_name, t.description, t.input_schema
+             FROM mcp_servers s JOIN server_tools t ON t.server_id = s.id
+            WHERE s.workspace_id = $1 AND t.quarantined = false
+            ORDER BY s.gateway_alias, t.tool_name`,
+          [workspaceId]
+        );
+        return rpcResult(env.id, {
+          tools: rows.rows.map((r) => ({
+            name: `${r.gateway_alias}__${r.tool_name}`,
+            description: r.description,
+            inputSchema: r.input_schema
+          })),
+          ttlMs: TOOLS_TTL_MS,
+          cacheScope: "workspace",
+          resultType: "complete"
+        });
+      }
+      case "tools/call":
+        return callTool(app, req, env);
+      // resources/*, prompts/*, subscriptions, sampling, elicitation, Tasks,
+      // Apps and every unknown method land here and are never forwarded.
+      default:
+        return rpcError(env.id, -32601, "Method not found", {
+          error: "unsupported_method", method: env.method
+        });
+    }
+  });
+
+  // v1 has no server-initiated stream and no SSESession resumption.
+  app.get("/mcp", async (_req, reply) => reply.code(405).send({ error: "method_not_allowed" }));
+}

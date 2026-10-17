@@ -14,6 +14,7 @@ import {
 import { callUpstreamTool, checkUpstreamUrlResolved, definitionHash, discoverTools } from "./upstream.js";
 import { hashesEqual, parseKey, seal, tryOpen } from "./seal.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
+import { gatewayAlias, registerMcpRoutes } from "./mcp.js";
 import { notify } from "./notify.js";
 import { captureRawEnabled, redactDeep, summarizeArgs } from "./redact.js";
 
@@ -136,10 +137,13 @@ export function buildGateway() {
     const client = await pool.connect();
     try {
       const workspaceId = await defaultWorkspaceId(client);
+      // The stable alias namespaces every exposed tool (§7.5) and is part of
+      // the signed server manifest once bundles land.
+      const alias = gatewayAlias(parsed.data.name);
       const res = await client.query(
-        `INSERT INTO mcp_servers (workspace_id, name, base_url, auth_secret)
-         VALUES ($1,$2,$3,$4) RETURNING id, workspace_id, name, base_url, created_at`,
-        [workspaceId, parsed.data.name, parsed.data.base_url, parsed.data.auth_secret ?? null]
+        `INSERT INTO mcp_servers (workspace_id, name, gateway_alias, base_url, auth_secret)
+         VALUES ($1,$2,$3,$4,$5) RETURNING id, workspace_id, name, gateway_alias, base_url, created_at`,
+        [workspaceId, parsed.data.name, alias, parsed.data.base_url, parsed.data.auth_secret ?? null]
       );
       await audit(pool, { actor_type: "admin", action: "server.register",
         resource_type: "mcp_server", resource_id: res.rows[0].id,
@@ -160,7 +164,7 @@ export function buildGateway() {
     const params: unknown[] = [];
     const scope = scopeClause(req.principal, params, "workspace_id");
     const res = await pool.query(
-      `SELECT id, workspace_id, name, base_url, created_at FROM mcp_servers
+      `SELECT id, workspace_id, name, gateway_alias, base_url, created_at FROM mcp_servers
        ${scope ? `WHERE ${scope}` : ""} ORDER BY created_at DESC`, params
     );
     return { items: res.rows };
@@ -808,6 +812,10 @@ export function buildGateway() {
     );
     return { items: res.rows };
   });
+
+  // Agent-facing MCP Streamable HTTP profile (§7.2), separate from the REST
+  // control and dashboard routes.
+  registerMcpRoutes(app);
 
   return app;
 }
