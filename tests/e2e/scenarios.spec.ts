@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import { expect, test, type Page } from "@playwright/test";
 import {
   apiGet, apiPost, event, gwCall, gwPost, ingest, seedRun, setKeys, upstreamHits
@@ -264,4 +265,53 @@ test("scenario F: two evaluation versions compare side by side", async ({ page, 
   await page.getByRole("button", { name: "Compare", exact: true }).click();
   await expect(page.getByText("100%").first()).toBeVisible();
   await expect(page.getByText("0%").first()).toBeVisible();
+});
+
+test("scenario H: a case runs through a live adapter from the dashboard", async ({ page, request }) => {
+  // A real endpoint, so this proves the dashboard can point a case at a live
+  // agent rather than only replaying what the case declared about itself.
+  const seen: { value?: { case?: string; input?: unknown } } = {};
+  const adapter = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      seen.value = JSON.parse(raw || "{}");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ output: "live answer", input_tokens: 12, output_tokens: 4 }));
+    });
+  });
+  await new Promise<void>((r) => adapter.listen(0, "127.0.0.1", r));
+  const port = (adapter.address() as { port: number }).port;
+  try {
+    const suite = await apiPost(request, "/v1/evaluations/suites", { name: `e2e-live-${tag}` });
+    const suiteId = (await suite.json()).id;
+    await apiPost(request, `/v1/evaluations/suites/${suiteId}/cases`, {
+      name: "live-case",
+      input_payload: { prompt: "ping" },
+      assertions: [{ type: "contains", value: "live answer" }]
+    });
+
+    await setKeys(page);
+    await page.goto("/");
+    await openTab(page, "Evaluations");
+
+    // The add-case form has a Suite picker too, so scope to the form that owns
+    // the run button rather than matching two fields with the same label.
+    const runForm = page.locator("form")
+      .filter({ has: page.getByRole("button", { name: "Run suite" }) });
+    await runForm.getByLabel("Suite").selectOption(suiteId);
+    // The URL is only asked for once the live adapter is chosen.
+    await expect(runForm.getByLabel("Adapter URL")).toHaveCount(0);
+    await runForm.getByLabel("Adapter").selectOption("http");
+    await runForm.getByLabel("Adapter URL").fill(`http://127.0.0.1:${port}/invoke`);
+    await runForm.getByRole("button", { name: "Run suite" }).click();
+
+    // The run opens on its result, and the endpoint received the case: a
+    // scripted adapter would never have called anything.
+    await expect(page.getByRole("cell", { name: "pass" }).first()).toBeVisible();
+    expect(seen.value?.case).toBe("live-case");
+    expect(seen.value?.input).toEqual({ prompt: "ping" });
+  } finally {
+    adapter.close();
+  }
 });
