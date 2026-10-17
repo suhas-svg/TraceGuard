@@ -31,7 +31,9 @@ echo "starting api, gateway, mock tools, web preview..."
 node apps/api/dist/index.js > /tmp/demo-api.log 2>&1 & pids+=($!)
 node apps/api/dist/gateway.js > /tmp/demo-gw.log 2>&1 & pids+=($!)
 node examples/mock-tools/server.mjs > /tmp/demo-mock.log 2>&1 & pids+=($!)
-npm run preview --workspace apps/web -- --port "${WEB_PORT:-5173}" --strictPort \
+# Started directly rather than through `npm run preview`: npm spawns vite as a
+# child, so killing this pid would orphan the server on the port.
+(cd apps/web && exec node node_modules/vite/bin/vite.js preview --port "${WEB_PORT:-5173}" --strictPort) \
   > /tmp/demo-web.log 2>&1 & pids+=($!)
 
 wait_for() { # url, label, attempts

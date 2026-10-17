@@ -25,31 +25,45 @@ export ALLOW_PRIVATE_UPSTREAMS=true
 [ "$GATEWAY_PORT" = "8091" ] || echo "warning: GATEWAY_PORT=$GATEWAY_PORT but the dashboard calls 8091"
 
 PORTS="$PORT $GATEWAY_PORT $MOCK_TOOLS_PORT 5173"
+PIDFILE="${TMPDIR:-/tmp}/traceguard-dev-stack.pids"
 
 # A force-kill of this script skips the trap below and leaves all four children
-# running, so there is a way to stop them by the port they hold.
+# running, so the pids are recorded on start and stopped by name. Resolving
+# listeners by port does not work here: Get-NetTCPConnection reports nothing for
+# these processes, so a port-based stop succeeds while changing nothing.
 if [ "${1:-}" = "--stop" ]; then
-  if command -v powershell.exe > /dev/null 2>&1; then
-    powershell.exe -NoProfile -Command \
-      "Get-NetTCPConnection -State Listen -LocalPort @($(echo $PORTS | tr ' ' ',')) -ErrorAction SilentlyContinue |
-       Select-Object -ExpandProperty OwningProcess -Unique |
-       ForEach-Object { Stop-Process -Id \$_ -Force -ErrorAction SilentlyContinue }"
-  else
-    for p in $PORTS; do lsof -ti "tcp:$p" 2>/dev/null | xargs -r kill -9; done
+  if [ ! -f "$PIDFILE" ]; then
+    echo "no pid file at $PIDFILE — nothing recorded to stop"
+    exit 0
   fi
-  echo "stopped anything listening on $PORTS"
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    if kill "$pid" 2>/dev/null; then
+      echo "stopped $pid"
+    elif command -v powershell.exe > /dev/null 2>&1; then
+      powershell.exe -NoProfile -Command \
+        "Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue" 2>/dev/null &&
+        echo "stopped $pid (forced)" || echo "already gone: $pid"
+    else
+      echo "already gone: $pid"
+    fi
+  done < "$PIDFILE"
+  rm -f "$PIDFILE"
   exit 0
 fi
 
 pids=()
-cleanup() { for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null; done; }
+cleanup() { for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null; done; rm -f "$PIDFILE"; }
 trap cleanup EXIT INT TERM
 
 node apps/api/dist/index.js > /tmp/stack-api.log 2>&1 & pids+=($!)
 node apps/api/dist/gateway.js > /tmp/stack-gw.log 2>&1 & pids+=($!)
 node examples/mock-tools/server.mjs > /tmp/stack-mock.log 2>&1 & pids+=($!)
-npm run preview --workspace apps/web -- --port 5173 --strictPort \
+# Started directly rather than through `npm run preview`: npm spawns vite as a
+# child, so the recorded pid is the wrapper and stopping it orphans the server.
+(cd apps/web && exec node node_modules/vite/bin/vite.js preview --port 5173 --strictPort) \
   > /tmp/stack-web.log 2>&1 & pids+=($!)
+printf '%s\n' "${pids[@]}" > "$PIDFILE"
 
 ready=1
 for _ in $(seq 1 40); do
