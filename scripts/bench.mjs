@@ -90,6 +90,30 @@ async function prepareGatewayCall() {
 
 const gwCall = await prepareGatewayCall();
 
+// Section 14's target is the policy decision, and the gateway records how long
+// each one took. Read it back, so the figure below is measured rather than an
+// upper bound inferred from the whole call.
+async function gatewayOverhead() {
+  if (!process.env.DATABASE_URL) return null;
+  try {
+    const { default: pg } = await import("pg");
+    const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+    await client.connect();
+    const res = await client.query(
+      `SELECT count(*) AS n,
+              percentile_cont(0.5) WITHIN GROUP (ORDER BY overhead_ms) AS p50,
+              percentile_cont(0.95) WITHIN GROUP (ORDER BY overhead_ms) AS p95
+         FROM policy_decisions
+        WHERE overhead_ms IS NOT NULL AND timestamp > now() - interval '10 minutes'`);
+    await client.end();
+    const r = res.rows[0];
+    if (!Number(r.n)) return null;
+    return { n: Number(r.n), p50: Number(r.p50), p95: Number(r.p95) };
+  } catch {
+    return null;
+  }
+}
+
 const rows = [];
 rows.push(await timed("GET /healthz", () => fetch(`${BASE}/healthz`)));
 rows.push(await timed("GET /v1/overview", () => fetch(`${BASE}/v1/overview`, { headers: auth })));
@@ -100,8 +124,8 @@ rows.push(await timed("POST /v1/ingest/events (1 event)", (i) =>
     body: JSON.stringify({ events: [event(i)] })
   })));
 if (gwCall) {
-  // Upper bound on the gateway target: this includes the upstream round trip,
-  // which the spec's 100ms budget explicitly excludes.
+  // The whole call, upstream round trip included. This is NOT the §14 target
+  // (which excludes upstream execution); the overhead line below is.
   rows.push(await timed("POST /v1/gateway/tools/call (incl. upstream)", (i) =>
     fetch(`${GW}/v1/gateway/tools/call`, {
       method: "POST", headers: { ...auth, "Content-Type": "application/json" },
@@ -130,5 +154,14 @@ for (const r of rows) {
 }
 console.log(`\nSpec §14 targets: dashboard queries p95 < 500ms, ingest-to-visible p95 < 3s,`);
 console.log(`gateway policy overhead p95 < 100ms (excluding upstream execution and human`);
-console.log(`approval, so the gateway row above is an upper bound on it). Cold starts miss`);
-console.log(`all three; warm the database and rerun before quoting any of these numbers.\n`);
+console.log(`approval).`);
+const ovh = await gatewayOverhead();
+if (ovh) {
+  console.log(`\n§14 gateway policy overhead, measured from policy_decisions.overhead_ms`);
+  console.log(`(decisions in the last 10 minutes): n=${ovh.n} p50=${num(ovh.p50)} p95=${num(ovh.p95)}`);
+} else {
+  console.log(`\nGateway policy overhead: not measured (set DATABASE_URL to read`);
+  console.log(`policy_decisions.overhead_ms, or run the gateway first).`);
+}
+console.log(`\nCold starts miss all three; warm the database and rerun before quoting`);
+console.log(`any of these numbers.\n`);

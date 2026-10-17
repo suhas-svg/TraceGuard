@@ -87,15 +87,21 @@ async function recordDecision(client: PoolClient, d: {
   workspace_id: string; caller: string; server_id: string | null; tool_name: string;
   args_hash: string; decision: string; policy_id?: string | null; policy_version?: number | null;
   matched?: unknown[]; reason?: string; approval_id?: string | null;
+  // Section 14's policy-decision budget, measured from the start of handling
+  // the call to the moment the decision is recorded. The upstream round trip
+  // it excludes is excluded by construction: the value is read before
+  // forwarding, not after.
+  overhead_ms?: number | null;
 }): Promise<void> {
   await client.query(
     `INSERT INTO policy_decisions
        (workspace_id, caller, server_id, tool_name, args_hash, decision,
-        policy_id, policy_version, matched_rules, reason, approval_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11)`,
+        policy_id, policy_version, matched_rules, reason, approval_id, overhead_ms)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12)`,
     [d.workspace_id, d.caller, d.server_id, d.tool_name, d.args_hash, d.decision,
      d.policy_id ?? null, d.policy_version ?? null,
-     JSON.stringify(d.matched ?? []), d.reason ?? "", d.approval_id ?? null]
+     JSON.stringify(d.matched ?? []), d.reason ?? "", d.approval_id ?? null,
+     d.overhead_ms ?? null]
   );
 }
 
@@ -373,7 +379,7 @@ export function buildGateway() {
     tool: string,
     args: Record<string, unknown>,
     caller: string,
-    decisionMeta: { approval_id?: string | null; policy_id?: string | null; policy_version?: number | null; matched?: unknown[] }
+    decisionMeta: { approval_id?: string | null; policy_id?: string | null; policy_version?: number | null; matched?: unknown[]; overheadMs?: number }
   ): Promise<unknown> {
     // Gateway fails closed: any upstream or policy error denies, never allows.
     // Re-validate before every forward; a failure surfaces through the
@@ -388,7 +394,7 @@ export function buildGateway() {
         args_hash: sha256Hex(stableStringify(args)), decision: "error",
         policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
         matched: decisionMeta.matched, reason: `upstream fails validation: ${urlRecheck.reason}`,
-        approval_id: decisionMeta.approval_id ?? null
+        approval_id: decisionMeta.approval_id ?? null, overhead_ms: decisionMeta.overheadMs ?? null
       });
       await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
         resource_type: "mcp_server", resource_id: server.id, result: "failed",
@@ -407,7 +413,7 @@ export function buildGateway() {
         args_hash: sha256Hex(stableStringify(args)), decision: "error",
         policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
         matched: decisionMeta.matched, reason: `upstream error: ${detail}`,
-        approval_id: decisionMeta.approval_id ?? null
+        approval_id: decisionMeta.approval_id ?? null, overhead_ms: decisionMeta.overheadMs ?? null
       });
       await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
         resource_type: "mcp_server", resource_id: server.id, result: "failed",
@@ -419,7 +425,7 @@ export function buildGateway() {
       args_hash: sha256Hex(stableStringify(args)), decision: decisionMeta.approval_id ? "approved_retry" : "allow",
       policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
       matched: decisionMeta.matched, reason: decisionMeta.approval_id ? "approved" : "allowed",
-      approval_id: decisionMeta.approval_id ?? null
+      approval_id: decisionMeta.approval_id ?? null, overhead_ms: decisionMeta.overheadMs ?? null
     });
     await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
       resource_type: "server_tool", resource_id: `${server.id}/${tool}`, result: "allowed" });
@@ -427,6 +433,11 @@ export function buildGateway() {
   }
 
   app.post("/v1/gateway/tools/call", async (req, reply) => {
+    // Section 14's budget covers what the gateway itself adds to a tool call,
+    // so the clock starts when the request arrives and is read before anything
+    // is forwarded. The upstream round trip is excluded by construction.
+    const t0 = performance.now();
+    const overheadMs = () => Math.round(performance.now() - t0);
     const parsed = callSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_call" });
     const { server_id, tool, arguments: args } = parsed.data;
@@ -452,7 +463,7 @@ export function buildGateway() {
         const reason = toolRow.rows[0] ? "tool quarantined" : "unknown tool";
         await recordDecision(client, { workspace_id: server.workspace_id, caller,
           server_id, tool_name: tool, args_hash: sha256Hex(stableStringify(args)),
-          decision: "deny", reason });
+          decision: "deny", reason, overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
           resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied" });
         // Alerts never block the denial they report.
@@ -486,7 +497,7 @@ export function buildGateway() {
           tool_name: tool, args_hash: argsHash, decision: "deny",
           policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null,
           matched: verdict.matched, reason: verdict.reason,
-          approval_id: parsed.data.approval_id ?? null });
+          approval_id: parsed.data.approval_id ?? null, overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
           resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied",
           metadata: { rule: verdict.rule?.name ?? null } });
@@ -510,7 +521,7 @@ export function buildGateway() {
         await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: argsHash, decision: "deny",
           matched: verdict.matched, reason,
-          approval_id: parsed.data.approval_id ?? null });
+          approval_id: parsed.data.approval_id ?? null, overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
           resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied",
           metadata: { budget_id: exhausted.id, scope: exhausted.scope } });
@@ -549,7 +560,8 @@ export function buildGateway() {
           }
           await recordDecision(client, { workspace_id: server.workspace_id, caller,
             server_id, tool_name: tool, args_hash: argsHash,
-            decision: "deny", reason: "approval expired", approval_id: approval.id });
+            decision: "deny", reason: "approval expired", approval_id: approval.id,
+            overhead_ms: overheadMs() });
           await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.expired",
             resource_type: "approval", resource_id: approval.id, result: "deny" });
           return reply.code(410).send({ error: "approval_expired" });
@@ -558,7 +570,8 @@ export function buildGateway() {
         if (!hashesEqual(want, approval.args_hash) || approval.caller !== caller) {
           await recordDecision(client, { workspace_id: server.workspace_id, caller,
             server_id, tool_name: tool, args_hash: argsHash,
-            decision: "deny", reason: "approval binding mismatch", approval_id: approval.id });
+            decision: "deny", reason: "approval binding mismatch", approval_id: approval.id,
+            overhead_ms: overheadMs() });
           // A replay or a transplanted approval is the most tell-tale event
           // this endpoint sees; it belongs in the tamper-evident trail.
           await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.binding_mismatch",
@@ -590,7 +603,7 @@ export function buildGateway() {
         if (!consumed.rows[0]) return reply.code(410).send({ error: "approval_consumed" });
         try {
           const result = await forward(client, server, tool, stored,
-            caller, { approval_id: approval.id });
+            caller, { approval_id: approval.id, overheadMs: overheadMs() });
           return { result, approval_id: approval.id };
         } catch {
           return reply.code(502).send({ error: "upstream_failed" });
@@ -614,7 +627,8 @@ export function buildGateway() {
         await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: argsHash, decision: "need_approval",
           policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null,
-          matched: verdict.matched, reason: verdict.reason, approval_id: row.id });
+          matched: verdict.matched, reason: verdict.reason, approval_id: row.id,
+          overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.request",
           resource_type: "approval", resource_id: row.id, result: "pending" });
         void notify(server.workspace_id, "approval.requested",
@@ -624,7 +638,7 @@ export function buildGateway() {
 
       try {
         const result = await forward(client, server, tool, args as Record<string, unknown>, caller,
-          { policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null, matched: verdict.matched });
+          { policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null, matched: verdict.matched, overheadMs: overheadMs() });
         return { result };
       } catch {
         return reply.code(502).send({ error: "upstream_failed" });

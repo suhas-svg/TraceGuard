@@ -9,6 +9,7 @@ import { estimateCostMicro } from "./cost.js";
 import { runAssertion } from "./assertions.js";
 import { notify } from "./notify.js";
 import { captureRawEnabled, redactDeep } from "./redact.js";
+import { guardedFetch } from "./upstream.js";
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
   const found = await client.query("SELECT id FROM workspaces WHERE name = 'default'");
@@ -30,19 +31,108 @@ interface ExecConfig {
   fail?: string;
 }
 
-// Scripted reference adapter. It replays the case's declared behavior against
-// the mock tool surface and records a real run, so evaluation tests the
-// platform's record and compare path deterministically. Live model adapters
-// arrive later behind the same run-writing contract.
+// Which adapter executes a case. Both write through the run contract below,
+// so assertions, latency and cost recording are identical either way.
+interface AdapterConfig {
+  type: "scripted" | "http";
+  url?: string;
+}
+
+// What a case produced, whichever adapter produced it.
+interface Produced {
+  output: string;
+  tools: { tool: string; args?: Record<string, unknown>; status?: string; error_type?: string }[];
+  status: string;
+  errorType: string | null;
+  errorDetail?: string;
+  provider: string;
+  model: string;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cachedTokens: number | null;
+  durationMs: number;
+}
+
+// Scripted reference adapter. It replays the case's declared behavior and
+// records a real run, so evaluation tests the platform's record and compare
+// path deterministically and without a network.
+async function scriptedResult(exec: ExecConfig, model: string): Promise<Produced> {
+  const started = Date.now();
+  // Bounded pretend work so latency is measured, not asserted.
+  await new Promise((r) => setTimeout(r, Math.min(Math.max(exec.latency_ms ?? 0, 0), 2000)));
+  const tools = exec.tools ?? [];
+  const failedTool = tools.find((t) => (t.status ?? "success") === "failed");
+  return {
+    output: exec.output ?? "", tools,
+    status: exec.fail || failedTool ? "failed" : "success",
+    errorType: exec.fail ?? failedTool?.error_type ?? null,
+    provider: exec.provider ?? "scripted", model: exec.model ?? model,
+    inputTokens: exec.input_tokens ?? null, outputTokens: exec.output_tokens ?? null,
+    cachedTokens: exec.cached_tokens ?? null, durationMs: Date.now() - started
+  };
+}
+
+// Live adapter (FR-021). The case's input goes to a registered HTTP endpoint
+// and its response is what gets recorded, so the case runs through a real
+// agent instead of a replay of what it was declared to do.
+//
+// The call goes through the same guard as every other outbound request, so an
+// adapter cannot reach an address the gateway would refuse. A failure here is
+// recorded as a failed case rather than thrown: one unreachable endpoint must
+// not discard the results of the cases that did run.
+// shortcut: the timeout is the platform-wide upstream one (UPSTREAM_TIMEOUT_MS,
+// 60s default), not per-adapter; give adapters their own when one needs faster.
+async function callHttpAdapter(
+  adapter: AdapterConfig, exec: ExecConfig, model: string, agentName: string, caseName: string
+): Promise<Produced> {
+  const started = Date.now();
+  const failed = (errorType: string, detail: string): Produced => ({
+    output: "", tools: [], status: "failed", errorType, errorDetail: detail,
+    provider: "http", model, inputTokens: null, outputTokens: null,
+    cachedTokens: null, durationMs: Date.now() - started
+  });
+  try {
+    const res = await guardedFetch(adapter.url as string, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ case: caseName, agent: agentName,
+        input: exec.input ?? null, model })
+    });
+    if (!res.ok) return failed("adapter_http_error", `endpoint answered ${res.status}`);
+    const body = (await res.json()) as Record<string, unknown>;
+    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+    // A live agent naturally names the tools it used; the object form is
+    // accepted too, so it can carry a status and an error type.
+    const tools = (Array.isArray(body.tools) ? body.tools : []).map((t) =>
+      typeof t === "string" ? { tool: t } : (t as Produced["tools"][number]));
+    const failedTool = tools.find((t) => (t.status ?? "success") === "failed");
+    const output = typeof body.output === "string" ? body.output
+      : body.output === undefined || body.output === null ? ""
+      : JSON.stringify(body.output);
+    return {
+      output, tools,
+      status: body.status === "failed" || failedTool ? "failed" : "success",
+      errorType: failedTool?.error_type ?? null,
+      provider: typeof body.provider === "string" ? body.provider : "http",
+      model: typeof body.model === "string" ? body.model : model,
+      inputTokens: num(body.input_tokens), outputTokens: num(body.output_tokens),
+      cachedTokens: num(body.cached_tokens), durationMs: Date.now() - started
+    };
+  } catch (err: unknown) {
+    return failed("adapter_unreachable", err instanceof Error ? err.message : String(err));
+  }
+}
+
 async function executeCase(
   client: PoolClient,
   workspaceId: string,
   agentId: string,
   agentName: string,
   exec: ExecConfig,
-  model: string
+  model: string,
+  adapter: AdapterConfig,
+  caseName: string
 ): Promise<{ runId: string; output: string; tools: string[]; status: string; latencyMs: number; costMicro: number | null }> {
-  const started = Date.now();
   const runId = randomUUID();
   const rootId = randomUUID();
   const now = new Date().toISOString();
@@ -70,43 +160,48 @@ async function executeCase(
   // pass as every other span attribute.
   await addSpan(rootId, null, "run.started",
     exec.input === undefined ? {} : { attributes: { input: exec.input } });
-  // Bounded pretend work so latency is measured, not asserted.
-  await new Promise((r) => setTimeout(r, Math.min(Math.max(exec.latency_ms ?? 0, 0), 2000)));
-  const tools = exec.tools ?? [];
+  const produced = adapter.type === "http"
+    ? await callHttpAdapter(adapter, exec, model, agentName, caseName)
+    : await scriptedResult(exec, model);
   await addSpan(randomUUID(), rootId, "model.request", {
-    duration_ms: Date.now() - started, provider: exec.provider ?? "scripted",
-    model: exec.model ?? model, input_tokens: exec.input_tokens ?? null,
-    output_tokens: exec.output_tokens ?? null, cached_tokens: exec.cached_tokens ?? null
+    duration_ms: produced.durationMs, provider: produced.provider, model: produced.model,
+    input_tokens: produced.inputTokens, output_tokens: produced.outputTokens,
+    cached_tokens: produced.cachedTokens,
+    // A live call's outcome belongs on its span. The scripted path keeps its
+    // own span at success and reports only on the run, as it always has.
+    ...(adapter.type === "http" ? { status: produced.status, error_type: produced.errorType } : {}),
+    ...(produced.errorDetail
+      ? { attributes: redactDeep({ error_detail: produced.errorDetail },
+          { captureRaw: captureRawEnabled() }) }
+      : {})
   });
   const toolNames: string[] = [];
-  for (const t of tools) {
+  for (const t of produced.tools) {
     toolNames.push(t.tool);
     await addSpan(randomUUID(), rootId, "tool.invocation", {
       duration_ms: 5, status: t.status ?? "success", error_type: t.error_type ?? null,
       attributes: redactDeep({ tool: t.tool, args: t.args ?? {} }, { captureRaw: captureRawEnabled() })
     });
   }
-  const failedTool = tools.find((t) => (t.status ?? "success") === "failed");
-  const status = exec.fail || failedTool ? "failed" : "success";
   await client.query("UPDATE runs SET status=$2, ended_at=now(), error_type=$3 WHERE id=$1",
-    [runId, status, exec.fail ?? failedTool?.error_type ?? null]);
+    [runId, produced.status, produced.errorType]);
 
   const price = await client.query(
     "SELECT * FROM pricing WHERE provider=$1 AND model=$2 ORDER BY effective_from DESC LIMIT 1",
-    [exec.provider ?? "scripted", exec.model ?? model]
+    [produced.provider, produced.model]
   );
   // Unknown price or unknown usage stays NULL, never zero (same rule as the
   // usage endpoint; comparisons must not read "no price" as "$0.00").
-  const priced = price.rows[0] != null && (exec.input_tokens != null || exec.output_tokens != null);
+  const priced = price.rows[0] != null && (produced.inputTokens != null || produced.outputTokens != null);
   const cost = priced
-    ? estimateCostMicro(exec.input_tokens ?? 0, exec.output_tokens ?? 0, Number(exec.cached_tokens ?? 0), {
+    ? estimateCostMicro(produced.inputTokens ?? 0, produced.outputTokens ?? 0, produced.cachedTokens ?? 0, {
         input_price_per_million: Number(price.rows[0].input_price_per_million),
         output_price_per_million: Number(price.rows[0].output_price_per_million),
         cached_input_price_per_million: Number(price.rows[0].cached_input_price_per_million)
       })
     : null;
-  return { runId, output: exec.output ?? "", tools: toolNames, status,
-    latencyMs: Date.now() - started, costMicro: cost };
+  return { runId, output: produced.output, tools: toolNames, status: produced.status,
+    latencyMs: produced.durationMs, costMicro: cost };
 }
 
 export function registerEvalRoutes(app: FastifyInstance) {
@@ -205,13 +300,25 @@ export function registerEvalRoutes(app: FastifyInstance) {
     cost_cap_micro: z.number().int().min(0).default(0),
     // Per-run behavior overrides keyed by case name. This is what makes two
     // versions comparable on one locked dataset: same cases, different code.
-    exec_overrides: z.record(z.record(z.unknown())).default({})
+    exec_overrides: z.record(z.record(z.unknown())).default({}),
+    // FR-021: a case executes through a registered adapter. The scripted one
+    // replays the case's declared behavior; the http one runs it against a
+    // live endpoint.
+    adapter: z.object({
+      type: z.enum(["scripted", "http"]).default("scripted"),
+      url: z.string().url().optional()
+    }).default({ type: "scripted" })
   });
 
   app.post("/v1/evaluations/suites/:id/runs", async (req, reply) => {
     const { id } = req.params as { id: string };
     const parsed = runSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_eval_run" });
+    // Named rather than folded into invalid_eval_run: an http adapter with no
+    // endpoint is the one mistake a caller makes here, and it is worth saying.
+    if (parsed.data.adapter.type === "http" && !parsed.data.adapter.url) {
+      return reply.code(400).send({ error: "adapter_url_required" });
+    }
     const client = await pool.connect();
     try {
       // Lock the suite row while snapshotting its cases, so the dataset this
@@ -232,17 +339,23 @@ export function registerEvalRoutes(app: FastifyInstance) {
       await client.query("COMMIT");
       const workspaceId = await defaultWorkspaceId(client);
       const cfg = parsed.data;
+      const adapter = cfg.adapter as AdapterConfig;
       let agent = await client.query(
         "SELECT id FROM agents WHERE workspace_id = $1 AND name = $2", [workspaceId, cfg.agent_name]
       );
       if (!agent.rows[0]) {
         agent = await client.query(
-          "INSERT INTO agents (workspace_id, name, adapter_type, config_fingerprint) VALUES ($1,$2,'scripted',$3) RETURNING id",
-          [workspaceId, cfg.agent_name, cfg.config_fingerprint]
+          "INSERT INTO agents (workspace_id, name, adapter_type, config_fingerprint) VALUES ($1,$2,$3,$4) RETURNING id",
+          [workspaceId, cfg.agent_name, adapter.type, cfg.config_fingerprint]
         );
-      } else if (cfg.config_fingerprint) {
-        await client.query("UPDATE agents SET config_fingerprint = $2 WHERE id = $1",
-          [agent.rows[0].id, cfg.config_fingerprint]);
+      } else {
+        // Re-registering a name under a different adapter must not leave it
+        // pointing at the old one.
+        await client.query(
+          `UPDATE agents SET adapter_type = $2,
+             config_fingerprint = CASE WHEN $3 = '' THEN config_fingerprint ELSE $3 END
+           WHERE id = $1`,
+          [agent.rows[0].id, adapter.type, cfg.config_fingerprint]);
       }
       const er = await client.query(
         `INSERT INTO eval_runs (suite_id, suite_version, agent_id, agent_name,
@@ -270,7 +383,7 @@ export function registerEvalRoutes(app: FastifyInstance) {
           if (exec.output === undefined && typeof c.expected === "string") exec.output = c.expected;
           if (exec.input === undefined) exec.input = c.input_payload as string | undefined;
           const out = await executeCase(client, workspaceId, agent.rows[0].id,
-            cfg.agent_name, exec, cfg.model);
+            cfg.agent_name, exec, cfg.model, adapter, c.name);
           // Unknown costs cannot count against the cap, which turns the cap
           // into a no-op exactly when spend is unknown. Stop and name the
           // reason instead of running the whole locked dataset unguarded while
