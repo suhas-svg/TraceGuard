@@ -291,6 +291,7 @@ export default function EvalsView({ onOpenRun }: { onOpenRun: (id: string) => vo
   const [openRun, setOpenRun] = useState("");
   const [compareIds, setCompareIds] = useState("");
   const [compare, setCompare] = useState<Record<string, unknown>[] | null>(null);
+  const [compareError, setCompareError] = useState("");
   const [error, setError] = useState("");
   const queryClient = useQueryClient();
   const suitesQuery = useQuery({ queryKey: ["eval-suites"], queryFn: () => listSuites() });
@@ -350,7 +351,14 @@ export default function EvalsView({ onOpenRun }: { onOpenRun: (id: string) => vo
           onSubmit={(e) => {
             e.preventDefault();
             const ids = compareIds.split(",").map((s) => s.trim()).filter(Boolean);
-            if (ids.length >= 2) compareEvalRuns(ids).then((c) => setCompare(c.runs));
+            if (ids.length >= 2) {
+              // Without the catch a failed compare left the panel blank, which
+              // reads the same as "no results".
+              setCompareError("");
+              compareEvalRuns(ids)
+                .then((c) => setCompare(c.runs))
+                .catch((e) => setCompareError(e instanceof Error ? e.message : "compare failed"));
+            }
           }}
         >
           <Input
@@ -361,6 +369,7 @@ export default function EvalsView({ onOpenRun }: { onOpenRun: (id: string) => vo
           />
           <Button variant="primary" type="submit">Compare</Button>
         </form>
+        {compareError && <div className="mt-2"><Alert>{compareError}</Alert></div>}
         {compare && (
           <div className="mt-3">
             <Table>

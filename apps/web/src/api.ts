@@ -2,7 +2,9 @@
 // policy edits and approvals stay in API clients with the right keys.
 const stored = (k: string, fallback: string) => {
   try {
-    return localStorage.getItem(k) ?? fallback;
+    // An empty stored value is unset, not a value: a cleared field used to
+    // win over the default and turn every request into a relative URL.
+    return localStorage.getItem(k) || fallback;
   } catch {
     return fallback;
   }
@@ -60,12 +62,27 @@ export interface Span {
   attributes: Record<string, unknown>;
 }
 
+// Carries the HTTP status, so callers branch on 403 versus 401 instead of
+// pattern-matching an English message.
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+async function explain(res: Response): Promise<string> {
+  // The API answers with { error: "code" }; a bare status tells the operator
+  // nothing about which code it was.
+  const body = (await res.json().catch(() => ({}))) as { error?: string };
+  return body.error ?? `request failed: ${res.status}`;
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${settings.url}${path}`, {
     headers: { Authorization: `Bearer ${settings.key}` }
   });
-  if (res.status === 401) throw new Error("unauthorized: check the API key in settings");
-  if (!res.ok) throw new Error(`request failed: ${res.status}`);
+  if (res.status === 401) throw new ApiError("unauthorized: check the API key in settings", 401);
+  if (!res.ok) throw new ApiError(await explain(res), res.status);
   return res.json() as Promise<T>;
 }
 
@@ -202,10 +219,9 @@ async function postApi<T>(path: string, body: unknown, method = "POST"): Promise
     },
     body: body === undefined ? undefined : JSON.stringify(body)
   });
-  if (res.status === 401) throw new Error("unauthorized: check the API key in settings");
+  if (res.status === 401) throw new ApiError("unauthorized: check the API key in settings", 401);
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error((data as { error?: string }).error ?? `request failed: ${res.status}`);
+    throw new ApiError(await explain(res), res.status);
   }
   return res.json() as Promise<T>;
 }
@@ -290,10 +306,9 @@ async function gw<T>(path: string, init?: RequestInit, approver = false): Promis
       ...(init?.headers ?? {})
     }
   });
-  if (res.status === 401) throw new Error("unauthorized: check the key in settings");
+  if (res.status === 401) throw new ApiError("unauthorized: check the key in settings", 401);
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error((body as { error?: string }).error ?? `request failed: ${res.status}`);
+    throw new ApiError(await explain(res), res.status);
   }
   return res.json() as Promise<T>;
 }
@@ -352,8 +367,10 @@ export const gwApi = {
     gw<Policy>("/v1/policies", { method: "POST", body: JSON.stringify(p) }),
   updatePolicy: (id: string, p: Record<string, unknown>) =>
     gw<Policy>(`/v1/policies/${id}`, { method: "PUT", body: JSON.stringify(p) }),
+  // The queue is fetched with the approver key: the gateway only opens the
+  // sealed arguments for a caller holding the approve scope.
   approvals: (status?: string) =>
-    gw<{ items: Approval[] }>(`/v1/approvals${status ? `?status=${status}` : ""}`),
+    gw<{ items: Approval[] }>(`/v1/approvals${status ? `?status=${status}` : ""}`, undefined, true),
   decide: (id: string, approved: boolean, reason: string) =>
     gw<Approval>(`/v1/approvals/${id}/decision`,
       { method: "POST", body: JSON.stringify({ approved, reason }) }, true),
@@ -454,7 +471,9 @@ export const opsApi = {
   createWebhook: (w: Record<string, unknown>) => postApi<Webhook>("/v1/webhooks", w),
   deleteWebhook: (id: string) => deleteApi<{ ok: boolean }>(`/v1/webhooks/${id}`),
   deliveries: (status?: string) =>
-    get<{ items: Delivery[] }>(`/v1/webhooks/deliveries${status ? `?status=${status}` : ""}`),
+    // The API caps this at 200; ask for the cap and say so in the UI rather
+    // than silently dropping everything past the newest 50.
+    get<{ items: Delivery[] }>(`/v1/webhooks/deliveries?limit=200${status ? `&status=${status}` : ""}`),
   retryDelivery: (id: string) =>
     postApi<{ status: string; lastError: string | null }>(`/v1/webhooks/deliveries/${id}/retry`, {}),
   retentionRules: () => get<{ items: RetentionRule[] }>("/v1/retention/rules"),

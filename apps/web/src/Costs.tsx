@@ -104,8 +104,15 @@ export default function CostsView() {
 
   const load = () => {
     setError("");
+    // Number("") is 0 and Number("x") is NaN, and an Invalid Date throws on
+    // toISOString: the Compare button used to do nothing at all.
+    const span = Number(days);
+    if (!Number.isFinite(span) || span <= 0) {
+      setError("days must be a positive number");
+      return;
+    }
     const end = new Date();
-    const start = new Date(end.getTime() - Number(days || 30) * 86400000);
+    const start = new Date(end.getTime() - span * 86400000);
     opsApi
       .compareCosts(start.toISOString(), end.toISOString(), provider || undefined)
       .then((r) => setRows(r.rows))

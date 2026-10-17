@@ -53,7 +53,7 @@ export default function WebhooksView() {
               <Input aria-label="Webhook name" placeholder="alerts" value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })} required />
             </Field>
-            <Field label="HMAC secret (optional)">
+            <Field label="HMAC secret (required)">
               <Input aria-label="Webhook secret" placeholder="shared secret" value={form.secret}
                 onChange={(e) => setForm({ ...form, secret: e.target.value })} />
             </Field>
@@ -102,6 +102,11 @@ export default function WebhooksView() {
         </Card>
       )}
       <h3 className="mb-2 text-sm font-semibold text-ink-700">Deliveries</h3>
+      {deliveries.length >= 200 && (
+        <p className="mb-2 text-xs text-ink-500">
+          Showing the newest 200 attempts; older ones are not listed here.
+        </p>
+      )}
       {deliveries.length === 0 ? (
         <Empty hint="No deliveries yet. Trigger a denial or approval to see one." />
       ) : (

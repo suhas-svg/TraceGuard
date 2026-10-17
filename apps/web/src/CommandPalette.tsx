@@ -11,13 +11,20 @@ export function Palette({ open, onClose, items }: {
   const [query, setQuery] = useState("");
   const [index, setIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
   const matches = matchItems(items, query);
 
   useEffect(() => {
     if (open) {
+      openerRef.current = document.activeElement as HTMLElement | null;
       setQuery("");
       setIndex(0);
       inputRef.current?.focus();
+    } else {
+      // Hand focus back to whatever opened the palette, so a keyboard user is
+      // not dropped at the top of the page.
+      openerRef.current?.focus?.();
+      openerRef.current = null;
     }
   }, [open]);
 
@@ -32,7 +39,16 @@ export function Palette({ open, onClose, items }: {
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-center pt-[15vh]" role="dialog" aria-label="Command palette">
+    // Escape lives on the container, not the input: focus that leaves the
+    // input used to leave no handler in reach, so the overlay could only be
+    // closed with a mouse. aria-modal tells assistive tech the rest is inert.
+    <div
+      className="fixed inset-0 z-50 flex justify-center pt-[15vh]"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Command palette"
+      onKeyDown={(e) => { if (e.key === "Escape") { e.preventDefault(); onClose(); } }}
+    >
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
       <div className="relative h-fit w-[32rem] max-w-[90vw] overflow-hidden rounded-lg border border-ink-200 bg-surface shadow-xl">
         <input
@@ -45,7 +61,6 @@ export function Palette({ open, onClose, items }: {
             if (e.key === "ArrowDown") { e.preventDefault(); setIndex((i) => Math.min(i + 1, matches.length - 1)); }
             else if (e.key === "ArrowUp") { e.preventDefault(); setIndex((i) => Math.max(i - 1, 0)); }
             else if (e.key === "Enter") { e.preventDefault(); choose(matches[index]); }
-            else if (e.key === "Escape") { e.preventDefault(); onClose(); }
           }}
           className="w-full border-b border-ink-100 bg-transparent px-4 py-3 text-sm text-ink-800 placeholder:text-ink-300 focus:outline-none"
         />

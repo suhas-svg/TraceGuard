@@ -3,6 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 import {
   apiGet, apiPost, event, gwCall, gwPost, ingest, seedRun, setKeys, upstreamHits
 } from "./helpers";
+import { API_KEY, GATEWAY_URL } from "./env";
 
 // Scenarios A-F from the specification, run against the real stack. The
 // describe is serial and shares one database and one upstream hit counter;
@@ -172,6 +173,52 @@ test("scenario E: a denied call never reaches the upstream", async ({ page, requ
   await page.goto(`/#/runs/${runId}`);
   await page.getByText("tool.invocation").first().click();
   await expect(page.getByText(new RegExp(`e2e-deny-${tag}`)).first()).toBeVisible();
+});
+
+test("scenario G: editing a second rule does not inherit the first rule's fields", async ({ page, request }) => {
+  const nameA = `stale-a-${tag}`;
+  const nameB = `stale-b-${tag}`;
+  for (const policy of [
+    { name: nameA, server_id: serverId, tool_name: "read_file", effect: "allow", priority: 1 },
+    { name: nameB, server_id: serverId, tool_name: "wipe_disk", effect: "deny", priority: 2 }
+  ]) {
+    const res = await gwPost(request, "/v1/policies", policy);
+    expect(res.status()).toBe(201);
+  }
+
+  await setKeys(page);
+  await page.goto("/");
+  await openTab(page, "Policy");
+  const rowFor = (name: string) => page.locator("tr").filter({ hasText: name });
+
+  await rowFor(nameA).getByRole("button", { name: "Edit" }).click();
+  await expect(page.getByLabel("Rule name")).toHaveValue(nameA);
+
+  // Clicking Edit on a second rule while the first editor is open must rebind
+  // the form. Without a key on the form component React reuses the instance,
+  // the fields keep rule A's values, and saving writes them onto rule B.
+  await rowFor(nameB).getByRole("button", { name: "Edit" }).click();
+  await expect(page.getByLabel("Rule name")).toHaveValue(nameB);
+  await expect(page.getByLabel("Tool name")).toHaveValue("wipe_disk");
+
+  await page.getByRole("button", { name: /^Save as v/ }).click();
+
+  // The new version carries rule B's own fields, and rule A was not touched.
+  await expect(async () => {
+    const listed = await request.get(`${GATEWAY_URL}/v1/policies?limit=200`, {
+      headers: { authorization: `Bearer ${API_KEY}` }
+    });
+    expect(listed.status()).toBe(200);
+    const items = (await listed.json()).items as
+      { name: string; tool_name: string; superseded_by: string | null }[];
+    const liveB = items.filter((p) => p.name === nameB && p.superseded_by === null);
+    // One live head for B, at the new version, still named and tooled as B.
+    expect(liveB.length).toBe(1);
+    expect(liveB[0].tool_name).toBe("wipe_disk");
+    const liveA = items.filter((p) => p.name === nameA && p.superseded_by === null);
+    expect(liveA.length).toBe(1);
+    expect(liveA[0].tool_name).toBe("read_file");
+  }).toPass({ timeout: 10_000 });
 });
 
 test("scenario F: two evaluation versions compare side by side", async ({ page, request }) => {
