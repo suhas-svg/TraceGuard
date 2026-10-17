@@ -68,6 +68,21 @@ jobs:
       - run: pip install "./sdks/python[dev]"
       - run: python -m pytest sdks/python
 
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      # check.py renders the kustomization, which references the gitignored
+      # secret file. The example holds only placeholders, so the drift checks
+      # (unresolvable refs, dangling selectors, missing probes or resources)
+      # run on every change instead of only when someone remembers.
+      - run: cp infra/k8s/secrets.example.yaml infra/k8s/secrets.yaml
+      - run: python infra/k8s/check.py
+
   e2e:
     runs-on: ubuntu-latest
     needs: [build-and-test]

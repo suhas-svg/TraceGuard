@@ -14,10 +14,14 @@ resources:
 images:
   - name: traceguard/api
     newName: ghcr.io/suhas-svg/traceguard-api
-    newTag: latest
+    newTag: v1.16.0
   - name: traceguard/web
     newName: ghcr.io/suhas-svg/traceguard-web
-    newTag: latest
+    newTag: v1.16.0
   - name: traceguard/migrate
     newName: ghcr.io/suhas-svg/traceguard-migrate
-    newTag: latest
+    newTag: v1.16.0
+
+# newTag must name a published image (a released version, or a digest via
+# newName: repo@sha256:...). The floating :latest tag made two applies of the
+# same manifest run different code and left a rollout nothing to roll back to.

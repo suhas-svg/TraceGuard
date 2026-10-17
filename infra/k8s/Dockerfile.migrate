@@ -1,2 +1,4 @@
 FROM postgres:17-alpine
 COPY apps/api/migrations /migrations
+# The migrate job only reads and applies SQL, so it never needs root.
+USER postgres

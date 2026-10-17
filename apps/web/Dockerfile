@@ -8,4 +8,7 @@ RUN npm run build --workspace=@traceguard/web
 
 FROM nginx:alpine
 COPY --from=build /app/apps/web/dist /usr/share/nginx/html
+# nginx:alpine already runs its workers as the unprivileged nginx user; this
+# only pins the master to a non-root uid for the k8s runAsNonRoot rule.
+USER nginx
 EXPOSE 80

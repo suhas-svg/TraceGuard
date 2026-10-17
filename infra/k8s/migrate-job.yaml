@@ -9,12 +9,18 @@ spec:
   backoffLimit: 3
   template:
     spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
       restartPolicy: OnFailure
       # The Job is applied at the same time as postgres, so the container must
       # wait for the database itself — compose does this with depends_on.
       initContainers:
         - name: wait-for-postgres
-          image: traceguard/migrate:latest
+          image: traceguard/migrate:v1.16.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
           command: ["/bin/sh", "-c"]
           args:
             - until pg_isready -h postgres -p 5432; do echo waiting for postgres; sleep 2; done
@@ -23,7 +29,10 @@ spec:
             limits: { memory: "128Mi" }
       containers:
         - name: migrate
-          image: traceguard/migrate:latest
+          image: traceguard/migrate:v1.16.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
           command: ["/bin/sh", "-c"]
           args:
             - |
