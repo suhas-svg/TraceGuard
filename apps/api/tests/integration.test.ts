@@ -962,9 +962,18 @@ describe("integration and security", () => {
   });
 
   it("caps a project's spend, measured from the project rather than a counter", async () => {
-    // The default workspace is the project. A project budget measures what the
-    // project actually spent, so a one-micro cap is already exceeded by the
-    // spend in this database and the first check must refuse it.
+    // The default workspace is the project. Seed spend inside the test rather
+    // than measuring whatever earlier tests left behind: on a clean database
+    // there is nothing to find, and the check would pass for the wrong reason.
+    const prov = `proj-${tag}`;
+    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+      payload: { provider: prov, model: "m", input_price_per_million: 1_000_000,
+        output_price_per_million: 0 } });
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: {
+      events: [ ev({ run_id: randomUUID(), event_type: "model.request",
+        timestamp: new Date().toISOString(), provider: prov, model: "m",
+        input_tokens: 500, output_tokens: 0, usage_source: "provider_reported" }) ] } });
+
     const ws = await api.inject({ method: "GET", url: "/v1/workspaces", headers: key });
     const def = ws.json().items.find((w: { name: string }) => w.name === "default");
     const b = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
