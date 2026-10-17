@@ -153,6 +153,45 @@ describe("integration and security", () => {
     expect(upstreamHits).toBe(before + 1);
   });
 
+  it("records what the gateway spent deciding, on allow and on deny", async () => {
+    // The value is read before forwarding, so it is the gateway's own work
+    // rather than the call's duration. This asserts it is recorded on both
+    // paths and stays below the whole call; the exclusion itself is a property
+    // of where the clock is read, not something a fast upstream can show.
+    const srv = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `ovh-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp` } });
+    expect(srv.statusCode).toBe(201);
+    const id = srv.json().id;
+    await gw.inject({ method: "POST", url: `/v1/servers/${id}/discover`, headers: key });
+    await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+      payload: { name: `ovh-allow-${tag}`, server_id: id, tool_name: "echo", effect: "allow" } });
+
+    const started = Date.now();
+    const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: id, tool: "echo", arguments: { text: "hi" }, caller: `ovh-${tag}` } });
+    const total = Date.now() - started;
+    expect(call.statusCode).toBe(200);
+
+    const row = await pool.query(
+      `SELECT overhead_ms FROM policy_decisions
+        WHERE server_id = $1 AND tool_name = 'echo' ORDER BY timestamp DESC LIMIT 1`, [id]);
+    // Recorded at all, which is what makes section 14's budget measurable
+    // instead of inferred from a whole-call figure.
+    expect(row.rows[0].overhead_ms).not.toBeNull();
+    expect(Number(row.rows[0].overhead_ms)).toBeGreaterThanOrEqual(0);
+    expect(Number(row.rows[0].overhead_ms)).toBeLessThan(total);
+
+    // A denied call never reaches an upstream and is measured too, so the
+    // number is comparable across decisions rather than only across allows.
+    const denied = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: id, tool: "ghost", arguments: {}, caller: `ovh-${tag}` } });
+    expect(denied.statusCode).toBe(403);
+    const denyRow = await pool.query(
+      `SELECT overhead_ms FROM policy_decisions
+        WHERE server_id = $1 AND tool_name = 'ghost' ORDER BY timestamp DESC LIMIT 1`, [id]);
+    expect(denyRow.rows[0].overhead_ms).not.toBeNull();
+  });
+
   it("holds approval calls, refuses agent decisions, enforces single use and expiry", async () => {
     const before = upstreamHits;
     // A gateway-scoped agent key stands in for the agent here; the shared
@@ -1048,6 +1087,91 @@ describe("integration and security", () => {
       url: `/v1/reconciliation/compare?${q}&group_by=nope`, headers: key });
     expect(bad.statusCode).toBe(400);
     expect(bad.json().error).toBe("invalid_group_by");
+  });
+
+  it("runs a case through a live adapter and records what it answered", async () => {
+    // A real endpoint, so this asserts a case reached a live agent rather than
+    // replaying what the case declared about itself.
+    const seen: { value?: { case?: string; agent?: string; input?: unknown } } = {};
+    const adapter = createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => { raw += c; });
+      req.on("end", () => {
+        seen.value = JSON.parse(raw || "{}");
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ output: "live hello", tools: ["lookup"],
+          input_tokens: 40, output_tokens: 8 }));
+      });
+    });
+    await new Promise<void>((r) => adapter.listen(0, "127.0.0.1", r));
+    const port = (adapter.address() as { port: number }).port;
+    try {
+      const suite = await api.inject({ method: "POST", url: "/v1/evaluations/suites", headers: key,
+        payload: { name: `live-suite-${tag}` } });
+      const suiteId = suite.json().id;
+      await api.inject({ method: "POST", url: `/v1/evaluations/suites/${suiteId}/cases`, headers: key,
+        payload: { name: "live-case", input_payload: { prompt: "ping" },
+          assertions: [{ type: "contains", value: "live hello" },
+            { type: "tools", names: ["lookup"] }] } });
+
+      const run = await api.inject({ method: "POST", url: `/v1/evaluations/suites/${suiteId}/runs`,
+        headers: key, payload: { agent_name: `live-agent-${tag}`, trials: 2,
+          adapter: { type: "http", url: `http://127.0.0.1:${port}/invoke` } } });
+      expect(run.statusCode).toBe(201);
+      const results = run.json().results;
+      expect(results.length).toBe(2);
+      // The endpoint received the case, its input and the agent name, so the
+      // case really executed through it. Nothing scripted would have called.
+      expect(seen.value?.case).toBe("live-case");
+      expect(seen.value?.input).toEqual({ prompt: "ping" });
+      expect(seen.value?.agent).toBe(`live-agent-${tag}`);
+      // Assertions ran against the live response, including its tool list.
+      expect(results.every((r: { passed: boolean }) => r.passed)).toBe(true);
+      // Each result carries its own run, which is what the requirement asks.
+      const runIds = results.map((r: { agent_run_id: string }) => r.agent_run_id);
+      expect(new Set(runIds).size).toBe(2);
+      // The agent is registered under the adapter that actually ran it.
+      const agent = await pool.query("SELECT adapter_type FROM agents WHERE name = $1",
+        [`live-agent-${tag}`]);
+      expect(agent.rows[0].adapter_type).toBe("http");
+      // Live usage is recorded and priced like any other run's.
+      const spans = await pool.query(
+        "SELECT input_tokens, output_tokens, provider FROM spans WHERE run_id = $1", [runIds[0]]);
+      const usage = spans.rows.find((s) => s.input_tokens != null);
+      expect(Number(usage.input_tokens)).toBe(40);
+      expect(usage.provider).toBe("http");
+    } finally {
+      adapter.close();
+    }
+  });
+
+  it("records a failed case when the live adapter cannot be reached", async () => {
+    const suite = await api.inject({ method: "POST", url: "/v1/evaluations/suites", headers: key,
+      payload: { name: `dead-suite-${tag}` } });
+    const suiteId = suite.json().id;
+    await api.inject({ method: "POST", url: `/v1/evaluations/suites/${suiteId}/cases`, headers: key,
+      payload: { name: "dead-case", assertions: [{ type: "contains", value: "anything" }] } });
+
+    // Nothing listens on this port. One unreachable endpoint must fail its own
+    // case, not discard the results of the run with a 500.
+    const run = await api.inject({ method: "POST", url: `/v1/evaluations/suites/${suiteId}/runs`,
+      headers: key, payload: { agent_name: `dead-agent-${tag}`,
+        adapter: { type: "http", url: "http://127.0.0.1:9/invoke" } } });
+    expect(run.statusCode).toBe(201);
+    const result = run.json().results[0];
+    expect(result.passed).toBe(false);
+    expect(result.error_summary).toBeTruthy();
+    const row = await pool.query("SELECT status, error_type FROM runs WHERE id = $1",
+      [result.agent_run_id]);
+    expect(row.rows[0].status).toBe("failed");
+    expect(row.rows[0].error_type).toBe("adapter_unreachable");
+
+    // The endpoint is required by this adapter, and naming that beats the
+    // generic invalid-body error.
+    const bad = await api.inject({ method: "POST", url: `/v1/evaluations/suites/${suiteId}/runs`,
+      headers: key, payload: { adapter: { type: "http" } } });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().error).toBe("adapter_url_required");
   });
 
   it("filters runs by date window, provider, model and evaluation run", async () => {
