@@ -50,6 +50,7 @@ jobs:
       - run: npm install --ignore-scripts
       - run: ./node_modules/.bin/tsc -p packages/schemas/tsconfig.json
       - run: ./node_modules/.bin/tsc -p packages/canonical-json/tsconfig.json
+      - run: ./node_modules/.bin/tsc -p packages/policy-signing/tsconfig.json
       - run: ./node_modules/.bin/tsc -p packages/mcp-client-shim/tsconfig.json
       - run: ./node_modules/.bin/tsc -p apps/api/tsconfig.json
       - run: ./node_modules/.bin/tsc -p apps/web/tsconfig.json
@@ -59,6 +60,7 @@ jobs:
       - run: ./node_modules/.bin/vitest run --root apps/api
       - run: ./node_modules/.bin/vitest run --root apps/web
       - run: ./node_modules/.bin/vitest run --root packages/canonical-json
+      - run: ./node_modules/.bin/vitest run --root packages/policy-signing
       - run: ./node_modules/.bin/vitest run --root packages/mcp-client-shim
       - run: ./node_modules/.bin/vitest run --root sdks/typescript
 
