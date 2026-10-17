@@ -141,15 +141,15 @@ test("scenario D: an approval-protected call waits for a human, then executes", 
     .getByRole("button", { name: "Approved", exact: true }).click();
   await page.getByRole("button", { name: "Run now", exact: true }).click();
 
-  // Running consumes the approval, so the card drops out of the Approved
+  // Running executes the approval, so the card drops out of the Approved
   // filter and its transient result text unmounts with it. Confirm the
   // execution reached the upstream once, then find the row where it now
-  // lives: under the Consumed filter. (Its args are cleared on consume, so
-  // only the status badge and metadata remain.)
+  // lives: under the Executed filter as response_received. (Its args are
+  // cleared on consume, so only the status badge and metadata remain.)
   await expect.poll(() => upstreamHits(request), { timeout: 45_000 }).toBe(before + 1);
   await page.getByRole("group", { name: "Filter approvals" })
-    .getByRole("button", { name: "Consumed", exact: true }).click();
-  await expect(page.getByText("consumed").first()).toBeVisible();
+    .getByRole("button", { name: "Executed", exact: true }).click();
+  await expect(page.getByText("response_received").first()).toBeVisible();
   await expect(page.getByText("read_file").first()).toBeVisible();
   await expect(page.getByText("from e2e").first()).toBeVisible();
 });
