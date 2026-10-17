@@ -49,6 +49,7 @@ jobs:
           cache: npm
       - run: npm install --ignore-scripts
       - run: ./node_modules/.bin/tsc -p packages/schemas/tsconfig.json
+      - run: ./node_modules/.bin/tsc -p packages/mcp-client-shim/tsconfig.json
       - run: ./node_modules/.bin/tsc -p apps/api/tsconfig.json
       - run: ./node_modules/.bin/tsc -p apps/web/tsconfig.json
       - run: ./node_modules/.bin/tsc -p sdks/typescript/tsconfig.json
@@ -56,6 +57,7 @@ jobs:
       - run: for f in apps/api/migrations/*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
       - run: ./node_modules/.bin/vitest run --root apps/api
       - run: ./node_modules/.bin/vitest run --root apps/web
+      - run: ./node_modules/.bin/vitest run --root packages/mcp-client-shim
       - run: ./node_modules/.bin/vitest run --root sdks/typescript
 
   python:
