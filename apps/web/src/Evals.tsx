@@ -238,6 +238,11 @@ function RunSuiteForm({
   const [trials, setTrials] = useState("1");
   const [fingerprint, setFingerprint] = useState("");
   const [costCap, setCostCap] = useState("");
+  // FR-021: the adapter decides whether a case replays its declared behavior or
+  // runs against a live endpoint. The API is the authority on the URL being
+  // required; this just avoids offering a run that cannot start.
+  const [adapterType, setAdapterType] = useState("scripted");
+  const [adapterUrl, setAdapterUrl] = useState("");
   const [busy, setBusy] = useState(false);
   return (
     <div className="mt-6">
@@ -255,7 +260,10 @@ function RunSuiteForm({
               model: model.trim() || "scripted-1",
               trials: Math.min(Math.max(Number(trials) || 1, 1), 5),
               config_fingerprint: fingerprint.trim() || undefined,
-              cost_cap_micro: costCap.trim() ? Math.round(Number(costCap) * 1_000_000) : undefined
+              cost_cap_micro: costCap.trim() ? Math.round(Number(costCap) * 1_000_000) : undefined,
+              adapter: adapterType === "http"
+                ? { type: "http", url: adapterUrl.trim() }
+                : { type: "scripted" }
             })
               .then((r) => onStarted(r.eval_run.id))
               .catch((err) => onError(err instanceof Error ? err.message : "run failed"))
@@ -278,7 +286,21 @@ function RunSuiteForm({
           <Field label="Cost cap ($)">
             <Input className="w-24" value={costCap} onChange={(e) => setCostCap(e.target.value)} />
           </Field>
-          <Button variant="primary" type="submit" disabled={busy || !suiteId}>
+          <Field label="Adapter">
+            <Select value={adapterType} onChange={(e) => setAdapterType(e.target.value)}>
+              <option value="scripted">scripted</option>
+              <option value="http">http</option>
+            </Select>
+          </Field>
+          {adapterType === "http" && (
+            <Field label="Adapter URL">
+              <Input className="w-64" value={adapterUrl}
+                onChange={(e) => setAdapterUrl(e.target.value)}
+                placeholder="https://agent.example.com/invoke" />
+            </Field>
+          )}
+          <Button variant="primary" type="submit"
+            disabled={busy || !suiteId || (adapterType === "http" && !adapterUrl.trim())}>
             {busy ? "Running..." : "Run suite"}
           </Button>
         </form>
