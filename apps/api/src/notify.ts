@@ -21,14 +21,18 @@ async function attempt(
   event: string,
   body: string
 ): Promise<{ status: string; lastError: string | null }> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "x-traceguard-event": event
+  };
+  // An empty secret used to sign with a publicly known key, so a receiver that
+  // verified the header unconditionally accepted any forged delivery. Omit the
+  // header instead: absent means unsigned, and a receiver can refuse it.
+  if (sub.secret) headers["x-traceguard-signature"] = sign(sub.secret, body);
   try {
     const res = await fetch(sub.url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-traceguard-event": event,
-        "x-traceguard-signature": sign(sub.secret ?? "", body)
-      },
+      headers,
       body,
       signal: AbortSignal.timeout(5000)
     });
@@ -82,8 +86,13 @@ export async function notify(
          VALUES ($1,$2,$3::jsonb,$4,1,$5)`,
         [sub.id, event, body, out.status, out.lastError]
       );
-    } catch {
-      // The audit of the alert must not break the call either.
+    } catch (err) {
+      // The audit of the alert must not break the call either, but a silent
+      // failure here means an empty delivery log for events that were sent and
+      // rejected, with nothing on the retry endpoint to retry.
+      console.error("webhook delivery log write failed", {
+        subscription_id: sub.id, event, error: err instanceof Error ? err.message : String(err)
+      });
     }
   }
 }

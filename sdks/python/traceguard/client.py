@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
+import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -23,7 +25,8 @@ class TraceGuardClient:
     agent_name: str = "demo-agent"
     workspace_name: str = "default"
     _queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=500), init=False)
-    _threads: list = field(default_factory=list, init=False)
+    _sender: threading.Thread | None = field(default=None, init=False)
+    _sender_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
     def _post(self, payload: dict) -> None:
         # Background thread, so a generous timeout only delays flush, never
@@ -43,24 +46,58 @@ class TraceGuardClient:
             pass  # telemetry fails open by design
 
     def emit(self, event: dict) -> None:
-        try:
-            self._queue.put_nowait(event)
-        except queue.Full:
-            pass  # bounded queue drops oldest pressure instead of blocking
-        events = []
-        while not self._queue.empty():
-            events.append(self._queue.get_nowait())
-        if events:
-            t = threading.Thread(target=self._post, args=({"events": events},), daemon=True)
-            t.start()
-            self._threads.append(t)
+        with self._sender_lock:
+            try:
+                self._queue.put_nowait(event)
+            except queue.Full:
+                return  # shed under pressure instead of growing without limit
+            self._start_sender_locked()
+
+    def _start_sender_locked(self) -> None:
+        # Caller holds _sender_lock. One reusable sender fed by the bounded
+        # queue: a thread per emit kept every Thread object alive until flush()
+        # and drained the queue in the same call, so the bound never applied.
+        if self._sender is not None and self._sender.is_alive():
+            return
+        if self._queue.empty():
+            return
+        self._sender = threading.Thread(target=self._drain, daemon=True)
+        self._sender.start()
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                first = self._queue.get_nowait()
+            except queue.Empty:
+                with self._sender_lock:
+                    # Re-check under the emit lock. An emit that enqueued while
+                    # we held nothing saw us alive and started no replacement,
+                    # so exiting with work left would strand that event.
+                    try:
+                        first = self._queue.get_nowait()
+                    except queue.Empty:
+                        self._sender = None
+                        return
+            batch = [first]
+            while len(batch) < 100:
+                try:
+                    batch.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+            self._post({"events": batch})
 
     def flush(self, timeout: float = 30) -> None:
         """Wait for queued events to send. Call before process exit,
-        otherwise daemon sender threads die with unsent events."""
-        for t in self._threads:
-            t.join(timeout=max(0.1, timeout / max(1, len(self._threads))))
-        self._threads = [t for t in self._threads if t.is_alive()]
+        otherwise the daemon sender dies with unsent events."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._sender_lock:
+                self._start_sender_locked()
+                drained = self._queue.empty() and (
+                    self._sender is None or not self._sender.is_alive())
+            if drained:
+                return
+            time.sleep(0.005)
 
     def start_run(self, run_id: str | None = None) -> str:
         run_id = run_id or str(uuid.uuid4())

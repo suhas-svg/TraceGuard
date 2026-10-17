@@ -104,13 +104,27 @@ interface PooledClient {
 const pool = new Map<string, PooledClient>();
 const IDLE_MS = 60_000;
 
+// Operator-tunable ceiling on one upstream exchange. The MCP SDK's own 60s
+// protocol default rejects the promise but never aborts the HTTP request, so a
+// hung upstream would pin the socket and this server's pool slot. The signal
+// is created per request, not per client: a signal made at connect time would
+// expire 60s after the client was opened and then abort every later call.
+const UPSTREAM_TIMEOUT_MS = Math.max(1_000, Number(process.env.UPSTREAM_TIMEOUT_MS ?? 60_000));
+
+function timeoutFetch(url: string | URL, init?: RequestInit): Promise<Response> {
+  return fetch(url, { ...init, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+}
+
 function poolKey(baseUrl: string, authSecret: string | null): string {
   return sha256Hex(`${baseUrl}|${authSecret ?? ""}`);
 }
 
 async function openClient(baseUrl: string, authSecret: string | null): Promise<Client> {
   const headers = authSecret ? { Authorization: "Bearer " + authSecret } : undefined;
-  const transport = new StreamableHTTPClientTransport(new URL(baseUrl), { requestInit: { headers } });
+  const transport = new StreamableHTTPClientTransport(new URL(baseUrl), {
+    requestInit: { headers },
+    fetch: timeoutFetch
+  });
   const client = new Client({ name: "traceguard-gateway", version: "0.1.0" });
   // The gateway holds upstream credentials and injects them here. Agent
   // tokens never leave the gateway toward upstream servers.

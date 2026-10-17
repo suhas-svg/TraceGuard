@@ -1,9 +1,9 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import type { PoolClient } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
-import { workspaceAllowed } from "./auth.js";
+import { scopeClause, workspaceAllowed } from "./auth.js";
 import { notify } from "./notify.js";
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
@@ -11,6 +11,45 @@ async function defaultWorkspaceId(client: PoolClient): Promise<string> {
   if (found.rows[0]) return found.rows[0].id;
   const created = await client.query("INSERT INTO workspaces (name) VALUES ('default') RETURNING id");
   return created.rows[0].id;
+}
+
+// Releases every hold whose TTL has passed and returns the micro-dollars
+// freed. One statement, so the reservation flip and the counter decrement
+// cannot be split by a crash, and re-running it finds nothing left to do.
+// Without this, an abandoned hold (a caller that died between reserve and
+// settle) keeps its worst case reserved forever: the budget then 409s with
+// spent_micro at zero and nothing on the API can recover it.
+async function sweepExpiredHolds(
+  client: Pool | PoolClient, budgetId: string
+): Promise<number> {
+  const r = await client.query(
+    `WITH expired AS (
+       UPDATE budget_reservations SET status='released', released_at=now()
+        WHERE budget_id=$1 AND status='held' AND expires_at < now()
+        RETURNING amount_micro
+     )
+     UPDATE budgets
+        SET reserved_micro = GREATEST(0, reserved_micro - COALESCE((SELECT SUM(amount_micro) FROM expired),0))
+      WHERE id=$1
+      RETURNING COALESCE((SELECT SUM(amount_micro) FROM expired),0)::bigint AS freed`,
+    [budgetId]
+  );
+  return Number(r.rows[0]?.freed ?? 0);
+}
+
+// Spend inside the budget's reporting period. Returns null for 'lifetime',
+// where the cached spent_micro counter is already the answer; windowed periods
+// sum the append-only ledger instead of resetting that counter on a schedule.
+async function periodSpentMicro(
+  client: PoolClient, budgetId: string, period: string
+): Promise<number | null> {
+  if (period === "lifetime") return null;
+  const r = await client.query(
+    `SELECT COALESCE(SUM(amount_micro),0)::bigint AS spent FROM budget_ledger
+      WHERE budget_id=$1 AND created_at >= date_trunc($2, now()::timestamptz)`,
+    [budgetId, period]
+  );
+  return Number(r.rows[0].spent);
 }
 
 export function registerBudgetRoutes(app: FastifyInstance) {
@@ -65,7 +104,9 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     scope: z.enum(["run", "agent"]),
     ref_id: z.string().uuid(),
     limit_micro: z.number().int().min(0),
-    effect: z.enum(["block", "warn"]).default("block")
+    effect: z.enum(["block", "warn"]).default("block"),
+    // 'lifetime' is the original behaviour: one limit for the row's whole life.
+    period: z.enum(["lifetime", "day", "week", "month"]).default("lifetime")
   });
 
   app.post("/v1/budgets", async (req, reply) => {
@@ -76,13 +117,13 @@ export function registerBudgetRoutes(app: FastifyInstance) {
       const workspaceId = await defaultWorkspaceId(client);
       const b = parsed.data;
       const res = await client.query(
-        `INSERT INTO budgets (workspace_id, scope, ref_id, limit_micro, effect)
-         VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-        [workspaceId, b.scope, b.ref_id, b.limit_micro, b.effect]
+        `INSERT INTO budgets (workspace_id, scope, ref_id, limit_micro, effect, period)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+        [workspaceId, b.scope, b.ref_id, b.limit_micro, b.effect, b.period]
       );
       await audit(pool, { actor_type: "admin", action: "budget.create",
         resource_type: "budget", resource_id: res.rows[0].id, result: "success",
-        metadata: { scope: b.scope, limit_micro: b.limit_micro, effect: b.effect } });
+        metadata: { scope: b.scope, limit_micro: b.limit_micro, effect: b.effect, period: b.period } });
       return reply.code(201).send(res.rows[0]);
     } finally {
       client.release();
@@ -90,7 +131,8 @@ export function registerBudgetRoutes(app: FastifyInstance) {
   });
 
   app.get("/v1/budgets", async (req) => {
-    const q = req.query as { scope?: string; ref_id?: string };
+    const q = req.query as { scope?: string; ref_id?: string; limit?: string };
+    const limit = Math.min(Math.max(Number(q.limit ?? 100), 1), 500);
     const params: unknown[] = [];
     const where: string[] = [];
     if (q.scope) {
@@ -101,10 +143,16 @@ export function registerBudgetRoutes(app: FastifyInstance) {
       params.push(q.ref_id);
       where.push(`ref_id = $${params.length}`);
     }
+    // Money rows are workspace-confined like every other read. Members hold
+    // the read scope for this path, so without this they see every team's
+    // limits, spend, and remaining headroom.
+    const scope = scopeClause(req.principal, params, "workspace_id");
+    if (scope) where.push(scope);
+    params.push(limit);
     const res = await pool.query(
       `SELECT *, (limit_micro - spent_micro - reserved_micro) AS remaining_micro
        FROM budgets ${where.length ? "WHERE " + where.join(" AND ") : ""}
-       ORDER BY created_at DESC`, params
+       ORDER BY created_at DESC LIMIT $${params.length}`, params
     );
     return { items: res.rows };
   });
@@ -113,7 +161,8 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     const { id } = req.params as { id: string };
     const parsed = z.object({
       limit_micro: z.number().int().min(0).optional(),
-      effect: z.enum(["block", "warn"]).optional()
+      effect: z.enum(["block", "warn"]).optional(),
+      period: z.enum(["lifetime", "day", "week", "month"]).optional()
     }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_budget" });
     const sets: string[] = ["updated_at = now()"];
@@ -125,6 +174,10 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     if (parsed.data.effect !== undefined) {
       params.push(parsed.data.effect);
       sets.push(`effect = $${params.length}`);
+    }
+    if (parsed.data.period !== undefined) {
+      params.push(parsed.data.period);
+      sets.push(`period = $${params.length}`);
     }
     params.push(id);
     const res = await pool.query(
@@ -149,6 +202,15 @@ export function registerBudgetRoutes(app: FastifyInstance) {
   app.post("/v1/budgets/check", async (req, reply) => {
     const parsed = checkSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_check" });
+    // Reclaim abandoned holds before measuring, on its own connection so the
+    // 409 path below cannot roll the recovery back. This is what stops an
+    // abandoned reservation from wedging the budget permanently.
+    const freed = await sweepExpiredHolds(pool, parsed.data.budget_id);
+    if (freed > 0) {
+      await audit(pool, { actor_type: "system", action: "budget.reservation_expired",
+        resource_type: "budget", resource_id: parsed.data.budget_id, result: "released",
+        metadata: { freed_micro: freed } });
+    }
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -162,18 +224,20 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         await client.query("ROLLBACK");
         return reply.code(403).send({ error: "workspace_forbidden" });
       }
-      const used = Number(budget.spent_micro) + Number(budget.reserved_micro);
+      const windowed = await periodSpentMicro(client, budget.id, budget.period ?? "lifetime");
+      const spent = windowed ?? Number(budget.spent_micro);
+      const used = spent + Number(budget.reserved_micro);
       const over = used + parsed.data.max_cost_micro > Number(budget.limit_micro);
 
       if (over && budget.effect === "block") {
         await client.query("ROLLBACK");
         await audit(pool, { actor_type: "agent", action: "budget.exceeded",
           resource_type: "budget", resource_id: budget.id, result: "blocked",
-          metadata: { spent_micro: budget.spent_micro, limit_micro: budget.limit_micro } });
+          metadata: { spent_micro: spent, limit_micro: budget.limit_micro, period: budget.period ?? "lifetime" } });
         void notify(budget.workspace_id, "budget.exceeded",
-          { budget_id: budget.id, scope: budget.scope, spent_micro: Number(budget.spent_micro), limit_micro: Number(budget.limit_micro) });
+          { budget_id: budget.id, scope: budget.scope, spent_micro: spent, limit_micro: Number(budget.limit_micro) });
         return reply.code(409).send({ error: "budget_exceeded",
-          spent_micro: Number(budget.spent_micro), limit_micro: Number(budget.limit_micro) });
+          spent_micro: spent, limit_micro: Number(budget.limit_micro) });
       }
 
       const updated = await client.query(

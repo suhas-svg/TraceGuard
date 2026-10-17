@@ -61,21 +61,28 @@ export function registerReconciliationRoutes(app: FastifyInstance) {
       const workspaceId = await defaultWorkspaceId(client);
       await client.query("BEGIN");
       let accepted = 0;
+      let duplicates = 0;
       for (const r of parsed.data.rows) {
-        await client.query(
+        // Idempotent on the invoice line's natural key: replaying a batch
+        // stores nothing twice and says how many rows it skipped.
+        const ins = await client.query(
           `INSERT INTO actuals
              (workspace_id, provider, model, period_start, period_end,
               input_tokens, output_tokens, actual_cost_micro, source)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+           ON CONFLICT (workspace_id, provider, model, period_start, period_end, source)
+           DO NOTHING`,
           [workspaceId, r.provider, r.model, r.period_start, r.period_end,
            r.input_tokens, r.output_tokens, r.actual_cost_micro, r.source]
         );
-        accepted++;
+        if (ins.rowCount === 0) duplicates++;
+        else accepted++;
       }
       await client.query("COMMIT");
       await audit(pool, { actor_type: "admin", action: "reconciliation.import",
-        resource_type: "actuals", result: "success", metadata: { rows: accepted } });
-      return reply.code(201).send({ accepted });
+        resource_type: "actuals", result: "success",
+        metadata: { rows: accepted, duplicates } });
+      return reply.code(201).send({ accepted, duplicates });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw err;
@@ -95,8 +102,17 @@ export function registerReconciliationRoutes(app: FastifyInstance) {
       // The comparison covers the default workspace only; members outside
       // it get a denial, not another team's numbers.
       if (!workspaceAllowed(req.principal, workspaceId)) {
-        client.release();
+        // No release here: the finally below owns it. Releasing twice logs a
+        // pool error on every denial and makes a routine 403 look like a fault.
         return reply.code(403).send({ error: "workspace_forbidden" });
+      }
+      const startMs = new Date(q.period_start).getTime();
+      const endMs = new Date(q.period_end).getTime();
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+        return reply.code(400).send({ error: "invalid_period" });
+      }
+      if (endMs <= startMs) {
+        return reply.code(400).send({ error: "period_end_must_follow_start" });
       }
       const params: unknown[] = [workspaceId, q.period_start, q.period_end];
       const filter: string[] = [];

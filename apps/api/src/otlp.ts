@@ -11,7 +11,7 @@ import { captureRawEnabled, redactDeep } from "./redact.js";
 
 export interface OtlpKeyValue {
   key: string;
-  value?: { stringValue?: string; intValue?: string; boolValue?: boolean };
+  value?: { stringValue?: string; intValue?: string; doubleValue?: number; boolValue?: boolean };
 }
 
 export interface OtlpSpan {
@@ -67,6 +67,9 @@ export function attrValue(v: OtlpKeyValue["value"]): unknown {
   if (!v) return null;
   if (v.stringValue !== undefined) return v.stringValue;
   if (v.intValue !== undefined) return Number(v.intValue);
+  // A provider that reports usage as a double must not lose it: silently
+  // dropping it records usage_source 'unavailable' and the span is never costed.
+  if (v.doubleValue !== undefined) return Number(v.doubleValue);
   if (v.boolValue !== undefined) return v.boolValue;
   return null;
 }
@@ -77,9 +80,25 @@ export function attrsToObject(list?: OtlpKeyValue[]): Record<string, unknown> {
   return out;
 }
 
-function nanoToIso(nano?: string): string {
-  const n = BigInt(nano ?? "0");
-  return new Date(Number(n / 1_000_000n)).toISOString();
+// Nanosecond stamps arrive as strings. Anything absent, unparseable, or
+// negative yields null rather than a substituted value: defaulting to zero
+// records the span at the epoch, which then feeds duration, cost windows, and
+// retention age downstream.
+export function nanoToMs(nano?: string): number | null {
+  if (nano === undefined || nano === null || nano === "") return null;
+  let ms: bigint;
+  try {
+    ms = BigInt(nano) / 1_000_000n;
+  } catch {
+    return null;
+  }
+  const asNumber = Number(ms);
+  return Number.isFinite(asNumber) && asNumber >= 0 ? asNumber : null;
+}
+
+function nanoToIso(nano?: string): string | null {
+  const ms = nanoToMs(nano);
+  return ms === null ? null : new Date(ms).toISOString();
 }
 
 export function mapOtlpSpan(
@@ -107,8 +126,13 @@ export function mapOtlpSpan(
   const failed = span.status?.code === 2 || errorType !== null;
 
   const start = nanoToIso(span.startTimeUnixNano);
-  const endMs = span.endTimeUnixNano ? Number(BigInt(span.endTimeUnixNano) / 1_000_000n) : null;
-  const startMs = span.startTimeUnixNano ? Number(BigInt(span.startTimeUnixNano) / 1_000_000n) : null;
+  // No usable start time means this is not a trace record worth storing: it
+  // would land at the epoch and poison every later window. Without this the
+  // row reaches runs.started_at as NULL and the whole batch 500s.
+  if (start === null) return null;
+
+  const endMs = nanoToMs(span.endTimeUnixNano);
+  const startMs = nanoToMs(span.startTimeUnixNano);
   const inTok = get("gen_ai.usage.input_tokens");
   const outTok = get("gen_ai.usage.output_tokens");
   const cacheTok = get("gen_ai.usage.cache_read_input_tokens") ?? get("gen_ai.usage.cached_input_tokens");

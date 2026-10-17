@@ -16,7 +16,11 @@ export function registerWebhookRoutes(app: FastifyInstance) {
   const subSchema = z.object({
     name: z.string().min(1).max(128),
     url: z.string().url().max(512),
-    secret: z.string().max(512).default(""),
+    // Required, not optional: an empty secret used to sign with a publicly
+    // known key, so the signature header implied an authenticity that did not
+    // exist. Unsigned delivery is still possible for legacy rows, and it now
+    // sends no header at all.
+    secret: z.string().min(1).max(512),
     events: z.array(z.enum(["tool.denied", "approval.requested", "approval.decided", "budget.exceeded", "eval.completed", "*"])).min(1),
     enabled: z.boolean().default(true)
   });

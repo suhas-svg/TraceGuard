@@ -18,17 +18,32 @@ export function registerUserRoutes(app: FastifyInstance) {
   app.post("/v1/auth/register", async (req, reply) => {
     const parsed = creds.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_credentials" });
-    const count = await pool.query("SELECT COUNT(*) AS n FROM users");
-    if (Number(count.rows[0].n) > 0) {
-      return reply.code(403).send({ error: "registration_closed" });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      // The bootstrap is first-come-only, so the check and the insert have to
+      // be one serialized unit: without the lock two concurrent registrations
+      // on a fresh install both read an empty table and both become admin.
+      await client.query("LOCK TABLE users IN EXCLUSIVE MODE");
+      const count = await client.query("SELECT COUNT(*) AS n FROM users");
+      if (Number(count.rows[0].n) > 0) {
+        await client.query("ROLLBACK");
+        return reply.code(403).send({ error: "registration_closed" });
+      }
+      const created = await client.query(
+        "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, 'admin') RETURNING id, email, role",
+        [parsed.data.email.toLowerCase(), hashPassword(parsed.data.password)]
+      );
+      await client.query("COMMIT");
+      await audit(pool, { actor_type: "system", action: "user.bootstrap",
+        resource_type: "user", resource_id: created.rows[0].id, result: "success", metadata: {} });
+      return reply.code(201).send(created.rows[0]);
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
     }
-    const created = await pool.query(
-      "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, 'admin') RETURNING id, email, role",
-      [parsed.data.email.toLowerCase(), hashPassword(parsed.data.password)]
-    );
-    await audit(pool, { actor_type: "system", action: "user.bootstrap",
-      resource_type: "user", resource_id: created.rows[0].id, result: "success", metadata: {} });
-    return reply.code(201).send(created.rows[0]);
   });
 
   app.post("/v1/auth/login", async (req, reply) => {

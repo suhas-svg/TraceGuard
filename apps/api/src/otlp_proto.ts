@@ -153,7 +153,10 @@ function normalizeAnyValue(v: Record<string, unknown> | undefined): Record<strin
   if (typeof v.stringValue === "string") return { stringValue: v.stringValue };
   if (typeof v.boolValue === "boolean") return { boolValue: v.boolValue };
   if (v.intValue !== undefined) return { intValue: String(v.intValue) };
-  if (typeof v.doubleValue === "number") return { stringValue: String(v.doubleValue) };
+  // Keep doubles numeric: stringifying them made the protobuf path disagree
+  // with the JSON path about the same payload, and a usage value that arrives
+  // as text never lands in the token columns.
+  if (typeof v.doubleValue === "number") return { doubleValue: v.doubleValue };
   const bytes = hex((v as { bytesValue?: unknown }).bytesValue);
   if (bytes !== undefined) return { stringValue: bytes };
   return undefined;

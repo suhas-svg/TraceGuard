@@ -287,10 +287,20 @@ export function buildGateway() {
     if (!parsed.success) return reply.code(400).send({ error: "invalid_policy" });
     const client = await pool.connect();
     try {
-      const old = await client.query("SELECT * FROM policies WHERE id = $1", [id]);
-      if (!old.rows[0]) return reply.code(404).send({ error: "policy_not_found" });
-      if (old.rows[0].superseded_by) return reply.code(409).send({ error: "policy_superseded" });
       await client.query("BEGIN");
+      // Locked so the "is this rule still live" check and the version insert
+      // are one unit. Read outside the transaction, two concurrent updates
+      // both find a live row and both insert a new version, leaving the rule
+      // with two live heads and a version an operator believes was retired.
+      const old = await client.query("SELECT * FROM policies WHERE id = $1 FOR UPDATE", [id]);
+      if (!old.rows[0]) {
+        await client.query("ROLLBACK");
+        return reply.code(404).send({ error: "policy_not_found" });
+      }
+      if (old.rows[0].superseded_by) {
+        await client.query("ROLLBACK");
+        return reply.code(409).send({ error: "policy_superseded" });
+      }
       const p = parsed.data;
       const next = await client.query(
         `INSERT INTO policies
@@ -525,14 +535,23 @@ export function buildGateway() {
           return reply.code(403).send({ error: "approval_not_granted", status: approval.status });
         }
         if (new Date(approval.expires_at).getTime() < Date.now()) {
-          await client.query(
+          // Guarded so a stale read cannot overwrite a concurrent decision,
+          // and so the audit trail only claims an expiry that really happened.
+          const expired = await client.query(
             `UPDATE approvals SET status='expired', args='{}'::jsonb, args_enc=false, args_summary=$2
-              WHERE id=$1`,
+              WHERE id=$1 AND status IN ('pending','approved') RETURNING id`,
             [approval.id, safeSummary(approval)]
           );
+          if (!expired.rows[0]) {
+            const now = await client.query("SELECT status FROM approvals WHERE id = $1", [approval.id]);
+            return reply.code(409).send({ error: "approval_not_pending",
+              status: now.rows[0]?.status ?? "unknown" });
+          }
           await recordDecision(client, { workspace_id: server.workspace_id, caller,
             server_id, tool_name: tool, args_hash: argsHash,
             decision: "deny", reason: "approval expired", approval_id: approval.id });
+          await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.expired",
+            resource_type: "approval", resource_id: approval.id, result: "deny" });
           return reply.code(410).send({ error: "approval_expired" });
         }
         const want = requestHash(caller, server_id, tool, args, approval.request_id);
@@ -540,6 +559,11 @@ export function buildGateway() {
           await recordDecision(client, { workspace_id: server.workspace_id, caller,
             server_id, tool_name: tool, args_hash: argsHash,
             decision: "deny", reason: "approval binding mismatch", approval_id: approval.id });
+          // A replay or a transplanted approval is the most tell-tale event
+          // this endpoint sees; it belongs in the tamper-evident trail.
+          await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.binding_mismatch",
+            resource_type: "approval", resource_id: approval.id, result: "deny",
+            metadata: { server_id, tool } });
           return reply.code(403).send({ error: "approval_binding_mismatch" });
         }
         if (approval.status === "pending") {
@@ -641,10 +665,15 @@ export function buildGateway() {
       `SELECT * FROM approvals ${where.length ? "WHERE " + where.join(" AND ") : ""}
        ORDER BY requested_at DESC LIMIT $${params.length}`, params
     );
-    // Approvers see plaintext; the seal opens here, inside the gateway.
-    // A row that will not open is shown redacted, never dropped silently.
+    // Approvers open plaintext here, and only approvers. This route needs
+    // just 'read', which members and agent keys hold, so a caller without the
+    // approve scope gets the row with the arguments withheld rather than the
+    // seal's contents.
+    const mayOpenSeal = !!req.principal &&
+      (req.principal.scopes.includes("approve") || req.principal.scopes.includes("admin"));
     const items = res.rows.map((row) => {
       if (!row.args_enc) return row;
+      if (!mayOpenSeal) return { ...row, args: {}, args_withheld: true };
       try {
         return { ...row, args: storedArgs(row) };
       } catch {
@@ -661,7 +690,9 @@ export function buildGateway() {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      const ap = await client.query("SELECT * FROM approvals WHERE id = $1", [id]);
+      // Locked for the rest of the decision: the expiry check and the status
+      // transition cannot be interleaved with a concurrent decide or consume.
+      const ap = await client.query("SELECT * FROM approvals WHERE id = $1 FOR UPDATE", [id]);
       if (!ap.rows[0]) {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "approval_not_found" });
@@ -677,32 +708,39 @@ export function buildGateway() {
         return reply.code(404).send({ error: "approval_not_found" });
       }
       if (new Date(approval.expires_at).getTime() < Date.now()) {
-        await client.query(
+        const expired = await client.query(
           `UPDATE approvals SET status='expired', args='{}'::jsonb, args_enc=false, args_summary=$2
-            WHERE id=$1`,
+            WHERE id=$1 AND status='pending' RETURNING id`,
           [id, safeSummary(approval)]
         );
         await client.query("COMMIT");
+        if (!expired.rows[0]) {
+          return reply.code(409).send({ error: "approval_decided_elsewhere" });
+        }
         return reply.code(410).send({ error: "approval_expired" });
       }
       // Single decision wins: only one row can leave pending state. Denying
       // drops the sealed arguments immediately, keeping only the redacted
       // summary and hash; approving keeps them until the retry consumes them.
+      // decided_by records the principal, not a constant: an approval trail
+      // that cannot name the human who decided it answers nothing.
+      const actor = req.principal?.userId ??
+        (req.principal?.kind === "env" ? "env_key" : "unknown");
       const updated = await client.query(
-        `UPDATE approvals SET status=$2, decided_by='approver', decided_at=now(), decision_reason=$3,
+        `UPDATE approvals SET status=$2, decided_by=$6, decided_at=now(), decision_reason=$3,
            args = CASE WHEN $4::boolean THEN '{}'::jsonb ELSE args END,
            args_enc = CASE WHEN $4::boolean THEN false ELSE args_enc END,
            args_summary = CASE WHEN $4::boolean THEN $5 ELSE args_summary END
          WHERE id=$1 AND status='pending' RETURNING *`,
         [id, parsed.data.approved ? "approved" : "denied", parsed.data.reason,
-         !parsed.data.approved, parsed.data.approved ? null : safeSummary(approval)]
+         !parsed.data.approved, parsed.data.approved ? null : safeSummary(approval), actor]
       );
       if (!updated.rows[0]) {
         await client.query("ROLLBACK");
         return reply.code(409).send({ error: "approval_decided_elsewhere" });
       }
       await client.query("COMMIT");
-      await audit(pool, { actor_type: "approver", action: "approval.decide",
+      await audit(pool, { actor_type: "approver", actor_id: actor, action: "approval.decide",
         resource_type: "approval", resource_id: id,
         result: parsed.data.approved ? "approved" : "denied",
         metadata: { reason: parsed.data.reason } });
