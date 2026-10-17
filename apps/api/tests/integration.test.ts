@@ -992,6 +992,55 @@ describe("integration and security", () => {
     expect(res.json().error).toBe("unknown_workspace");
   });
 
+  it("groups costs by agent, project, and reporting period", async () => {
+    // Section 12.1 names all of these dimensions. Each branch builds different
+    // SQL, so each one has to be executed, not just accepted as a parameter.
+    const prov = `grp-${tag}`;
+    const agentName = `grp-agent-${tag}`;
+    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+      payload: { provider: prov, model: "m", input_price_per_million: 1_000_000,
+        output_price_per_million: 0 } });
+    const runId = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: {
+      events: [
+        ev({ run_id: runId, agent_name: agentName, event_type: "model.request",
+          timestamp: new Date().toISOString(), provider: prov, model: "m",
+          input_tokens: 500, output_tokens: 0, usage_source: "provider_reported" }),
+        ev({ run_id: runId, agent_name: agentName, event_type: "run.completed",
+          timestamp: new Date().toISOString() })
+      ] } });
+    const start = new Date(Date.now() - 3_600_000).toISOString();
+    const end = new Date(Date.now() + 60_000).toISOString();
+    const q = `period_start=${encodeURIComponent(start)}&period_end=${encodeURIComponent(end)}`;
+
+    const byAgent = await api.inject({ method: "GET",
+      url: `/v1/reconciliation/compare?${q}&group_by=agent`, headers: key });
+    expect(byAgent.statusCode).toBe(200);
+    expect(byAgent.json().group_by).toBe("agent");
+    const agentRow = byAgent.json().rows.find((r: { model: string }) => r.model === agentName);
+    expect(agentRow?.estimated_micro).toBeGreaterThanOrEqual(500);
+    // Actuals are recorded per provider and model, so another dimension reports
+    // no actual rather than a share of one that would be invented.
+    expect(agentRow?.actual_micro).toBeNull();
+
+    const byProject = await api.inject({ method: "GET",
+      url: `/v1/reconciliation/compare?${q}&group_by=project`, headers: key });
+    expect(byProject.statusCode).toBe(200);
+    expect(byProject.json().rows.length).toBeGreaterThanOrEqual(1);
+    expect(byProject.json().rows.every((r: { actual_micro: unknown }) => r.actual_micro === null)).toBe(true);
+
+    const byPeriod = await api.inject({ method: "GET",
+      url: `/v1/reconciliation/compare?${q}&group_by=period&bucket=day`, headers: key });
+    expect(byPeriod.statusCode).toBe(200);
+    expect(byPeriod.json().rows.length).toBeGreaterThanOrEqual(1);
+    expect(byPeriod.json().rows.every((r: { estimated_micro: number }) => r.estimated_micro >= 0)).toBe(true);
+
+    const bad = await api.inject({ method: "GET",
+      url: `/v1/reconciliation/compare?${q}&group_by=nope`, headers: key });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().error).toBe("invalid_group_by");
+  });
+
   it("filters runs by date window, provider, model and evaluation run", async () => {
     const runId = randomUUID();
     const prov = `flt-${tag}`;

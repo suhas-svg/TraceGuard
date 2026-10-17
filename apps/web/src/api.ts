@@ -462,9 +462,9 @@ export const opsApi = {
     deleteApi<{ ok: boolean }>(`/v1/users/${userId}/memberships/${workspaceId}`),
   workspaces: () => get<{ items: Workspace[] }>("/v1/workspaces"),
   createWorkspace: (name: string) => postApi<Workspace>("/v1/workspaces", { name }),
-  compareCosts: (periodStart: string, periodEnd: string, provider?: string) =>
-    get<{ period_start: string; period_end: string; rows: CompareRow[] }>(
-      `/v1/reconciliation/compare?period_start=${encodeURIComponent(periodStart)}&period_end=${encodeURIComponent(periodEnd)}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}`),
+  compareCosts: (periodStart: string, periodEnd: string, provider?: string, groupBy?: string) =>
+    get<{ period_start: string; period_end: string; group_by: string; rows: CompareRow[] }>(
+      `/v1/reconciliation/compare?period_start=${encodeURIComponent(periodStart)}&period_end=${encodeURIComponent(periodEnd)}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}${groupBy && groupBy !== "model" ? `&group_by=${encodeURIComponent(groupBy)}` : ""}`),
   importActuals: (rows: Record<string, unknown>[]) =>
     postApi<{ accepted: number }>("/v1/reconciliation/actuals", { rows }),
   webhooks: () => get<{ items: Webhook[] }>("/v1/webhooks"),
