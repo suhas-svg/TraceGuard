@@ -961,6 +961,37 @@ describe("integration and security", () => {
     expect(unauth.statusCode).toBe(401);
   });
 
+  it("caps a project's spend, measured from the project rather than a counter", async () => {
+    // The default workspace is the project. A project budget measures what the
+    // project actually spent, so a one-micro cap is already exceeded by the
+    // spend in this database and the first check must refuse it.
+    const ws = await api.inject({ method: "GET", url: "/v1/workspaces", headers: key });
+    const def = ws.json().items.find((w: { name: string }) => w.name === "default");
+    const b = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "project", ref_id: def.id, limit_micro: 1, effect: "block" } });
+    expect(b.statusCode).toBe(201);
+
+    const check = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+      payload: { budget_id: b.json().id, max_cost_micro: 0 } });
+    // Measuring the budget's own ledger instead returns 0 spent and a 200 with
+    // the whole limit apparently available, which is the bug this pins.
+    expect(check.statusCode).toBe(409);
+    expect(check.json().spent_micro).toBeGreaterThan(0);
+
+    // The list agrees, so the dashboard cannot show headroom that is not there.
+    const list = await api.inject({ method: "GET", url: "/v1/budgets?scope=project&limit=500", headers: key });
+    const row = list.json().items.find((x: { id: string }) => x.id === b.json().id);
+    expect(row.spent_micro).toBeGreaterThan(0);
+    expect(row.remaining_micro).toBeLessThan(0);
+  });
+
+  it("refuses a project budget that names no workspace", async () => {
+    const res = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "project", ref_id: randomUUID(), limit_micro: 1000 } });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("unknown_workspace");
+  });
+
   it("filters runs by date window, provider, model and evaluation run", async () => {
     const runId = randomUUID();
     const prov = `flt-${tag}`;

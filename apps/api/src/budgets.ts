@@ -52,6 +52,42 @@ async function periodSpentMicro(
   return Number(r.rows[0].spent);
 }
 
+// A project budget caps what the whole project spent, so it is measured from the
+// spans that actually incurred cost rather than from the budget's own ledger.
+// The ledger only accumulates for calls that checked that specific budget, which
+// for a project cap would mean counting a fraction of the spend and reporting
+// headroom that is not there. Unpriced spans contribute nothing, the same as
+// everywhere else cost is estimated.
+async function projectSpentMicro(
+  client: Pool | PoolClient, workspaceId: string, period: string
+): Promise<number> {
+  const params: unknown[] = [workspaceId];
+  let windowSql = "TRUE";
+  if (period !== "lifetime") {
+    params.push(period);
+    windowSql = `s.started_at >= date_trunc($${params.length}, now()::timestamptz)`;
+  }
+  const r = await client.query(
+    `SELECT COALESCE(SUM(
+              CASE WHEN s.input_tokens IS NULL AND s.output_tokens IS NULL THEN 0
+                   WHEN p.id IS NULL THEN 0
+                   ELSE ((GREATEST(COALESCE(s.input_tokens,0) - COALESCE(s.cached_tokens,0), 0) * p.input_price_per_million
+                        + COALESCE(s.cached_tokens,0) * p.cached_input_price_per_million
+                        + COALESCE(s.output_tokens,0) * p.output_price_per_million) / 1000000)::BIGINT
+              END), 0)::bigint AS spent
+       FROM spans s
+       JOIN runs r ON r.id = s.run_id
+       LEFT JOIN LATERAL (
+         SELECT * FROM pricing
+         WHERE provider = s.provider AND model = s.model AND effective_from <= s.started_at
+         ORDER BY effective_from DESC LIMIT 1
+       ) p ON true
+      WHERE r.workspace_id = $1 AND ${windowSql}`,
+    params
+  );
+  return Number(r.rows[0].spent);
+}
+
 export function registerBudgetRoutes(app: FastifyInstance) {
   const pricingSchema = z.object({
     provider: z.string().min(1).max(64),
@@ -101,7 +137,9 @@ export function registerBudgetRoutes(app: FastifyInstance) {
   });
 
   const budgetSchema = z.object({
-    scope: z.enum(["run", "agent"]),
+    // 'project' is the spec's name for a workspace (§9.1); ref_id carries the
+    // workspace id and the cap covers what that project actually spent.
+    scope: z.enum(["run", "agent", "project"]),
     ref_id: z.string().uuid(),
     limit_micro: z.number().int().min(0),
     effect: z.enum(["block", "warn"]).default("block"),
@@ -116,6 +154,16 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     try {
       const workspaceId = await defaultWorkspaceId(client);
       const b = parsed.data;
+      // A project budget names a workspace, so an arbitrary uuid must not be
+      // accepted: it would create a cap that governs nothing and can never be
+      // satisfied or read back.
+      if (b.scope === "project") {
+        const ws = await client.query("SELECT id FROM workspaces WHERE id = $1", [b.ref_id]);
+        if (!ws.rows[0]) return reply.code(400).send({ error: "unknown_workspace" });
+        if (!workspaceAllowed(req.principal, b.ref_id)) {
+          return reply.code(403).send({ error: "workspace_forbidden" });
+        }
+      }
       const res = await client.query(
         `INSERT INTO budgets (workspace_id, scope, ref_id, limit_micro, effect, period)
          VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
@@ -154,6 +202,24 @@ export function registerBudgetRoutes(app: FastifyInstance) {
        FROM budgets ${where.length ? "WHERE " + where.join(" AND ") : ""}
        ORDER BY created_at DESC LIMIT $${params.length}`, params
     );
+    // A project budget's spend is measured from the project's spans rather than
+    // from a counter, so the cached column reads zero and the dashboard would
+    // show headroom that is not there. One extra query per distinct project and
+    // window on the page, not one per row.
+    const projects = res.rows.filter((b) => b.scope === "project");
+    if (projects.length > 0) {
+      const spent = new Map<string, number>();
+      for (const b of projects) {
+        const key = `${b.ref_id}\0${b.period ?? "lifetime"}`;
+        if (!spent.has(key)) {
+          spent.set(key, await projectSpentMicro(pool, b.ref_id, b.period ?? "lifetime"));
+        }
+      }
+      for (const b of projects) {
+        b.spent_micro = spent.get(`${b.ref_id}\0${b.period ?? "lifetime"}`) ?? 0;
+        b.remaining_micro = Number(b.limit_micro) - b.spent_micro - Number(b.reserved_micro);
+      }
+    }
     return { items: res.rows };
   });
 
@@ -220,12 +286,18 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         return reply.code(404).send({ error: "budget_not_found" });
       }
       const budget = b.rows[0];
-      if (!workspaceAllowed(req.principal, budget.workspace_id)) {
+      // A project budget governs its target workspace, so that is the workspace
+      // the caller has to be allowed in; the row's own workspace_id only says
+      // who created it.
+      const governed = budget.scope === "project" ? budget.ref_id : budget.workspace_id;
+      if (!workspaceAllowed(req.principal, governed)) {
         await client.query("ROLLBACK");
         return reply.code(403).send({ error: "workspace_forbidden" });
       }
-      const windowed = await periodSpentMicro(client, budget.id, budget.period ?? "lifetime");
-      const spent = windowed ?? Number(budget.spent_micro);
+      const spent = budget.scope === "project"
+        ? await projectSpentMicro(client, budget.ref_id, budget.period ?? "lifetime")
+        : (await periodSpentMicro(client, budget.id, budget.period ?? "lifetime")) ??
+          Number(budget.spent_micro);
       const used = spent + Number(budget.reserved_micro);
       const over = used + parsed.data.max_cost_micro > Number(budget.limit_micro);
 

@@ -72,10 +72,15 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 
 - `POST /v1/pricing` versions model prices, old versions stay so past
   estimates keep meaning. Money is integer micro-dollars, never floats.
-- `POST /v1/budgets` sets run or agent limits with block or warn effects,
-  and a reporting `period` of `lifetime` (default), `day`, `week`, or
-  `month`. Windowed spend is summed from the append-only ledger, so no
+- `POST /v1/budgets` sets run, agent, or project limits with block or warn
+  effects, and a reporting `period` of `lifetime` (default), `day`, `week`,
+  or `month`. Windowed spend is summed from the append-only ledger, so no
   counter is reset on a schedule and past windows stay explainable.
+- A **project** budget (`scope: "project"`, `ref_id` = a workspace id) caps
+  what the whole project spends over its period. It is measured from the
+  project's priced spans rather than from its own ledger, because a ledger
+  only counts calls that checked that specific budget — measuring it would
+  report headroom that is not there and never block.
 - A hold that is abandoned (a caller that dies between reserve and settle)
   is released by the next check against that budget, and the release is
   audited. Without that the worst case stayed reserved forever and the
