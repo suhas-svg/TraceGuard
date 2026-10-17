@@ -35,6 +35,7 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 - `GET /v1/runs`, `GET /v1/runs/:id`, `GET /v1/runs/:id/trace`, `GET /v1/runs/:id/usage` read stored runs with token and cost breakdowns.
 - Gateway on :8091: upstream registry, tool discovery with definition pinning, allow/deny/approval policies, single-use bound approvals, hash-chained audit.
 - The gateway exposes the MCP Streamable HTTP profile at `POST /mcp` (`server/discover`, `tools/list`, `tools/call`) with namespaced `alias__tool` names, header/body binding, and the approval retry contract keyed on a stable logical request id; unsupported methods are rejected and never forwarded. See `docs/compatibility.md`.
+- Approvals are a ten-state machine: `pending` → `approved` → `executing` → `response_received` / `outcome_unknown`, plus terminal `rejected`, `expired`, `policy_invalidated` and `tool_quarantined`. A timeout or crash after dispatch is recorded as **outcome unknown** ("the upstream action may have executed") and is never retried. TTL defaults to 15 minutes (hard max 60), with per-caller pending caps and a creation rate limit.
 - Budgets with atomic reserve-and-settle plus a Python `BudgetGuard` wrapper.
 - Evaluations: versioned suites, scripted or live replay, deterministic assertions, run comparison.
 - The dashboard has Overview, Runs, Evaluations, Policy, Approvals, Webhooks,

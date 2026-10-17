@@ -242,6 +242,8 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
 
 export function registerMcpRoutes(app: FastifyInstance): void {
   app.post("/mcp", async (req, reply) => {
+    // Approvals and tool contracts are per-caller state; never cacheable.
+    reply.header("Cache-Control", "no-store");
     const parsed = parseEnvelope(req.body);
     if (!parsed.ok) {
       return reply.code(400).send(rpcError(parsed.id, -32600, "Invalid Request", { error: parsed.message }));

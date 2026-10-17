@@ -21,7 +21,16 @@ import { captureRawEnabled, redactDeep, summarizeArgs } from "./redact.js";
 const API_KEY = process.env.API_KEY ?? "";
 const APPROVER_KEY = process.env.APPROVER_KEY ?? "";
 const PORT = Number(process.env.GATEWAY_PORT ?? 8091);
-const APPROVAL_TTL_SECONDS = Number(process.env.APPROVAL_TTL_SECONDS ?? 300);
+// §9.4: default 15 minutes, hard maximum 60 minutes. Deployments may lower the
+// default; nothing may raise the cap without a spec change.
+const APPROVAL_TTL_SECONDS = Math.min(Math.max(Number(process.env.APPROVAL_TTL_SECONDS ?? 900), 60), 3600);
+// Queue protections, read per request so a deployment (or a test) can tighten
+// them without a restart. Defaults are the spec's numbers: 10 pending per
+// caller, 100 per project, 5 new requests per caller per minute.
+const approvalEnv = (name: string, fallback: number): number => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
 // Same single-origin CORS as the API, for the policy screens.
 const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN ?? "http://localhost:5173";
 if (!API_KEY) throw new Error("API_KEY is required");
@@ -63,6 +72,14 @@ function safeSummary(row: { args_enc: boolean; args: unknown; request_id: string
   } catch {
     return "[unreadable]";
   }
+}
+
+// A bounded, redacted summary of an upstream result for the approval record:
+// the response may outlive the payload, so cap it and never store unredacted
+// content.
+function boundedSummary(result: unknown): string {
+  const text = stableStringify(redactDeep({ result }));
+  return text.length > 512 ? `${text.slice(0, 512)}...` : text;
 }
 
 // §11.3 step 3: hard budget limits gate managed operations. Returns the first
@@ -474,6 +491,23 @@ export function buildGateway() {
         void notify(server.workspace_id, "tool.denied",
           { caller, server_id, tool, reason: toolRow.rows[0] ? "quarantined" : "unknown" });
         await recordDeniedSpan(client, parsed.data, server.id, tool, reason);
+        // A held approval for a tool that has since been quarantined dies
+        // with the tool: no execution, no return to the queue.
+        if (parsed.data.approval_id && toolRow.rows[0]?.quarantined) {
+          const prior = await client.query(
+            "SELECT * FROM approvals WHERE id = $1 AND status = 'approved'",
+            [parsed.data.approval_id]
+          );
+          if (prior.rows[0]) {
+            await client.query(
+              `UPDATE approvals SET status='tool_quarantined', terminal_at=now(), args='{}'::jsonb,
+                 args_enc=false, args_summary=$2 WHERE id=$1 AND status='approved'`,
+              [prior.rows[0].id, safeSummary(prior.rows[0])]
+            );
+            await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.tool_quarantined",
+              resource_type: "approval", resource_id: prior.rows[0].id, result: "deny" });
+          }
+        }
         return reply.code(403).send({ error: "tool_blocked", reason: "unknown or quarantined tool" });
       }
 
@@ -505,6 +539,24 @@ export function buildGateway() {
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
           resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied",
           metadata: { rule: verdict.rule?.name ?? null } });
+        // An approval held for this call is dead on arrival: a newly
+        // applicable deny invalidates it instead of letting it wait for TTL.
+        if (parsed.data.approval_id) {
+          const prior = await client.query(
+            "SELECT * FROM approvals WHERE id = $1 AND status = 'approved'",
+            [parsed.data.approval_id]
+          );
+          if (prior.rows[0]) {
+            await client.query(
+              `UPDATE approvals SET status='policy_invalidated', terminal_at=now(), decision_reason=$2,
+                 args='{}'::jsonb, args_enc=false, args_summary=$3 WHERE id=$1 AND status='approved'`,
+              [prior.rows[0].id, `invalidated: ${verdict.reason}`, safeSummary(prior.rows[0])]
+            );
+            await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.policy_invalidated",
+              resource_type: "approval", resource_id: prior.rows[0].id, result: "deny",
+              metadata: { rule: verdict.rule?.name ?? null } });
+          }
+        }
         void notify(server.workspace_id, "tool.denied",
           { caller, server_id, tool, rule: verdict.rule?.name ?? null, reason: verdict.reason });
         await recordDeniedSpan(client, parsed.data, server.id, tool, verdict.reason);
@@ -538,36 +590,67 @@ export function buildGateway() {
           scope: exhausted.scope, limit_micro: Number(exhausted.limit_micro) });
       }
 
-      // Approval retry: the client presents a prior approval for this exact call.
+      // Approval retry: the client presents the durable approval for this
+      // exact call. Everything up to the committed EXECUTING transition runs
+      // in one transaction — DB-time expiry, binding, consume-time
+      // re-evaluation, the claim and the execution-intent audit event.
       if (parsed.data.approval_id) {
-        const ap = await client.query("SELECT * FROM approvals WHERE id = $1", [parsed.data.approval_id]);
-        if (!ap.rows[0]) return reply.code(404).send({ error: "approval_not_found" });
+        await client.query("BEGIN");
+        const ap = await client.query(
+          "SELECT *, (expires_at < now()) AS ttl_expired FROM approvals WHERE id = $1 FOR UPDATE",
+          [parsed.data.approval_id]
+        );
+        if (!ap.rows[0]) {
+          await client.query("ROLLBACK");
+          return reply.code(404).send({ error: "approval_not_found" });
+        }
         const approval = ap.rows[0];
-        if (approval.status === "consumed") {
-          return reply.code(410).send({ error: "approval_consumed" });
+        if (approval.status === "claimed" || approval.status === "executing") {
+          await client.query("ROLLBACK");
+          return reply.code(409).send({ error: "approval_in_progress", status: approval.status });
         }
-        if (approval.status !== "pending" && approval.status !== "approved") {
-          return reply.code(403).send({ error: "approval_not_granted", status: approval.status });
-        }
-        if (new Date(approval.expires_at).getTime() < Date.now()) {
-          // Guarded so a stale read cannot overwrite a concurrent decision,
-          // and so the audit trail only claims an expiry that really happened.
-          const expired = await client.query(
-            `UPDATE approvals SET status='expired', args='{}'::jsonb, args_enc=false, args_summary=$2
-              WHERE id=$1 AND status IN ('pending','approved') RETURNING id`,
+        if (approval.status === "pending") {
+          if (!approval.ttl_expired) {
+            await client.query("ROLLBACK");
+            return reply.code(202).send({ approval_id: approval.id, status: "pending",
+              expires_at: approval.expires_at });
+          }
+          await client.query(
+            `UPDATE approvals SET status='expired', terminal_at=now(), args='{}'::jsonb,
+               args_enc=false, args_summary=$2 WHERE id=$1 AND status='pending'`,
             [approval.id, safeSummary(approval)]
           );
-          if (!expired.rows[0]) {
-            const now = await client.query("SELECT status FROM approvals WHERE id = $1", [approval.id]);
-            return reply.code(409).send({ error: "approval_not_pending",
-              status: now.rows[0]?.status ?? "unknown" });
-          }
           await recordDecision(client, { workspace_id: server.workspace_id, caller,
             server_id, tool_name: tool, args_hash: argsHash,
             decision: "deny", reason: "approval expired", approval_id: approval.id,
             overhead_ms: overheadMs() });
-          await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.expired",
+          await audit(client, { actor_type: "agent", actor_id: caller, action: "approval.expired",
             resource_type: "approval", resource_id: approval.id, result: "deny" });
+          await client.query("COMMIT");
+          return reply.code(410).send({ error: "approval_expired" });
+        }
+        if (approval.status !== "approved") {
+          // Terminal state: report it, never dispatch again.
+          await client.query("ROLLBACK");
+          const http = ["rejected", "policy_invalidated", "tool_quarantined"].includes(approval.status) ? 403 : 410;
+          const note = approval.status === "outcome_unknown"
+            ? { note: "The upstream action may have executed." } : {};
+          return reply.code(http).send({ error: `approval_${approval.status}`,
+            status: approval.status, ...note });
+        }
+        if (approval.ttl_expired) {
+          await client.query(
+            `UPDATE approvals SET status='expired', terminal_at=now(), args='{}'::jsonb,
+               args_enc=false, args_summary=$2 WHERE id=$1 AND status='approved'`,
+            [approval.id, safeSummary(approval)]
+          );
+          await recordDecision(client, { workspace_id: server.workspace_id, caller,
+            server_id, tool_name: tool, args_hash: argsHash,
+            decision: "deny", reason: "approval expired", approval_id: approval.id,
+            overhead_ms: overheadMs() });
+          await audit(client, { actor_type: "agent", actor_id: caller, action: "approval.expired",
+            resource_type: "approval", resource_id: approval.id, result: "deny" });
+          await client.query("COMMIT");
           return reply.code(410).send({ error: "approval_expired" });
         }
         const want = requestHash(caller, server_id, tool, args, approval.request_id);
@@ -578,43 +661,137 @@ export function buildGateway() {
             overhead_ms: overheadMs() });
           // A replay or a transplanted approval is the most tell-tale event
           // this endpoint sees; it belongs in the tamper-evident trail.
-          await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.binding_mismatch",
+          await audit(client, { actor_type: "agent", actor_id: caller, action: "approval.binding_mismatch",
             resource_type: "approval", resource_id: approval.id, result: "deny",
             metadata: { server_id, tool } });
+          await client.query("COMMIT");
           return reply.code(403).send({ error: "approval_binding_mismatch" });
         }
-        if (approval.status === "pending") {
-          return reply.code(202).send({ approval_id: approval.id, status: "pending",
-            expires_at: approval.expires_at });
-        }
-        // Read the sealed arguments before consuming, so an unreadable row
+        // Read the sealed arguments before claiming, so an unreadable row
         // fails closed without burning the single-use approval.
         let stored: Record<string, unknown>;
         try {
           stored = storedArgs(approval);
         } catch {
+          await client.query("ROLLBACK");
           return reply.code(500).send({ error: "approval_unreadable" });
         }
-        // Only one concurrent retry can flip approved -> consumed; the loser
-        // gets 410 instead of forwarding a second time. Consuming also drops
-        // the sealed arguments: from then on only the redacted summary and
-        // the args hash remain.
-        const consumed = await client.query(
-          `UPDATE approvals SET status='consumed', decided_at=now(), args='{}'::jsonb,
-             args_enc=false, args_summary=$2 WHERE id=$1 AND status='approved' RETURNING id`,
-          [approval.id, summarizeArgs(stored, { captureRaw: captureRawEnabled() })]
+        // Consume-time full re-evaluation, in the same transaction as the
+        // claim: a deny or a quarantined pin added after approval invalidates
+        // it and nothing is dispatched. Prior human approval never overrides
+        // a current deny.
+        const recheck = evaluate(rules, {
+          caller, agent_id: parsed.data.agent_id ?? null, server_id, tool_name: tool,
+          args: stored
+        });
+        const toolNow = await client.query(
+          "SELECT quarantined FROM server_tools WHERE server_id = $1 AND tool_name = $2",
+          [server_id, tool]
         );
-        if (!consumed.rows[0]) return reply.code(410).send({ error: "approval_consumed" });
-        try {
-          const result = await forward(client, server, tool, stored,
-            caller, { approval_id: approval.id, overheadMs: overheadMs() });
-          return { result, approval_id: approval.id };
-        } catch {
-          return reply.code(502).send({ error: "upstream_failed" });
+        if (toolNow.rows[0]?.quarantined) {
+          await client.query(
+            `UPDATE approvals SET status='tool_quarantined', terminal_at=now(), args='{}'::jsonb,
+               args_enc=false, args_summary=$2 WHERE id=$1 AND status='approved'`,
+            [approval.id, summarizeArgs(stored, { captureRaw: captureRawEnabled() })]
+          );
+          await audit(client, { actor_type: "agent", actor_id: caller, action: "approval.tool_quarantined",
+            resource_type: "approval", resource_id: approval.id, result: "deny" });
+          await client.query("COMMIT");
+          return reply.code(403).send({ error: "tool_quarantined", approval_id: approval.id });
         }
+        if (recheck.decision === "deny") {
+          await client.query(
+            `UPDATE approvals SET status='policy_invalidated', terminal_at=now(), decision_reason=$2,
+               args='{}'::jsonb, args_enc=false, args_summary=$3 WHERE id=$1 AND status='approved'`,
+            [approval.id, `invalidated: ${recheck.reason}`,
+             summarizeArgs(stored, { captureRaw: captureRawEnabled() })]
+          );
+          await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+            tool_name: tool, args_hash: argsHash, decision: "deny",
+            policy_id: recheck.rule?.id ?? null, policy_version: recheck.rule?.version ?? null,
+            matched: recheck.matched,
+            reason: `approval invalidated by current policy: ${recheck.reason}`,
+            approval_id: approval.id, overhead_ms: overheadMs() });
+          await audit(client, { actor_type: "agent", actor_id: caller, action: "approval.policy_invalidated",
+            resource_type: "approval", resource_id: approval.id, result: "deny",
+            metadata: { rule: recheck.rule?.name ?? null } });
+          await client.query("COMMIT");
+          return reply.code(403).send({ error: "policy_invalidated", reason: recheck.reason });
+        }
+        // Claim (compare-and-swap) and execution intent. The committed
+        // EXECUTING row is the linearization point: concurrent retries lose
+        // the CAS, and a crash before this COMMIT leaves the approval
+        // APPROVED because nothing was dispatched by construction.
+        const claimed = await client.query(
+          `UPDATE approvals SET status='executing', claim_id=$2, execution_started_at=now(),
+             args='{}'::jsonb, args_enc=false, args_summary=$3
+            WHERE id=$1 AND status='approved' RETURNING id`,
+          [approval.id, randomUUID(), summarizeArgs(stored, { captureRaw: captureRawEnabled() })]
+        );
+        if (!claimed.rows[0]) {
+          await client.query("ROLLBACK");
+          return reply.code(409).send({ error: "approval_in_progress" });
+        }
+        await audit(client, { actor_type: "agent", actor_id: caller, action: "approval.execution_intent",
+          resource_type: "approval", resource_id: approval.id, result: "executing",
+          metadata: { server_id, tool } });
+        await client.query("COMMIT");
+        // Only now may anything leave for the upstream (§9.2 rule 6).
+        let result: unknown;
+        try {
+          result = await forward(client, server, tool, stored,
+            caller, { approval_id: approval.id, overheadMs: overheadMs() });
+        } catch (err) {
+          // The gateway cannot prove the upstream did not act: burn the
+          // approval into a visible ambiguity, never auto-retry.
+          await pool.query(
+            `UPDATE approvals SET status='outcome_unknown', terminal_at=now(),
+               outcome_summary=$2 WHERE id=$1`,
+            [approval.id, "The upstream action may have executed."]
+          );
+          await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.outcome_unknown",
+            resource_type: "approval", resource_id: approval.id, result: "unknown",
+            metadata: { detail: err instanceof Error ? err.message : String(err) } });
+          return reply.code(502).send({ error: "outcome_unknown", approval_id: approval.id,
+            note: "The upstream action may have executed." });
+        }
+        const upstreamError = !!result && typeof result === "object" &&
+          (result as { isError?: unknown }).isError === true;
+        const bounded = redactDeep({ result });
+        await pool.query(
+          `UPDATE approvals SET status='response_received', response_is_error=$2,
+             terminal_at=now(), outcome_summary=$3, outcome_hash=$4 WHERE id=$1`,
+          [approval.id, upstreamError, boundedSummary(result), sha256Hex(stableStringify(bounded))]
+        );
+        await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.response_received",
+          resource_type: "approval", resource_id: approval.id,
+          result: upstreamError ? "error" : "success" });
+        return { result, approval_id: approval.id };
       }
 
       if (verdict.decision === "need_approval") {
+        // §9.4 queue protections: active-pending caps and a creation rate
+        // limit, counted against DB time. Limits only tighten (§9.4).
+        const pendingCaller = await client.query(
+          "SELECT count(*)::int AS n FROM approvals WHERE caller = $1 AND workspace_id = $2 AND status IN ('pending','approved')",
+          [caller, server.workspace_id]
+        );
+        const pendingWs = await client.query(
+          "SELECT count(*)::int AS n FROM approvals WHERE workspace_id = $1 AND status IN ('pending','approved')",
+          [server.workspace_id]
+        );
+        const recent = await client.query(
+          "SELECT count(*)::int AS n FROM approvals WHERE caller = $1 AND workspace_id = $2 AND requested_at > now() - interval '60 seconds'",
+          [caller, server.workspace_id]
+        );
+        if (pendingCaller.rows[0].n >= approvalEnv("APPROVAL_MAX_PENDING_PER_CALLER", 10) ||
+            pendingWs.rows[0].n >= approvalEnv("APPROVAL_MAX_PENDING_PER_WORKSPACE", 100)) {
+          return reply.code(429).send({ error: "approval_limit",
+            pending_caller: pendingCaller.rows[0].n, pending_workspace: pendingWs.rows[0].n });
+        }
+        if (recent.rows[0].n >= approvalEnv("APPROVAL_RATE_PER_MINUTE", 5)) {
+          return reply.code(429).send({ error: "approval_rate_limited", retry_after_seconds: 60 });
+        }
         const requestId = parsed.data.request_id ?? `req-${randomUUID()}`;
         const hash = requestHash(caller, server_id, tool, args as Record<string, unknown>, requestId);
         const expiresAt = new Date(Date.now() + APPROVAL_TTL_SECONDS * 1000).toISOString();
@@ -637,6 +814,7 @@ export function buildGateway() {
           resource_type: "approval", resource_id: row.id, result: "pending" });
         void notify(server.workspace_id, "approval.requested",
           { approval_id: row.id, caller, server_id, tool });
+        reply.header("Cache-Control", "no-store");
         return reply.code(202).send({ approval_id: row.id, status: row.status, expires_at: row.expires_at });
       }
 
@@ -652,21 +830,41 @@ export function buildGateway() {
     }
   });
 
-  app.get("/v1/approvals", async (req) => {
+  app.get("/v1/approvals", async (req, reply) => {
+    reply.header("Cache-Control", "no-store");
     const q = req.query as { status?: string; limit?: string };
     const limit = Math.min(Math.max(Number(q.limit ?? 50), 1), 200);
-    // Lazy expiry sweep: listing approvals flips any past-TTL pending row to
-    // expired (args dropped, redacted summary kept), so queues never show
-    // dead holds. The per-row pending guard keeps concurrent lists idempotent.
+    // Lazy recovery sweep, driven by DB time (§9.2 rules 2, 7, 9): pending
+    // past TTL expires; executing without a terminal outcome past the recovery
+    // window becomes OUTCOME_UNKNOWN. Claimed-without-executing cannot
+    // persist: claim and execution intent commit in one transaction.
     const stale = await pool.query(
       "SELECT * FROM approvals WHERE status = 'pending' AND expires_at < now()"
     );
     for (const row of stale.rows) {
       await pool.query(
-        `UPDATE approvals SET status='expired', args='{}'::jsonb, args_enc=false, args_summary=$2
-          WHERE id=$1 AND status='pending'`,
+        `UPDATE approvals SET status='expired', terminal_at=now(), args='{}'::jsonb,
+           args_enc=false, args_summary=$2 WHERE id=$1 AND status='pending'`,
         [row.id, safeSummary(row)]
       );
+      await audit(pool, { actor_type: "system", action: "approval.expired",
+        resource_type: "approval", resource_id: row.id, result: "expired" });
+    }
+    const stuck = await pool.query(
+      `SELECT id FROM approvals
+        WHERE status = 'executing'
+          AND execution_started_at < now() - ($1::int * interval '1 second')`,
+      [approvalEnv("APPROVAL_EXECUTION_TIMEOUT_SECONDS", 300)]
+    );
+    for (const row of stuck.rows) {
+      await pool.query(
+        `UPDATE approvals SET status='outcome_unknown', terminal_at=now(),
+           outcome_summary=$2 WHERE id=$1 AND status='executing'`,
+        [row.id, "The upstream action may have executed."]
+      );
+      await audit(pool, { actor_type: "system", action: "approval.outcome_unknown",
+        resource_type: "approval", resource_id: row.id, result: "unknown",
+        metadata: { reason: "recovery timeout" } });
     }
     const params: unknown[] = [];
     const where: string[] = [];
@@ -702,6 +900,7 @@ export function buildGateway() {
   });
 
   app.post("/v1/approvals/:id/decision", async (req, reply) => {
+    reply.header("Cache-Control", "no-store");
     const { id } = req.params as { id: string };
     const parsed = z.object({ approved: z.boolean(), reason: z.string().max(512).default("") }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_decision" });
@@ -750,7 +949,7 @@ export function buildGateway() {
            args_enc = CASE WHEN $4::boolean THEN false ELSE args_enc END,
            args_summary = CASE WHEN $4::boolean THEN $5 ELSE args_summary END
          WHERE id=$1 AND status='pending' RETURNING *`,
-        [id, parsed.data.approved ? "approved" : "denied", parsed.data.reason,
+        [id, parsed.data.approved ? "approved" : "rejected", parsed.data.reason,
          !parsed.data.approved, parsed.data.approved ? null : safeSummary(approval), actor]
       );
       if (!updated.rows[0]) {
@@ -760,7 +959,7 @@ export function buildGateway() {
       await client.query("COMMIT");
       await audit(pool, { actor_type: "approver", actor_id: actor, action: "approval.decide",
         resource_type: "approval", resource_id: id,
-        result: parsed.data.approved ? "approved" : "denied",
+        result: parsed.data.approved ? "approved" : "rejected",
         metadata: { reason: parsed.data.reason } });
       void notify(approval.workspace_id, "approval.decided",
         { approval_id: id, result: parsed.data.approved ? "approved" : "denied" });

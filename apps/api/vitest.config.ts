@@ -7,7 +7,9 @@ export default defineConfig({
     setupFiles: ["./tests/setup.ts"],
     // Integration hooks open a database pool and a real MCP upstream; the
     // default 10s is tight when the whole file suite runs in parallel.
-    hookTimeout: 30_000
+    hookTimeout: 30_000,
+    // A hung-upstream case legitimately waits for the SDK's bounded retry.
+    testTimeout: 30_000
   },
   resolve: {
     alias: {
