@@ -22,44 +22,44 @@ gateway row reports itself as skipped.
 ## A run of it
 
 Measured 2026-10-17 on a Windows 11 dev box: Docker Desktop Postgres, Node 22,
-1422 runs and 562 spans with usage in the database, 30 sequential requests per
+2215 runs and 726 spans with usage in the database, 50 sequential requests per
 path, warmed database.
 
 | Path | n | p50 | p95 | max | mean |
 |---|---|---|---|---|---|
-| `GET /healthz` | 30 | 15ms | 16ms | 92ms | 14ms |
-| `GET /v1/overview` | 30 | 29ms | 52ms | 66ms | 30ms |
-| `GET /v1/runs?limit=50` | 30 | 8ms | 13ms | 20ms | 9ms |
-| `POST /v1/ingest/events` (1 event) | 30 | 30ms | 70ms | 919ms | 65ms |
-| `POST /v1/gateway/tools/call` (incl. upstream) | 30 | 360ms | 458ms | 530ms | 362ms |
+| `GET /healthz` | 50 | 15ms | 16ms | 16ms | 13ms |
+| `GET /v1/overview` | 50 | 31ms | 37ms | 55ms | 31ms |
+| `GET /v1/runs?limit=50` | 50 | 6ms | 7ms | 19ms | 7ms |
+| `POST /v1/ingest/events` (1 event) | 50 | 29ms | 93ms | 15421ms | 346ms |
+| `POST /v1/gateway/tools/call` (incl. upstream) | 50 | 66ms | 75ms | 612ms | 74ms |
 
 Against the §14 engineering targets:
 
 | Target | Budget | Measured | Verdict |
 |---|---|---|---|
-| Typical dashboard queries | p95 < 500ms | 52ms | inside |
-| Ingestion-to-dashboard visibility | p95 < 3s | 70ms | inside |
-| Gateway policy overhead | p95 < 100ms | not isolated | see below |
+| Typical dashboard queries | p95 < 500ms | 37ms | inside |
+| Ingestion-to-dashboard visibility | p95 < 3s | 93ms | inside |
+| Gateway policy overhead | p95 < 100ms | 15ms over 110 decisions | inside |
 
-The gateway row measures the whole proxied call — policy decision, upstream MCP
-round trip, and the span write — because that is what a client experiences. The
-spec's 100ms budget covers the policy decision alone, excluding upstream
-execution and human approval, so 458ms is an upper bound on it, not the target
-being missed. Isolating the decision needs a timing instrument inside the
-gateway; until that exists, quote this row as a whole-call figure.
+The gateway figure is measured, not inferred. The gateway records how long each
+policy decision took in `policy_decisions.overhead_ms`, read before the call is
+forwarded, so the upstream round trip is excluded by construction rather than by
+subtraction. `scripts/bench.mjs` reports the p95 from that trail when
+`DATABASE_URL` is set. The whole-call row above includes the upstream round trip
+and the span write, which is what a client experiences; it is not the target.
 
-An earlier version of this file recorded a gateway p95 of 15.7s. That run timed a
-build where every call paid a fresh MCP handshake and this machine was stalling
-requests for 5-17s; a back-to-back run of the same build showed the stalls too,
-so they were environmental rather than a pooling regression. The numbers above
-come from the committed script, which is the only reason they are worth
-comparing to anything.
+An earlier version of this file recorded a gateway p95 of 15.7s and called the
+policy overhead "not isolated". The second is now fixed; the first was this
+machine stalling requests for 5-17s, which it still does — see the ingest max
+below. That stall is environmental rather than a pooling regression, and a
+back-to-back run of the same build showed it too.
 
 ## Reading the max column
 
-Occasional 500ms-900ms maxima come from this machine stalling individual
-requests. Cold starts miss every target. Rerun on Linux server hardware before
-quoting these numbers anywhere else.
+Occasional multi-second maxima (15.4s on ingest above) come from this machine
+stalling individual requests; the p50 and p95 on the same run are unaffected,
+which is why the targets are quoted at p95. Cold starts miss every target.
+Rerun on Linux server hardware before quoting these numbers anywhere else.
 
 ## Idempotency
 

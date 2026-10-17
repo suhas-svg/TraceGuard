@@ -35,7 +35,7 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 - `GET /v1/runs`, `GET /v1/runs/:id`, `GET /v1/runs/:id/trace`, `GET /v1/runs/:id/usage` read stored runs with token and cost breakdowns.
 - Gateway on :8091: upstream registry, tool discovery with definition pinning, allow/deny/approval policies, single-use bound approvals, hash-chained audit.
 - Budgets with atomic reserve-and-settle plus a Python `BudgetGuard` wrapper.
-- Evaluations: versioned suites, scripted replay, deterministic assertions, run comparison.
+- Evaluations: versioned suites, scripted or live replay, deterministic assertions, run comparison.
 - The dashboard has Overview, Runs, Evaluations, Policy, Approvals, Webhooks,
   Retention, Costs, and Users tabs: KPI tiles with usage and spend charts, run
   search and traces, suite creation and runs with comparison, server
@@ -110,6 +110,13 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
   locked dataset differently.
 - The compare endpoint reports pass rate, latency spread, cost, and denied
   tool violations side by side, with missing data shown as missing.
+- A run executes through a registered adapter. `scripted` replays the case's
+  declared behavior; `http` posts the case to a live endpoint and records what
+  it answers, so the case exercises the agent rather than a description of it.
+  Both write through the same run contract, so assertions, latency, cost, and
+  the per-case run link behave identically either way. The call goes through
+  the same SSRF guard as every other outbound request, and an unreachable
+  endpoint fails its own case rather than discarding the whole run.
 - The dashboard has an Evaluations tab: suite list, per-case results with
   failure reasons, links back to traces, and a two-run comparison.
 
@@ -185,19 +192,10 @@ memberships, and OTLP ingestion landed on top; their sections are under
 
 ## Roadmap: next integrations
 
-- Live evaluation adapters: register a real agent endpoint so replays exercise the
-  agent itself, not just the recorded execution config. This is the one
-  functional requirement still short of the spec: replay runs a registered
-  scripted adapter, and `eval_results.agent_run_id` already links each case to a
-  real run, so an HTTP adapter is the missing piece rather than a redesign.
-- Projects as a first-class policy target (agent, project, server, tool), with
-  per-project budgets. The spec names a project dimension in four places
-  (policy targeting, budgets, cost grouping, cost explorer); nothing in the
-  schema carries one today.
-- Cost explorer drill-downs: per-agent breakdowns and an
-  input-vs-output cost split.
+- Cost explorer drill-downs: an input-vs-output cost split on the group-by view.
 - OTLP export from TraceGuard, plus log ingestion alongside traces.
+- A deployment that has actually been rolled out. The manifests are rendered and
+  checked by `infra/k8s/check.py`, never applied to a cluster, and the §14
+  numbers in `docs/PERFORMANCE.md` come from one Windows dev box.
 - SSO/OIDC for the dashboard, replacing bearer-token login.
 - Alerting integrations (Slack, PagerDuty) on top of the existing webhook events.
-- A timing instrument inside the gateway, so the §14 policy-decision budget can
-  be measured on its own rather than inferred from a whole-call figure.
