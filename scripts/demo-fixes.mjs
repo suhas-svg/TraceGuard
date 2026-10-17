@@ -30,7 +30,8 @@ function head(n, title) {
   console.log(`\n${"─".repeat(78)}\n${n}. ${title}\n`);
 }
 function check(label, ok, detail) {
-  ok ? passed++ : failed++;
+  if (ok) passed += 1;
+  else failed += 1;
   console.log(`   ${ok ? "PASS" : "FAIL"}  ${label}`);
   if (detail !== undefined) console.log(`         ${detail}`);
 }
@@ -460,6 +461,7 @@ head(15, "Dashboard: the command palette is modal and returns focus");
   await page.keyboard.press("Escape");
   await page.waitForTimeout(400);
   const stillOpen = await page.getByRole("dialog", { name: "Command palette" }).count();
+  // eslint-disable-next-line no-undef -- this callback runs in the page, not in node
   const focusBack = await page.evaluate(() => document.activeElement?.textContent?.trim() ?? "");
   check("the overlay declares itself modal", modal === "true",
     `role=dialog aria-modal=${modal}`);
