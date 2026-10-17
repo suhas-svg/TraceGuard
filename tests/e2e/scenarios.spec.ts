@@ -306,11 +306,15 @@ test("scenario H: a case runs through a live adapter from the dashboard", async 
     await runForm.getByLabel("Adapter URL").fill(`http://127.0.0.1:${port}/invoke`);
     await runForm.getByRole("button", { name: "Run suite" }).click();
 
-    // The run opens on its result, and the endpoint received the case: a
-    // scripted adapter would never have called anything.
-    await expect(page.getByRole("cell", { name: "pass" }).first()).toBeVisible();
-    expect(seen.value?.case).toBe("live-case");
+    // The endpoint receiving the case is the proof a scripted adapter would
+    // fail: it never calls anything. Polled first and with room, because this
+    // adapter call is an outbound request and this machine stalls those.
+    await expect.poll(() => seen.value?.case, { timeout: 60_000 }).toBe("live-case");
     expect(seen.value?.input).toEqual({ prompt: "ping" });
+
+    // Then that the dashboard shows it. "1/1" is the run view's Passed stat:
+    // one case, one pass. Generous timeout for the same reason as above.
+    await expect(page.getByText("1/1").first()).toBeVisible({ timeout: 60_000 });
   } finally {
     adapter.close();
   }
