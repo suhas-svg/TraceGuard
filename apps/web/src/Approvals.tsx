@@ -50,6 +50,27 @@ function ApprovalCard({ a, onChanged }: { a: Approval; onChanged: () => void }) 
         {JSON.stringify(a.args, null, 2)}
       </pre>
       {a.decision_reason && <p className="mt-2 text-ink-500">Reason: {a.decision_reason}</p>}
+      {a.status === "outcome_unknown" && (
+        <p className="mt-2 text-sm text-ink-800">
+          <strong>The upstream action may have executed.</strong> Inspect the upstream
+          system before taking further action. This approval cannot be retried.
+        </p>
+      )}
+      {a.status === "policy_invalidated" && (
+        <p className="mt-2 text-sm text-ink-500">
+          A policy change invalidated this approval before execution. It was never sent upstream.
+        </p>
+      )}
+      {a.status === "tool_quarantined" && (
+        <p className="mt-2 text-sm text-ink-500">
+          The tool definition changed and was quarantined after this approval was issued.
+        </p>
+      )}
+      {a.status === "response_received" && a.response_is_error && (
+        <p className="mt-2 text-sm text-ink-500">
+          The tool returned an error; that is not proof it caused no side effect.
+        </p>
+      )}
       {error && <div className="mt-2"><Alert>{error}</Alert></div>}
       {result && <p className="mt-2 text-sm text-ok-800">{result}</p>}
       {a.status === "pending" && (
@@ -98,9 +119,12 @@ export default function ApprovalsView() {
               { value: "pending", label: "Pending" },
               { value: "", label: "All" },
               { value: "approved", label: "Approved" },
-              { value: "denied", label: "Denied" },
+              { value: "rejected", label: "Rejected" },
               { value: "expired", label: "Expired" },
-              { value: "consumed", label: "Consumed" }
+              { value: "executing", label: "Executing" },
+              { value: "response_received", label: "Executed" },
+              { value: "outcome_unknown", label: "Outcome unknown" },
+              { value: "policy_invalidated", label: "Invalidated" }
             ]}
           />
           <Button onClick={reload}>Refresh</Button>

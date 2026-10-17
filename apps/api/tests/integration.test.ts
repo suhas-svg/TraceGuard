@@ -232,7 +232,7 @@ describe("integration and security", () => {
     // the args hash remain once the call has executed.
     const consumed = await pool.query(
       "SELECT status, args_enc, args, args_summary FROM approvals WHERE id = $1", [approvalId]);
-    expect(consumed.rows[0].status).toBe("consumed");
+    expect(consumed.rows[0].status).toBe("response_received");
     expect(consumed.rows[0].args_enc).toBe(false);
     expect(consumed.rows[0].args).toEqual({});
     expect(consumed.rows[0].args_summary).toContain("wait");
@@ -729,7 +729,10 @@ describe("integration and security", () => {
       gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key, payload })
     ]);
     const codes = [a.statusCode, b.statusCode].sort((x, y) => x - y);
-    expect(codes).toEqual([200, 410]);
+    // One retry claims and executes; the other observes the live/terminal
+    // state (409 while executing, 410 once a response was recorded).
+    expect(codes.filter((c) => c === 200)).toHaveLength(1);
+    expect(codes.every((c) => c === 200 || c === 409 || c === 410)).toBe(true);
     expect(upstreamHits).toBe(before + 1);
   });
 
@@ -830,9 +833,10 @@ describe("integration and security", () => {
     expect(retry.statusCode).toBe(403);
     expect(retry.json().reason).toContain(`late-deny-${tag}`);
     expect(upstreamHits).toBe(before);
-    // The denied retry did not consume the approval.
+    // The denied retry never consumed the approval; it invalidated it, so it
+    // can never execute even if the deny rule is later removed.
     const row = await pool.query("SELECT status FROM approvals WHERE id = $1", [approvalId]);
-    expect(row.rows[0].status).toBe("approved");
+    expect(row.rows[0].status).toBe("policy_invalidated");
   });
 
   it("denies gateway calls once a covering block budget is exhausted", async () => {
@@ -919,7 +923,7 @@ describe("integration and security", () => {
     expect(dec.statusCode).toBe(200);
     const deniedRow = (await pool.query(
       "SELECT status, args_enc, args, args_summary FROM approvals WHERE id = $1", [deniedId])).rows[0];
-    expect(deniedRow.status).toBe("denied");
+    expect(deniedRow.status).toBe("rejected");
     expect(deniedRow.args_enc).toBe(false);
     expect(deniedRow.args).toEqual({});
     expect(deniedRow.args_summary).toContain("[REDACTED]");
@@ -941,7 +945,7 @@ describe("integration and security", () => {
     expect(retry.statusCode).toBe(200);
     const goneRow = (await pool.query(
       "SELECT status, args_enc, args, args_summary FROM approvals WHERE id = $1", [okId])).rows[0];
-    expect(goneRow.status).toBe("consumed");
+    expect(goneRow.status).toBe("response_received");
     expect(goneRow.args_enc).toBe(false);
     expect(goneRow.args).toEqual({});
     expect(goneRow.args_summary).toContain(`ok-${tag}`);

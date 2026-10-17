@@ -343,6 +343,8 @@ export interface Approval {
   status: string;
   expires_at: string;
   decision_reason: string;
+  response_is_error?: boolean | null;
+  outcome_summary?: string;
 }
 
 export interface AuditEvent {

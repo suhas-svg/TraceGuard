@@ -107,12 +107,15 @@ interface PooledClient {
 const pool = new Map<string, PooledClient>();
 const IDLE_MS = 60_000;
 
-// Operator-tunable ceiling on one upstream exchange. The MCP SDK's own 60s
-// protocol default rejects the promise but never aborts the HTTP request, so a
-// hung upstream would pin the socket and this server's pool slot. The signal
-// is created per request, not per client: a signal made at connect time would
-// expire 60s after the client was opened and then abort every later call.
-const UPSTREAM_TIMEOUT_MS = Math.max(1_000, Number(process.env.UPSTREAM_TIMEOUT_MS ?? 60_000));
+// Operator-tunable ceiling on one upstream exchange (read per request so a
+// test can shorten it). The MCP SDK's own 60s protocol default rejects the
+// promise but never aborts the HTTP request, so a hung upstream would pin the
+// socket and this server's pool slot. The signal is created per request, not
+// per client: a signal made at connect time would expire 60s after the client
+// was opened and then abort every later call.
+function upstreamTimeoutMs(): number {
+  return Math.max(1_000, Number(process.env.UPSTREAM_TIMEOUT_MS ?? 60_000));
+}
 
 // The last hop before the socket. Registration, discover, and call all resolve
 // the name, but the transport resolves it again when it connects, so a name that
@@ -122,7 +125,7 @@ const UPSTREAM_TIMEOUT_MS = Math.max(1_000, Number(process.env.UPSTREAM_TIMEOUT_
 export async function guardedFetch(url: string | URL, init?: RequestInit): Promise<Response> {
   const allowed = await checkUpstreamUrlResolved(String(url));
   if (!allowed.ok) throw new Error(`upstream refused: ${allowed.reason}`);
-  return fetch(url, { ...init, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+  return fetch(url, { ...init, signal: AbortSignal.timeout(upstreamTimeoutMs()) });
 }
 
 function poolKey(baseUrl: string, authSecret: string | null): string {
@@ -208,6 +211,10 @@ export async function callUpstreamTool(
   args: Record<string, unknown>
 ): Promise<unknown> {
   return withClient(baseUrl, authSecret, async (client) =>
-    client.callTool({ name: toolName, arguments: args })
+    // The SDK's default request timeout is 60s and only rejects the promise;
+    // pairing it with our own bound makes a hung server fail in bounded time.
+    client.callTool({ name: toolName, arguments: args }, undefined, {
+      timeout: upstreamTimeoutMs()
+    })
   );
 }
