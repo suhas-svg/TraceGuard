@@ -1,0 +1,76 @@
+{
+  "suite": {
+    "name": "reference-agent-baseline",
+    "description": "Three scripted cases covering a clean answer, a tool call, and a failure. Replay it against two configurations and compare pass rate, latency, cost, and tool violations."
+  },
+  "cases": [
+    {
+      "name": "greeting",
+      "input_payload": { "prompt": "say hello" },
+      "expected": "hello world",
+      "assertions": [
+        { "type": "contains", "value": "hello" },
+        { "type": "status", "value": "success" }
+      ],
+      "exec_config": { "output": "hello world", "latency_ms": 5, "input_tokens": 10, "output_tokens": 5 }
+    },
+    {
+      "name": "tool-read",
+      "input_payload": { "prompt": "read the config file" },
+      "assertions": [
+        { "type": "tools", "names": ["read_file"] },
+        { "type": "status", "value": "success" }
+      ],
+      "exec_config": {
+        "output": "read 12 bytes",
+        "latency_ms": 12,
+        "input_tokens": 40,
+        "output_tokens": 8,
+        "tools": [{ "tool": "read_file", "args": { "path": "/etc/app/config.yaml" } }]
+      }
+    },
+    {
+      "name": "json-shape",
+      "input_payload": { "prompt": "return the summary as JSON" },
+      "assertions": [
+        {
+          "type": "json_schema",
+          "schema": {
+            "type": "object",
+            "required": ["summary", "count"],
+            "properties": {
+              "summary": { "type": "string" },
+              "count": { "type": "integer" }
+            }
+          }
+        }
+      ],
+      "exec_config": {
+        "output": "{\"summary\": \"all good\", \"count\": 3}",
+        "latency_ms": 20,
+        "input_tokens": 60,
+        "output_tokens": 30
+      }
+    }
+  ],
+  "runs": [
+    {
+      "label": "baseline",
+      "agent_name": "reference-agent",
+      "config_fingerprint": "baseline",
+      "model": "scripted-1",
+      "trials": 1
+    },
+    {
+      "label": "regression",
+      "agent_name": "reference-agent",
+      "config_fingerprint": "regressed",
+      "model": "scripted-1",
+      "trials": 1,
+      "exec_overrides": {
+        "greeting": { "output": "goodbye", "latency_ms": 90, "input_tokens": 400, "output_tokens": 200 },
+        "tool-read": { "tools": [] }
+      }
+    }
+  ]
+}

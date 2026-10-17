@@ -20,6 +20,7 @@ variable, which is how the compose file reads them.
 | DIAG_MAX_DURATION_MS | api | 1800000 | advisory diagnostics: run duration in ms |
 | DIAG_MAX_TOKENS | api | 1000000 | advisory diagnostics: tokens per run |
 | DIAG_REPEATED_FAILURES | api | 3 | advisory diagnostics: identical tool failures |
+| UPSTREAM_TIMEOUT_MS | gateway | 60000 | ceiling on one upstream MCP exchange; aborts the request itself |
 | PORT | api | 8080 | container side; compose maps the host to 8090 |
 
 Ports on a dev machine: API 8090, gateway 8091, mock tools 8092
@@ -66,7 +67,7 @@ Member keys cannot auto-create workspaces by naming new ones; unknown names
 are denied, not conjured.
 
 Reads are scoped the same way. Run lists, run detail, traces, usage,
-servers, policies, approvals, decisions, and eval runs show only the
+servers, policies, approvals, decisions, budgets, and eval runs show only the
 caller's workspaces; foreign ids read as 404 so they cannot be probed.
 Registry reads (servers, policies) need only read scope, while every write
 to them stays admin. Eval suites and cases are shared templates with no

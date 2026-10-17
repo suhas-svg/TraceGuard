@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { opsApi, type TeamUser, type Workspace } from "./api";
+import { ApiError, opsApi, type TeamUser, type Workspace } from "./api";
 import {
   Alert, Badge, Button, Card, Empty, Field, Input,
   Page, Select
@@ -160,15 +160,22 @@ export default function UsersView() {
   const workspacesQuery = useQuery({ queryKey: ["workspaces"], queryFn: () => opsApi.workspaces() });
   const workspaces = workspacesQuery.data?.items ?? [];
   const loadError = teamQuery.error ?? workspacesQuery.error;
-  const denied = loadError instanceof Error && /forbidden|unauthorized/i.test(loadError.message);
-  const loadFailed = loadError && !denied ? (loadError instanceof Error ? loadError.message : "load failed") : "";
+  // Branch on the status, not on the message: a 401 (bad key) and a 403
+  // (key is not an admin) used to be swapped, so a wrong key was reported as a
+  // permissions problem and a real non-admin key showed a bare "request
+  // failed: 403" above a Loading... that never resolved.
+  const forbidden = loadError instanceof ApiError && loadError.status === 403;
+  const badKey = loadError instanceof ApiError && loadError.status === 401;
+  const keyHint = badKey ? "unauthorized: check the API key in settings" : "";
+  const loadFailed = loadError && !forbidden && !badKey
+    ? (loadError instanceof Error ? loadError.message : "load failed") : "";
   const users = teamQuery.data?.items ?? null;
 
   const reload = () => queryClient.invalidateQueries();
 
   const nameOf = (id: string) => workspaces.find((w) => w.id === id)?.name ?? id.slice(0, 8);
 
-  if (denied) {
+  if (forbidden) {
     return (
       <Page title="Users" sub="Team, keys, and workspace membership.">
         <Empty hint="Admin only. Connect with an admin key to manage the team." />
@@ -181,7 +188,7 @@ export default function UsersView() {
       title="Users"
       sub="Team, keys, and workspace membership. Key plaintext shows once, at mint."
     >
-      {(error || loadFailed) && <Alert>{error || loadFailed}</Alert>}
+      {(error || loadFailed || keyHint) && <Alert>{error || loadFailed || keyHint}</Alert>}
       <div className="mb-5 grid gap-4 lg:grid-cols-2">
         <Card className="p-4">
           <h3 className="mb-2 text-sm font-semibold text-ink-700">New user</h3>
@@ -249,8 +256,10 @@ export default function UsersView() {
         </Card>
       </div>
       {users === null ? (
-        <p className="text-sm text-ink-500">Loading...</p>
-      ) : users.length === 0 && !denied ? (
+        // An errored fetch is reported by the Alert above, not as a Loading...
+        // that never resolves.
+        loadError ? null : <p className="text-sm text-ink-500">Loading...</p>
+      ) : users.length === 0 && !forbidden ? (
         <Empty hint="No users yet." />
       ) : (
         users.map((u) => (

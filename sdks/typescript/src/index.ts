@@ -20,8 +20,8 @@ export function nowIso(): string {
 }
 
 export class TraceGuardClient {
-  private queue: Record<string, unknown>[] = [];
   private pending: Promise<unknown>[] = [];
+  private inFlight = 0;
   private readonly maxQueue = 500;
 
   constructor(
@@ -32,21 +32,32 @@ export class TraceGuardClient {
   ) {}
 
   private post(payload: unknown): void {
+    // Serialising can throw (a circular reference, a BigInt attribute). Kept
+    // inside the guarded path, like a network failure, so telemetry never
+    // throws into the agent.
+    let body: string;
+    try {
+      body = JSON.stringify(payload);
+    } catch {
+      return;
+    }
+    this.inFlight += 1;
     const task = fetch(`${this.baseUrl.replace(/\/$/, "")}/v1/ingest/events`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.apiKey}` },
-      body: JSON.stringify(payload),
+      body,
       signal: AbortSignal.timeout(30000)
-    }).catch(() => undefined); // telemetry fails open by design
+    }).catch(() => undefined) // telemetry fails open by design
+      .finally(() => { this.inFlight -= 1; });
     this.pending.push(task);
   }
 
   emit(event: Record<string, unknown>): void {
-    if (this.queue.length >= this.maxQueue) return;
-    this.queue.push(event);
-    const batch = this.queue;
-    this.queue = [];
-    this.post({ events: batch });
+    // Shed past the bound instead of growing without limit. The previous check
+    // tested a queue that emit itself emptied on every call, so it never fired
+    // and the real growth was one unsettled request per event.
+    if (this.inFlight >= this.maxQueue) return;
+    this.post({ events: [event] });
   }
 
   async flush(timeoutMs = 30000): Promise<void> {

@@ -75,7 +75,9 @@ export function checkUpstreamUrl(raw: string): { ok: boolean; reason?: string } 
 
 // Resolve DNS names and reject those pointing at private ranges, unless the
 // operator explicitly allowed private upstreams. IP literals were already
-// classified by checkUpstreamUrl.
+// classified by checkUpstreamUrl. Every answer is checked, not just the first:
+// a name that returns one public and one private address is a rebinding attempt,
+// and taking whichever the resolver listed first would let it through.
 export async function checkUpstreamUrlResolved(raw: string): Promise<{ ok: boolean; reason?: string }> {
   const sync = checkUpstreamUrl(raw);
   if (!sync.ok) return sync;
@@ -83,14 +85,15 @@ export async function checkUpstreamUrlResolved(raw: string): Promise<{ ok: boole
   const host = new URL(raw).hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(":")) return { ok: true };
   const { lookup } = await import("node:dns/promises");
-  let address: string;
+  let addresses: { address: string }[];
   try {
-    ({ address } = await lookup(host));
+    addresses = await lookup(host, { all: true });
   } catch {
     return { ok: false, reason: "upstream host does not resolve" };
   }
-  if (isPrivateHost(address)) {
-    return { ok: false, reason: "upstream host resolves to a private address" };
+  const priv = addresses.find((a) => isPrivateHost(a.address));
+  if (priv) {
+    return { ok: false, reason: `upstream host resolves to a private address (${priv.address})` };
   }
   return { ok: true };
 }
@@ -104,13 +107,34 @@ interface PooledClient {
 const pool = new Map<string, PooledClient>();
 const IDLE_MS = 60_000;
 
+// Operator-tunable ceiling on one upstream exchange. The MCP SDK's own 60s
+// protocol default rejects the promise but never aborts the HTTP request, so a
+// hung upstream would pin the socket and this server's pool slot. The signal
+// is created per request, not per client: a signal made at connect time would
+// expire 60s after the client was opened and then abort every later call.
+const UPSTREAM_TIMEOUT_MS = Math.max(1_000, Number(process.env.UPSTREAM_TIMEOUT_MS ?? 60_000));
+
+// The last hop before the socket. Registration, discover, and call all resolve
+// the name, but the transport resolves it again when it connects, so a name that
+// answered publicly at those checks and privately a moment later would still be
+// dialled. Re-checking here leaves only the gap between this resolve and the
+// socket, and the timeout above stops a hung upstream from pinning the pool.
+export async function guardedFetch(url: string | URL, init?: RequestInit): Promise<Response> {
+  const allowed = await checkUpstreamUrlResolved(String(url));
+  if (!allowed.ok) throw new Error(`upstream refused: ${allowed.reason}`);
+  return fetch(url, { ...init, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+}
+
 function poolKey(baseUrl: string, authSecret: string | null): string {
   return sha256Hex(`${baseUrl}|${authSecret ?? ""}`);
 }
 
 async function openClient(baseUrl: string, authSecret: string | null): Promise<Client> {
   const headers = authSecret ? { Authorization: "Bearer " + authSecret } : undefined;
-  const transport = new StreamableHTTPClientTransport(new URL(baseUrl), { requestInit: { headers } });
+  const transport = new StreamableHTTPClientTransport(new URL(baseUrl), {
+    requestInit: { headers },
+    fetch: guardedFetch
+  });
   const client = new Client({ name: "traceguard-gateway", version: "0.1.0" });
   // The gateway holds upstream credentials and injects them here. Agent
   // tokens never leave the gateway toward upstream servers.

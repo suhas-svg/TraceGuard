@@ -24,9 +24,17 @@ spec:
       labels:
         app: gateway
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: gateway
-          image: traceguard/api:latest
+          image: traceguard/api:v1.16.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
           args: ["node", "apps/api/dist/gateway.js"]
           ports:
             - containerPort: 8091

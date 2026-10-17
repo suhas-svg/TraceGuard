@@ -39,6 +39,32 @@ describe("typescript sdk", () => {
     await expect(client.flush(50)).resolves.toBeUndefined();
   });
 
+  it("never throws when an attribute cannot be serialised", async () => {
+    const client = new TraceGuardClient("http://x:8090", "k");
+    const circular: Record<string, unknown> = { name: "loop" };
+    circular.self = circular;
+    expect(() => client.modelEvent("run-1", { attributes: circular })).not.toThrow();
+    expect(() => client.modelEvent("run-1", { attributes: { big: BigInt(1) } })).not.toThrow();
+    // The un-serialisable events are shed, and the client is still usable.
+    const runId = client.startRun();
+    await client.flush(50);
+    expect(posted.some((p) => p.url.endsWith("/v1/ingest/events"))).toBe(true);
+    expect((posted.flatMap((p) => p.body.events as Record<string, unknown>[]))
+      .some((e) => e.run_id === runId)).toBe(true);
+  });
+
+  it("sheds past the bound instead of growing without limit", async () => {
+    const calls = { n: 0 };
+    vi.stubGlobal("fetch", vi.fn(() => {
+      calls.n += 1;
+      return new Promise(() => {}); // never settles: the bound is the only limit
+    }));
+    const client = new TraceGuardClient("http://x:8090", "k");
+    for (let i = 0; i < 600; i++) client.emit({ i });
+    // 500 in flight, the rest shed; without a real bound this would be 600.
+    expect(calls.n).toBe(500);
+  });
+
   it("raises BudgetExceeded instead of calling past the limit", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       status: 409,

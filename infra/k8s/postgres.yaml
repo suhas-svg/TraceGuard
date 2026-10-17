@@ -25,6 +25,10 @@ spec:
       labels:
         app: postgres
     spec:
+      # runAsNonRoot is deliberately unset: the image entrypoint needs root
+      # for its first-init chown, then drops to the postgres user itself.
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: postgres
           image: postgres:17-alpine

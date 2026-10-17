@@ -127,6 +127,30 @@ def test_emit_drops_instead_of_blocking_when_the_queue_is_full(base_url, backend
     assert ids == ["evt-kept"]
 
 
+def test_emit_keeps_one_sender_under_a_slow_endpoint(base_url, backend):
+    # A blocking endpoint used to cost one live thread per event, each holding
+    # its payload until flush. The bound must hold the sender count down.
+    release = threading.Event()
+
+    def slow(path, body):
+        release.wait(timeout=10)
+        return 200, {"ok": True}
+
+    backend.response_for = slow
+    client = TraceGuardClient(base_url, "k")
+    baseline = threading.active_count()
+    try:
+        for i in range(50):
+            client.emit({"schema_version": "1", "event_id": f"evt-{i}", "run_id": "r",
+                         "span_id": "s", "event_type": "run.started",
+                         "timestamp": "2026-01-01T00:00:00.000Z", "attributes": {}})
+        assert threading.active_count() - baseline < 20
+    finally:
+        release.set()
+    client.flush(timeout=20)
+    assert len(ingest_events(backend)) == 50
+
+
 def test_budget_guard_reserves_then_settles(base_url, backend):
     def plan(path, body):
         if path == "/v1/budgets/check":

@@ -961,6 +961,95 @@ describe("integration and security", () => {
     expect(unauth.statusCode).toBe(401);
   });
 
+  it("caps a project's spend, measured from the project rather than a counter", async () => {
+    // The default workspace is the project. Seed spend inside the test rather
+    // than measuring whatever earlier tests left behind: on a clean database
+    // there is nothing to find, and the check would pass for the wrong reason.
+    const prov = `proj-${tag}`;
+    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+      payload: { provider: prov, model: "m", input_price_per_million: 1_000_000,
+        output_price_per_million: 0 } });
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: {
+      events: [ ev({ run_id: randomUUID(), event_type: "model.request",
+        timestamp: new Date().toISOString(), provider: prov, model: "m",
+        input_tokens: 500, output_tokens: 0, usage_source: "provider_reported" }) ] } });
+
+    const ws = await api.inject({ method: "GET", url: "/v1/workspaces", headers: key });
+    const def = ws.json().items.find((w: { name: string }) => w.name === "default");
+    const b = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "project", ref_id: def.id, limit_micro: 1, effect: "block" } });
+    expect(b.statusCode).toBe(201);
+
+    const check = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+      payload: { budget_id: b.json().id, max_cost_micro: 0 } });
+    // Measuring the budget's own ledger instead returns 0 spent and a 200 with
+    // the whole limit apparently available, which is the bug this pins.
+    expect(check.statusCode).toBe(409);
+    expect(check.json().spent_micro).toBeGreaterThan(0);
+
+    // The list agrees, so the dashboard cannot show headroom that is not there.
+    const list = await api.inject({ method: "GET", url: "/v1/budgets?scope=project&limit=500", headers: key });
+    const row = list.json().items.find((x: { id: string }) => x.id === b.json().id);
+    expect(row.spent_micro).toBeGreaterThan(0);
+    expect(row.remaining_micro).toBeLessThan(0);
+  });
+
+  it("refuses a project budget that names no workspace", async () => {
+    const res = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "project", ref_id: randomUUID(), limit_micro: 1000 } });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("unknown_workspace");
+  });
+
+  it("groups costs by agent, project, and reporting period", async () => {
+    // Section 12.1 names all of these dimensions. Each branch builds different
+    // SQL, so each one has to be executed, not just accepted as a parameter.
+    const prov = `grp-${tag}`;
+    const agentName = `grp-agent-${tag}`;
+    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+      payload: { provider: prov, model: "m", input_price_per_million: 1_000_000,
+        output_price_per_million: 0 } });
+    const runId = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: {
+      events: [
+        ev({ run_id: runId, agent_name: agentName, event_type: "model.request",
+          timestamp: new Date().toISOString(), provider: prov, model: "m",
+          input_tokens: 500, output_tokens: 0, usage_source: "provider_reported" }),
+        ev({ run_id: runId, agent_name: agentName, event_type: "run.completed",
+          timestamp: new Date().toISOString() })
+      ] } });
+    const start = new Date(Date.now() - 3_600_000).toISOString();
+    const end = new Date(Date.now() + 60_000).toISOString();
+    const q = `period_start=${encodeURIComponent(start)}&period_end=${encodeURIComponent(end)}`;
+
+    const byAgent = await api.inject({ method: "GET",
+      url: `/v1/reconciliation/compare?${q}&group_by=agent`, headers: key });
+    expect(byAgent.statusCode).toBe(200);
+    expect(byAgent.json().group_by).toBe("agent");
+    const agentRow = byAgent.json().rows.find((r: { model: string }) => r.model === agentName);
+    expect(agentRow?.estimated_micro).toBeGreaterThanOrEqual(500);
+    // Actuals are recorded per provider and model, so another dimension reports
+    // no actual rather than a share of one that would be invented.
+    expect(agentRow?.actual_micro).toBeNull();
+
+    const byProject = await api.inject({ method: "GET",
+      url: `/v1/reconciliation/compare?${q}&group_by=project`, headers: key });
+    expect(byProject.statusCode).toBe(200);
+    expect(byProject.json().rows.length).toBeGreaterThanOrEqual(1);
+    expect(byProject.json().rows.every((r: { actual_micro: unknown }) => r.actual_micro === null)).toBe(true);
+
+    const byPeriod = await api.inject({ method: "GET",
+      url: `/v1/reconciliation/compare?${q}&group_by=period&bucket=day`, headers: key });
+    expect(byPeriod.statusCode).toBe(200);
+    expect(byPeriod.json().rows.length).toBeGreaterThanOrEqual(1);
+    expect(byPeriod.json().rows.every((r: { estimated_micro: number }) => r.estimated_micro >= 0)).toBe(true);
+
+    const bad = await api.inject({ method: "GET",
+      url: `/v1/reconciliation/compare?${q}&group_by=nope`, headers: key });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().error).toBe("invalid_group_by");
+  });
+
   it("filters runs by date window, provider, model and evaluation run", async () => {
     const runId = randomUUID();
     const prov = `flt-${tag}`;
@@ -1149,5 +1238,200 @@ describe("integration and security", () => {
     const after = await api.inject({ method: "GET",
       url: `/v1/evaluations/runs/compare?ids=${aId},${bId}`, headers: key });
     expect(rowFor(after.json())?.violations).toBeNull();
+  });
+
+  it("releases an abandoned reservation instead of wedging the budget", async () => {
+    const budget = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: randomUUID(), limit_micro: 1000 } });
+    const budgetId = budget.json().id;
+    // Reserve the entire limit and abandon the hold: no settle, no release.
+    // This is what a caller dying mid-call leaves behind.
+    const held = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+      payload: { budget_id: budgetId, max_cost_micro: 1000, ttl_seconds: 300 } });
+    expect(held.statusCode).toBe(200);
+    expect(new Date(held.json().expires_at).getTime()).toBeGreaterThan(Date.now());
+    const whileHeld = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+      payload: { budget_id: budgetId, max_cost_micro: 1 } });
+    expect(whileHeld.statusCode).toBe(409);
+    // Age that hold past its TTL. Nothing else about the budget changes.
+    await pool.query(
+      "UPDATE budget_reservations SET expires_at = now() - interval '1 second' WHERE budget_id = $1",
+      [budgetId]);
+    const afterExpiry = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+      payload: { budget_id: budgetId, max_cost_micro: 1000 } });
+    expect(afterExpiry.statusCode).toBe(200);
+    const row = await pool.query(
+      "SELECT reserved_micro::float8 AS reserved, spent_micro::float8 AS spent FROM budgets WHERE id = $1",
+      [budgetId]);
+    expect(row.rows[0].reserved).toBe(1000); // the fresh hold only
+    expect(row.rows[0].spent).toBe(0);       // an unconfirmed call is not billed
+    const released = await pool.query(
+      "SELECT released_at FROM budget_reservations WHERE budget_id = $1 AND status = 'released'",
+      [budgetId]);
+    expect(released.rows.length).toBe(1);
+    expect(released.rows[0].released_at).not.toBeNull();
+    const audited = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_events
+        WHERE action = 'budget.reservation_expired' AND resource_id = $1`, [budgetId]);
+    expect(audited.rows[0].n).toBe(1);
+  });
+
+  it("confines budget reads to member workspaces", async () => {
+    const ws = await api.inject({ method: "POST", url: "/v1/workspaces", headers: key,
+      payload: { name: `bud-ws-${tag}` } });
+    const mine = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: randomUUID(), limit_micro: 5000 } });
+    const mu = await api.inject({ method: "POST", url: "/v1/users", headers: key,
+      payload: { email: `bud-${tag}@example.com`, password: "long-password-666", role: "member" } });
+    await api.inject({ method: "POST", url: `/v1/users/${mu.json().id}/memberships`,
+      headers: key, payload: { workspace_id: ws.json().id } });
+    const kc = await api.inject({ method: "POST", url: `/v1/users/${mu.json().id}/keys`, headers: key,
+      payload: { name: "budget-reader", scopes: ["read"] } });
+    const member = { authorization: `Bearer ${kc.json().key}` };
+    // The budget is real and visible to an unrestricted principal...
+    const adminList = await api.inject({ method: "GET", url: "/v1/budgets?limit=500", headers: key });
+    expect(adminList.json().items.some((b: { id: string }) => b.id === mine.json().id)).toBe(true);
+    // ...but a member of another workspace never sees it.
+    const listed = await api.inject({ method: "GET", url: "/v1/budgets?limit=500", headers: member });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json().items.some((b: { id: string }) => b.id === mine.json().id)).toBe(false);
+    expect(listed.json().items.every(
+      (b: { workspace_id: string }) => b.workspace_id === ws.json().id)).toBe(true);
+  });
+
+  it("counts windowed budget spend from the ledger, not the lifetime counter", async () => {
+    const monthly = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: randomUUID(), limit_micro: 1000, period: "month" } });
+    const lifetime = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: randomUUID(), limit_micro: 1000 } });
+    expect(monthly.json().period).toBe("month");
+    expect(lifetime.json().period).toBe("lifetime");
+    // Identical past-window spend sits behind both budgets.
+    for (const id of [monthly.json().id, lifetime.json().id]) {
+      await pool.query("UPDATE budgets SET spent_micro = 900 WHERE id = $1", [id]);
+      await pool.query(
+        `INSERT INTO budget_ledger (budget_id, amount_micro, created_at)
+         VALUES ($1, 900, now() - interval '40 days')`, [id]);
+    }
+    const m = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+      payload: { budget_id: monthly.json().id, max_cost_micro: 500 } });
+    expect(m.statusCode).toBe(200); // last month's spend is outside this window
+    const l = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+      payload: { budget_id: lifetime.json().id, max_cost_micro: 500 } });
+    expect(l.statusCode).toBe(409); // the lifetime counter still counts it
+    expect(l.json().spent_micro).toBe(900);
+  });
+
+  it("withholds pending approval arguments from callers without the approve scope", async () => {
+    const wsList = await api.inject({ method: "GET", url: "/v1/workspaces", headers: key });
+    const def = wsList.json().items.find((w: { name: string }) => w.name === "default");
+    const mu = await api.inject({ method: "POST", url: "/v1/users", headers: key,
+      payload: { email: `peek-${tag}@example.com`, password: "long-password-777", role: "member" } });
+    await api.inject({ method: "POST", url: `/v1/users/${mu.json().id}/memberships`,
+      headers: key, payload: { workspace_id: def.id } });
+    const kc = await api.inject({ method: "POST", url: `/v1/users/${mu.json().id}/keys`, headers: key,
+      payload: { name: "peeker", scopes: ["read"] } });
+    const peeker = { authorization: `Bearer ${kc.json().key}` };
+    await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+      payload: { name: `peek-appr-${tag}`, priority: 200, server_id: serverId,
+        tool_name: "echo", effect: "require_approval" } });
+    const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo",
+        arguments: { text: "classified-payload" }, caller: "peek", request_id: `peek-${tag}` } });
+    expect(call.statusCode).toBe(202);
+    const approvalId = call.json().approval_id;
+    // The approver opens the seal for that row...
+    const asApprover = await gw.inject({ method: "GET",
+      url: "/v1/approvals?status=pending&limit=200", headers: approver });
+    const forApprover = asApprover.json().items.find((a: { id: string }) => a.id === approvalId);
+    expect(forApprover.args.text).toBe("classified-payload");
+    // ...and a read-scoped member of the same workspace, who can see the row,
+    // cannot see inside it.
+    const asMember = await gw.inject({ method: "GET",
+      url: "/v1/approvals?status=pending&limit=200", headers: peeker });
+    expect(asMember.statusCode).toBe(200);
+    const forMember = asMember.json().items.find((a: { id: string }) => a.id === approvalId);
+    expect(forMember).toBeDefined();
+    expect(forMember.args_withheld).toBe(true);
+    expect(JSON.stringify(forMember)).not.toContain("classified-payload");
+  });
+
+  it("rejects an unusable OTLP span instead of storing it at the epoch", async () => {
+    const trace = randomUUID().replace(/-/g, "");
+    const now = (BigInt(Date.now()) * 1_000_000n).toString();
+    const spanId = () => randomUUID().replace(/-/g, "").slice(0, 16);
+    const res = await api.inject({ method: "POST", url: "/v1/traces", headers: key,
+      payload: { resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: `otlp-bad-${tag}` } }] },
+        scopeSpans: [{ spans: [
+          { traceId: trace, spanId: spanId(), name: "gen_ai.request",
+            startTimeUnixNano: now, endTimeUnixNano: now },
+          { traceId: trace, spanId: spanId(), name: "gen_ai.request",
+            startTimeUnixNano: "not-a-number" }
+        ] }]
+      }] } });
+    expect(res.statusCode).toBe(200);
+    // The good span lands, the unusable one is reported rather than dropped.
+    expect(res.json().accepted).toBe(1);
+    expect(res.json().rejected).toBe(1);
+    expect(res.json().partialSuccess.rejectedSpans).toBe(1);
+    const epoch = await pool.query("SELECT count(*)::int AS n FROM spans WHERE started_at < '2000-01-01'");
+    expect(epoch.rows[0].n).toBe(0);
+  });
+
+  it("counts a replayed actuals batch as duplicates instead of doubling it", async () => {
+    const row = { provider: `recon-${tag}`, model: "m1",
+      period_start: "2026-01-01T00:00:00.000Z", period_end: "2026-02-01T00:00:00.000Z",
+      input_tokens: 10, output_tokens: 5, actual_cost_micro: 12345, source: "invoice" };
+    const first = await api.inject({ method: "POST", url: "/v1/reconciliation/actuals",
+      headers: key, payload: { rows: [row] } });
+    expect(first.statusCode).toBe(201);
+    expect(first.json().accepted).toBe(1);
+    const again = await api.inject({ method: "POST", url: "/v1/reconciliation/actuals",
+      headers: key, payload: { rows: [row] } });
+    expect(again.statusCode).toBe(201);
+    expect(again.json().accepted).toBe(0);
+    expect(again.json().duplicates).toBe(1);
+    const stored = await pool.query(
+      `SELECT count(*)::int AS n, COALESCE(SUM(actual_cost_micro), 0)::float8 AS total
+         FROM actuals WHERE provider = $1`, [row.provider]);
+    expect(stored.rows[0].n).toBe(1);
+    expect(stored.rows[0].total).toBe(12345);
+  });
+
+  it("replays a case whose only expected value is a string", async () => {
+    const suite = await api.inject({ method: "POST", url: "/v1/evaluations/suites", headers: key,
+      payload: { name: `str-expected-${tag}` } });
+    expect(suite.statusCode).toBe(201);
+    const kase = await api.inject({
+      method: "POST", url: `/v1/evaluations/suites/${suite.json().id}/cases`, headers: key,
+      payload: { name: "greeting", expected: "hello world",
+        assertions: [{ type: "exact", value: "hello world" }] }
+    });
+    // A string expected value is what the replay turns into the scripted
+    // output, so the create must accept one.
+    expect(kase.statusCode).toBe(201);
+    const run = await api.inject({
+      method: "POST", url: `/v1/evaluations/suites/${suite.json().id}/runs`, headers: key,
+      payload: { agent_name: `str-${tag}`, config_fingerprint: "v1" }
+    });
+    expect(run.statusCode).toBe(201);
+    expect(run.json().results[0].passed).toBe(true);
+    expect(run.json().results[0].assertion_results[0].message).toBe("exact match");
+  });
+
+  it("serializes concurrent audit appends so the chain does not fork", async () => {
+    const marker = `chain-${tag}`;
+    const posts = Array.from({ length: 8 }, (_, i) =>
+      api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+        payload: { provider: marker, model: `m${i}`,
+          input_price_per_million: 1, output_price_per_million: 1 } }));
+    const results = await Promise.all(posts);
+    expect(results.every((r) => r.statusCode === 201)).toBe(true);
+    const chain = await pool.query(
+      "SELECT hash, prev_hash FROM audit_events WHERE metadata->>'provider' = $1", [marker]);
+    expect(chain.rows.length).toBe(8);
+    // Two appenders that read the same tail would record the same prev_hash.
+    expect(new Set(chain.rows.map((r) => r.prev_hash)).size).toBe(8);
   });
 }, 60000);

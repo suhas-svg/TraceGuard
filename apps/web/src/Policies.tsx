@@ -389,7 +389,11 @@ export default function PoliciesView() {
       <h3 className="mb-2 text-sm font-semibold text-ink-700">Rules</h3>
       {showNew && <PolicyForm servers={servers} onDone={() => { setShowNew(false); reload(); }} />}
       {editing && (
-        <PolicyForm servers={servers} initial={editing} onDone={() => { setEditing(null); reload(); }} />
+        // Keyed by rule id: without it React reuses the instance and the form
+        // keeps the previous rule's fields, so saving writes them onto the
+        // rule just clicked.
+        <PolicyForm key={editing.id} servers={servers} initial={editing}
+          onDone={() => { setEditing(null); reload(); }} />
       )}
       {policiesQuery.isPending ? (
         <ListSkeleton rows={3} label="Loading rules..." />

@@ -10,6 +10,7 @@ import { registerReconciliationRoutes } from "./reconciliation.js";
 import { attrsToObject, mapOtlpSpan, type OtlpSpan } from "./otlp.js";
 import { decodeTraceRequest, encodeEmptyTraceResponse } from "./otlp_proto.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
+import { audit } from "./audit.js";
 import { registerUserRoutes } from "./users.js";
 import { captureRawEnabled, redactDeep } from "./redact.js";
 import { computeWarnings, thresholdsFromEnv } from "./diagnostics.js";
@@ -499,6 +500,7 @@ export function buildApp() {
       await client.query("BEGIN");
       let accepted = 0;
       let duplicates = 0;
+      let rejected = 0;
       for (const rs of resourceSpans) {
         const resource = attrsToObject(
           (rs.resource?.attributes ?? []) as Parameters<typeof attrsToObject>[0]
@@ -506,7 +508,10 @@ export function buildApp() {
         const spans = (rs.scopeSpans ?? []).flatMap((s) => s.spans ?? []).slice(0, 2000);
         for (const span of spans) {
           const m = mapOtlpSpan(span, resource);
-          if (!m) continue;
+          if (!m) {
+            rejected++;
+            continue;
+          }
           let workspace = await client.query("SELECT id FROM workspaces WHERE name = $1", [m.workspaceName]);
           if (!workspace.rows[0]) {
             if (req.principal?.workspaces !== "all") {
@@ -557,7 +562,13 @@ export function buildApp() {
       if (isProtobuf) {
         return reply.type("application/x-protobuf").send(encodeEmptyTraceResponse());
       }
-      return { partialSuccess: {}, accepted, duplicates };
+      // A rejected span is reported, not silently dropped: an exporter that
+      // gets no signal retries the same bad batch forever while its valid
+      // siblings never land.
+      return { partialSuccess: rejected > 0
+        ? { rejectedSpans: rejected,
+            errorMessage: `${rejected} span(s) rejected: missing or unparseable start time` }
+        : {}, accepted, duplicates, rejected };
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
@@ -577,6 +588,11 @@ export function buildApp() {
        RETURNING id`,
       [String(seconds)]
     );
+    // A bulk status mutation belongs in the same trail as every other admin
+    // outcome; it is not exempt because it is a sweep.
+    await audit(pool, { actor_type: "admin", action: "run.finalize_stale",
+      resource_type: "run", result: "success",
+      metadata: { older_than_seconds: seconds, finalized: res.rows.length } });
     return { finalized: res.rows.length, ids: res.rows.map((r) => r.id) };
   });
 

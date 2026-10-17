@@ -1,0 +1,25 @@
+# Build context hygiene. Without this, `COPY . .` style steps in the app images
+# copy the host workspace over the dependency tree npm just installed inside the
+# image, so a stale or wrong-platform node_modules silently wins.
+node_modules
+**/node_modules
+dist
+**/dist
+test-results
+playwright-report
+
+# Never bake secrets or local state into an image.
+.env
+.env.*
+!.env.example
+pgdata
+infra/k8s/secrets.yaml
+.git
+.gitignore
+
+# Docs and dev-only material add build time and nothing else.
+docs
+README.md
+LICENSE
+SECURITY.md
+.hermes

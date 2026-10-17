@@ -4,6 +4,20 @@ Self-hosted control plane for AI agents: execution tracing, cost control
 with budgets, MCP tool policy enforcement with human approvals, and
 scripted evaluation workbench.
 
+## What it looks like
+
+| | |
+|---|---|
+| ![Overview](docs/images/overview.png) | ![Runs](docs/images/runs.png) |
+| Overview: runs by status, tokens, spend, latency percentiles, denied calls, pending approvals | Runs: search, sort, filters by agent, status, date, provider, model, and eval run |
+| ![Trace](docs/images/trace.png) | ![Costs](docs/images/costs.png) |
+| Trace: nested spans with per-span usage, cost, and the error class apart from policy denials | Costs: spend by model, budget utilization, estimates against imported provider actuals |
+| ![Policy](docs/images/policy.png) | ![Evaluations](docs/images/evaluations.png) |
+| Policy: server registration with tool quarantine, rules, budgets, and audit history | Evaluations: suites, per-case results, and a two-run comparison |
+
+Regenerate these from the current build with `node scripts/screenshots.mjs`
+against a running stack; see the file header for the commands.
+
 ## Run it
 
 Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
@@ -58,12 +72,24 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 
 - `POST /v1/pricing` versions model prices, old versions stay so past
   estimates keep meaning. Money is integer micro-dollars, never floats.
+- `POST /v1/budgets` sets run, agent, or project limits with block or warn
+  effects, and a reporting `period` of `lifetime` (default), `day`, `week`,
+  or `month`. Windowed spend is summed from the append-only ledger, so no
+  counter is reset on a schedule and past windows stay explainable.
+- A **project** budget (`scope: "project"`, `ref_id` = a workspace id) caps
+  what the whole project spends over its period. It is measured from the
+  project's priced spans rather than from its own ledger, because a ledger
+  only counts calls that checked that specific budget — measuring it would
+  report headroom that is not there and never block.
+- A hold that is abandoned (a caller that dies between reserve and settle)
+  is released by the next check against that budget, and the release is
+  audited. Without that the worst case stayed reserved forever and the
+  budget answered 409 with `spent_micro` at zero.
 - `GET /v1/runs/:id/usage` breaks tokens and cost down per span against the
   price in force at the time. Cached input tokens bill once at the cached
   rate, never on top of the full input rate; spans with no matching price
   report NULL and list under `missing_pricing`, never zero.
-- `POST /v1/budgets` sets run or agent limits with block or warn effects.
-  The managed path reserves before the call under a row lock, then settles
+- The managed path reserves before the call under a row lock, then settles
   to the measured cost. A blocked call gets 409 and the SDK raises
   `BudgetExceeded` instead of calling the provider.
 - The Python SDK gained `BudgetGuard` plus `flush`, and now stamps Zulu
@@ -87,7 +113,22 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 - The dashboard has an Evaluations tab: suite list, per-case results with
   failure reasons, links back to traces, and a two-run comparison.
 
-Unit checks: `npm install && npm test`.
+Unit checks: `npm install && npm test`. The Python SDK suite runs separately
+(`pip install "./sdks/python[dev]" && python -m pytest sdks/python`), the
+browser scenarios with `npm run test:e2e`, the Kubernetes manifests with
+`python infra/k8s/check.py`, and the performance table with
+`node scripts/bench.mjs`.
+
+## Documentation
+
+| File | What is in it |
+|---|---|
+| `docs/architecture.md` | components, request flow, and where enforcement lives |
+| `docs/security.md` | what the platform guarantees, what it does not, and the sensitive-data inventory |
+| `docs/configuration.md` | every environment variable and the scoping rules |
+| `docs/operations.md` | backups, restores, migrations, and the cron endpoints |
+| `docs/PERFORMANCE.md` | how to measure, and one recorded run of the targets |
+| `docs/kubernetes.md` | the manifests and how to deploy them |
 
 ## Phase 3: trace dashboard
 
@@ -145,11 +186,18 @@ memberships, and OTLP ingestion landed on top; their sections are under
 ## Roadmap: next integrations
 
 - Live evaluation adapters: register a real agent endpoint so replays exercise the
-  agent itself, not just the recorded execution config.
+  agent itself, not just the recorded execution config. This is the one
+  functional requirement still short of the spec: replay runs a registered
+  scripted adapter, and `eval_results.agent_run_id` already links each case to a
+  real run, so an HTTP adapter is the missing piece rather than a redesign.
 - Projects as a first-class policy target (agent, project, server, tool), with
-  per-project budgets that carry a reporting period.
+  per-project budgets. The spec names a project dimension in four places
+  (policy targeting, budgets, cost grouping, cost explorer); nothing in the
+  schema carries one today.
 - Cost explorer drill-downs: per-agent breakdowns and an
   input-vs-output cost split.
 - OTLP export from TraceGuard, plus log ingestion alongside traces.
 - SSO/OIDC for the dashboard, replacing bearer-token login.
 - Alerting integrations (Slack, PagerDuty) on top of the existing webhook events.
+- A timing instrument inside the gateway, so the §14 policy-decision budget can
+  be measured on its own rather than inferred from a whole-call figure.

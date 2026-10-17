@@ -116,18 +116,26 @@ export function registerEvalRoutes(app: FastifyInstance) {
       description: z.string().max(1024).default("")
     }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_suite" });
-    const existing = await pool.query(
-      "SELECT MAX(version) AS v FROM eval_suites WHERE name = $1", [parsed.data.name]
-    );
-    const version = Number(existing.rows[0]?.v ?? 0) + 1;
-    const res = await pool.query(
-      "INSERT INTO eval_suites (name, version, description) VALUES ($1,$2,$3) RETURNING *",
-      [parsed.data.name, version, parsed.data.description]
-    );
-    await audit(pool, { actor_type: "admin", action: "eval.suite_create",
-      resource_type: "eval_suite", resource_id: res.rows[0].id, result: "success",
-      metadata: { name: parsed.data.name, version } });
-    return reply.code(201).send(res.rows[0]);
+    // Allocate the version inside the insert. Read-then-insert lets two
+    // concurrent creates compute the same next version, and the loser dies on
+    // the unique index with a 500 instead of a usable answer.
+    try {
+      const res = await pool.query(
+        `INSERT INTO eval_suites (name, version, description)
+         SELECT $1, COALESCE(MAX(version), 0) + 1, $2 FROM eval_suites WHERE name = $1
+         RETURNING *`,
+        [parsed.data.name, parsed.data.description]
+      );
+      await audit(pool, { actor_type: "admin", action: "eval.suite_create",
+        resource_type: "eval_suite", resource_id: res.rows[0].id, result: "success",
+        metadata: { name: parsed.data.name, version: res.rows[0].version } });
+      return reply.code(201).send(res.rows[0]);
+    } catch (err: unknown) {
+      if ((err as { code?: string }).code === "23505") {
+        return reply.code(409).send({ error: "suite_version_race" });
+      }
+      throw err;
+    }
   });
 
   app.get("/v1/evaluations/suites", async () => {
@@ -142,7 +150,10 @@ export function registerEvalRoutes(app: FastifyInstance) {
   const caseSchema = z.object({
     name: z.string().min(1).max(128),
     input_payload: z.record(z.unknown()).default({}),
-    expected: z.record(z.unknown()).default({}),
+    // Any JSON, not just an object: the replay below turns a string expected
+    // value into the scripted output, and a record-only schema made that
+    // documented path unreachable through the API.
+    expected: z.unknown().default({}),
     assertions: z.array(z.record(z.unknown())).default([]),
     exec_config: z.record(z.unknown()).default({})
   });
@@ -156,12 +167,17 @@ export function registerEvalRoutes(app: FastifyInstance) {
     if (suite.rows[0].locked) return reply.code(409).send({ error: "suite_locked" });
     try {
       const c = parsed.data;
+      // The locked flag is re-checked inside the insert, so a case cannot slip
+      // into a suite that a run locked between the read above and this write.
       const res = await pool.query(
         `INSERT INTO eval_cases (suite_id, name, input_payload, expected, assertions, exec_config)
-         VALUES ($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6::jsonb) RETURNING *`,
+         SELECT $1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6::jsonb
+          WHERE EXISTS (SELECT 1 FROM eval_suites WHERE id = $1 AND NOT locked)
+         RETURNING *`,
         [id, c.name, JSON.stringify(c.input_payload), JSON.stringify(c.expected),
          JSON.stringify(c.assertions), JSON.stringify(c.exec_config)]
       );
+      if (!res.rows[0]) return reply.code(409).send({ error: "suite_locked" });
       return reply.code(201).send(res.rows[0]);
     } catch (err: unknown) {
       if ((err as { code?: string }).code === "23505") {
@@ -198,12 +214,22 @@ export function registerEvalRoutes(app: FastifyInstance) {
     if (!parsed.success) return reply.code(400).send({ error: "invalid_eval_run" });
     const client = await pool.connect();
     try {
-      const suite = await client.query("SELECT * FROM eval_suites WHERE id = $1", [id]);
-      if (!suite.rows[0]) return reply.code(404).send({ error: "suite_not_found" });
+      // Lock the suite row while snapshotting its cases, so the dataset this
+      // run executes is exactly the one it locked.
+      await client.query("BEGIN");
+      const suite = await client.query("SELECT * FROM eval_suites WHERE id = $1 FOR UPDATE", [id]);
+      if (!suite.rows[0]) {
+        await client.query("ROLLBACK");
+        return reply.code(404).send({ error: "suite_not_found" });
+      }
       const cases = await client.query("SELECT * FROM eval_cases WHERE suite_id = $1 ORDER BY name", [id]);
-      if (!cases.rows.length) return reply.code(400).send({ error: "suite_empty" });
+      if (!cases.rows.length) {
+        await client.query("ROLLBACK");
+        return reply.code(400).send({ error: "suite_empty" });
+      }
 
       await client.query("UPDATE eval_suites SET locked = true WHERE id = $1", [id]);
+      await client.query("COMMIT");
       const workspaceId = await defaultWorkspaceId(client);
       const cfg = parsed.data;
       let agent = await client.query(
@@ -245,9 +271,15 @@ export function registerEvalRoutes(app: FastifyInstance) {
           if (exec.input === undefined) exec.input = c.input_payload as string | undefined;
           const out = await executeCase(client, workspaceId, agent.rows[0].id,
             cfg.agent_name, exec, cfg.model);
-          // Unknown costs cannot count against the cap; the cap is a guard,
-          // not an accounting.
+          // Unknown costs cannot count against the cap, which turns the cap
+          // into a no-op exactly when spend is unknown. Stop and name the
+          // reason instead of running the whole locked dataset unguarded while
+          // reporting a cap that never fired.
           spent += out.costMicro ?? 0;
+          if (out.costMicro == null && cfg.cost_cap_micro > 0) {
+            stopped = `cost unknown for ${cfg.model}; cost cap not enforceable`;
+            break;
+          }
           const ctx = { output: out.output, tools: out.tools, status: out.status };
           const assertionResults = ((c.assertions ?? []) as Record<string, unknown>[])
             .map((a) => ({ type: String(a.type ?? "?"), ...runAssertion(a, ctx) }));
@@ -317,7 +349,9 @@ export function registerEvalRoutes(app: FastifyInstance) {
       const res = await pool.query("SELECT * FROM eval_results WHERE eval_run_id = $1", [r.id]);
       const lat = res.rows.map((x) => Number(x.latency_ms));
       const denied = await pool.query(
-        `SELECT COUNT(*) AS n, COUNT(*) FILTER (WHERE s.status = 'denied') AS denied
+        `SELECT COUNT(*) AS n,
+                COUNT(*) FILTER (WHERE s.status = 'denied') AS denied,
+                COUNT(*) FILTER (WHERE s.input_tokens IS NOT NULL OR s.output_tokens IS NOT NULL) AS with_usage
            FROM spans s JOIN eval_results e ON e.agent_run_id = s.run_id
           WHERE e.eval_run_id = $1`, [r.id]
       );
@@ -330,6 +364,10 @@ export function registerEvalRoutes(app: FastifyInstance) {
           WHERE e.eval_run_id = $1`, [r.id]
       );
       const num = (v: unknown) => (v == null ? null : Number(v));
+      // A partial SUM silently understates. Flag it, so two runs are never
+      // compared on numbers that do not cover the same data.
+      const spanCount = Number(denied.rows[0]?.n ?? 0);
+      const spansWithUsage = Number(denied.rows[0]?.with_usage ?? 0);
       out.push({
         eval_run_id: r.id, agent_name: r.agent_name, config_fingerprint: r.config_fingerprint,
         model: r.model, trials: r.trials, cases: res.rows.length, passed,
@@ -338,10 +376,12 @@ export function registerEvalRoutes(app: FastifyInstance) {
           ? { mean: Math.round(lat.reduce((a, b) => a + b, 0) / lat.length), min: Math.min(...lat), max: Math.max(...lat) }
           : null,
         cost_micro: costs.length ? costs.reduce((a, b) => a + b, 0) : null,
+        cost_partial: costs.length > 0 && costs.length !== res.rows.length,
         input_tokens: num(tokens.rows[0].input_tokens),
         output_tokens: num(tokens.rows[0].output_tokens),
+        tokens_partial: spanCount > 0 && spansWithUsage > 0 && spansWithUsage !== spanCount,
         // A run whose spans are gone counts as unknown, not as zero.
-        violations: Number(denied.rows[0]?.n ?? 0) > 0 ? Number(denied.rows[0].denied) : null
+        violations: spanCount > 0 ? Number(denied.rows[0].denied) : null
       });
     }
     return { runs: out };

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  formatMicro, getDiagnostics, getRunCounts, getTrace, getUsage, gwApi, listAgents, listRuns,
+  formatMicro, getDiagnostics, getOverview, getRunCounts, getTrace, getUsage, listAgents, listRuns,
   settings, type Span
 } from "./api";
 import { buildTree, tokenTotal, type SpanNode } from "./tree";
@@ -519,14 +519,15 @@ export default function App() {
     refetchInterval: 30_000
   });
   const connected = health.isError ? false : health.data ?? null;
-  // Same key as the Approvals view's default filter, so the badge rides the
-  // cache the view already warms.
+  // Exact pending count from the overview. Reading the approvals list instead
+  // capped at the API's default 50, so the badge read exactly 50 and the
+  // surplus holds were invisible.
   const pendingApprovals = useQuery({
-    queryKey: ["approvals", "pending"],
-    queryFn: () => gwApi.approvals("pending"),
+    queryKey: ["overview", "pending-approvals"],
+    queryFn: getOverview,
     refetchInterval: 30_000,
     retry: false
-  }).data?.items.length ?? 0;
+  }).data?.pending_approvals ?? 0;
 
   const go = (t: Tab) => navigate({ tab: t, runId: null });
 

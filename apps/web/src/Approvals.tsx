@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { gwApi, type Approval } from "./api";
 import {
   Alert, Button, Card, Empty, Input, ListSkeleton, Page,
@@ -78,7 +78,11 @@ export default function ApprovalsView() {
   });
   const items = approvalsQuery.data?.items ?? [];
   const error = approvalsQuery.error instanceof Error ? approvalsQuery.error.message : "";
-  const reload = () => approvalsQuery.refetch();
+  const queryClient = useQueryClient();
+  // Invalidate every approvals query, not just the filtered one: the sidebar
+  // badge reads its own key, so deciding a hold left the count stale for up to
+  // its 30s interval and the badge contradicted the list on screen.
+  const reload = () => queryClient.invalidateQueries({ queryKey: ["approvals"] });
 
   return (
     <Page
