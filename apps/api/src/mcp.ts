@@ -234,6 +234,14 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
         error: body.error ?? "approval_terminal", status: body.status ?? null
       });
     case 502:
+      if (body.error === "outcome_unknown") {
+        // A post-dispatch ambiguity is not a retryable failure; the client
+        // must surface it as OUTCOME_UNKNOWN (§9.5).
+        return rpcError(env.id, -32007, "Outcome unknown", {
+          error: "OUTCOME_UNKNOWN", approval_id: body.approval_id,
+          note: "The upstream action may have executed."
+        });
+      }
       return rpcError(env.id, -32603, "Upstream failed", { error: "UPSTREAM_FAILED" });
     default:
       return rpcError(env.id, -32603, "Internal error", { error: body.error ?? "internal_error" });
