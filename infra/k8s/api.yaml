@@ -38,8 +38,17 @@ spec:
           ports:
             - containerPort: 8080
           env:
+            # §13.4: the api runs as api_runtime and the retention sweep as
+            # retention_job; the owner URL in DATABASE_URL is only for the
+            # migrate Job. Kubernetes expands $(VAR) from earlier env entries.
+            - name: API_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: API_DB_PASSWORD } }
+            - name: RETENTION_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: RETENTION_DB_PASSWORD } }
             - name: DATABASE_URL
-              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: DATABASE_URL } }
+              value: postgres://api_runtime:$(API_DB_PASSWORD)@postgres:5432/traceguard
+            - name: DATABASE_URL_RETENTION
+              value: postgres://retention_job:$(RETENTION_DB_PASSWORD)@postgres:5432/traceguard
             - name: API_KEY
               valueFrom: { secretKeyRef: { name: traceguard-secrets, key: API_KEY } }
             - name: PORT

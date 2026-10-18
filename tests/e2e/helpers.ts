@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { APIRequestContext, Page } from "@playwright/test";
-import { API_KEY, API_URL, APPROVER_KEY, DATABASE_URL, GATEWAY_STATE_DIR, GATEWAY_URL, MOCK_TOOLS_URL } from "./env";
+import { API_KEY, API_URL, APPROVER_KEY, GATEWAY_STATE_DIR, GATEWAY_URL, MOCK_TOOLS_URL, PUBLISHER_DATABASE_URL } from "./env";
 
 const auth = (key: string) => ({ authorization: `Bearer ${key}` });
 
@@ -22,7 +22,7 @@ export function publishPolicy(): void {
   const run = (args: string[]) =>
     execFileSync(process.execPath, ["node_modules/tsx/dist/cli.mjs", "tools/policy-publisher/src/index.ts", ...args], {
       cwd: repoRoot,
-      env: { ...process.env, DATABASE_URL, POLICY_SIGNING_KEY_FILE: keyFile },
+      env: { ...process.env, DATABASE_URL: PUBLISHER_DATABASE_URL, POLICY_SIGNING_KEY_FILE: keyFile },
       stdio: "pipe"
     });
   if (!existsSync(keyFile)) run(["keygen", "--out", e2eKeys]);

@@ -24,7 +24,12 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
 
 1. Copy `.env.example` to `.env` and set `API_KEY` and `APPROVER_KEY`.
 2. `docker compose up --build`
-3. Apply migrations in order: `for f in apps/api/migrations/*.sql; do psql $DATABASE_URL -f "$f"; done`
+3. The `db-roles` service applies the migrations and enables the
+   least-privilege role logins (`api_runtime`, `gateway_runtime`,
+   `retention_job`, `policy_publisher`) before the api and gateway start;
+   watch it with `docker compose logs db-roles`. Running outside compose,
+   apply `apps/api/migrations/*.sql` yourself and run the `ALTER ROLE` lines
+   in `docs/operations.md`.
 4. Install the SDK and run the demo: `python -m pip install ./sdks/python`
    then `TRACEGUARD_URL=http://localhost:8090 python examples/demo-agent/main.py`
 5. Open http://localhost:5173, set the API URL and key in the header, browse runs.
@@ -41,7 +46,10 @@ npm run policy:keygen                      # writes ./policy-keys/{signing-key.p
 npm run policy:trust -- --workspace default
 
 # 3. Sign and publish the current drafts as the new active version.
-npm run policy:publish -- --workspace default
+#    Inside the compose deployment the publisher connects with its own
+#    least-privilege role (the password is PUBLISHER_DB_PASSWORD in .env):
+npm run policy:publish -- --workspace default \
+  --database-url postgres://policy_publisher:publisher_dev_pw@localhost:5432/traceguard
 
 # What would be published, without publishing:
 npm run policy:publish -- --workspace default --dry-run

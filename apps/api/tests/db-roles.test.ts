@@ -48,13 +48,22 @@ async function attempt(client: PoolClient, db: () => Promise<unknown>): Promise<
 const DENIED = "42501";
 
 describe("least-privilege database roles", () => {
-  it("creates all six roles, none able to log in by default", async () => {
-    const res = await pool.query<{ rolname: string; rolcanlogin: boolean }>(
-      "SELECT rolname, rolcanlogin FROM pg_roles WHERE rolname = ANY($1)",
+  it("creates all six roles, none privileged, and the audit owner can never log in", async () => {
+    const res = await pool.query<{ rolname: string; rolcanlogin: boolean; rolsuper: boolean }>(
+      "SELECT rolname, rolcanlogin, rolsuper FROM pg_roles WHERE rolname = ANY($1)",
       [ROLES]
     );
     expect(res.rows.map((r) => r.rolname).sort()).toEqual([...ROLES].sort());
-    for (const row of res.rows) expect(row.rolcanlogin).toBe(false);
+    for (const row of res.rows) expect(row.rolsuper).toBe(false);
+    // Roles are cluster-wide, and enabling a login is a deployment decision
+    // (compose's db-roles service enables the four runtime logins), so this
+    // asserts only what must always hold: the audit owner and the migration
+    // identity cannot connect.
+    for (const row of res.rows) {
+      if (row.rolname === "audit_owner" || row.rolname === "migration_owner") {
+        expect(row.rolcanlogin).toBe(false);
+      }
+    }
   });
 
   it("owns the audit table from a non-login role", async () => {

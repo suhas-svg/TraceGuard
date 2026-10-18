@@ -17,12 +17,39 @@ services:
     networks:
       - front
 
+  # §13.4: migrate as the owner, then enable the least-privilege logins the
+  # services below connect with. Runs once per `compose up`; the api and the
+  # gateway wait for it, so a clean clone never boots against an unmigrated
+  # database or a role that cannot log in yet.
+  db-roles:
+    image: postgres:17-alpine
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-traceguard}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-traceguard_dev_only}
+      PGDATABASE: ${POSTGRES_DB:-traceguard}
+      API_DB_PASSWORD: ${API_DB_PASSWORD:-api_dev_pw}
+      GATEWAY_DB_PASSWORD: ${GATEWAY_DB_PASSWORD:-gateway_dev_pw}
+      RETENTION_DB_PASSWORD: ${RETENTION_DB_PASSWORD:-retention_dev_pw}
+      PUBLISHER_DB_PASSWORD: ${PUBLISHER_DB_PASSWORD:-publisher_dev_pw}
+    volumes:
+      - ./apps/api/migrations:/migrations:ro
+      - ./infra/postgres/bootstrap.sh:/bootstrap.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - front
+    restart: "no"
+
   api:
     build:
       context: .
       dockerfile: ./apps/api/Dockerfile
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-traceguard}:${POSTGRES_PASSWORD:-traceguard_dev_only}@postgres:5432/${POSTGRES_DB:-traceguard}
+      DATABASE_URL: postgres://api_runtime:${API_DB_PASSWORD:-api_dev_pw}@postgres:5432/${POSTGRES_DB:-traceguard}
+      DATABASE_URL_RETENTION: postgres://retention_job:${RETENTION_DB_PASSWORD:-retention_dev_pw}@postgres:5432/${POSTGRES_DB:-traceguard}
       API_KEY: ${API_KEY:-dev_key_change_me}
       PORT: 8080
     ports:
@@ -30,6 +57,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-roles:
+        condition: service_completed_successfully
     networks:
       - front
 
@@ -39,7 +68,7 @@ services:
       dockerfile: ./apps/api/Dockerfile
     command: ["node", "apps/api/dist/gateway.js"]
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-traceguard}:${POSTGRES_PASSWORD:-traceguard_dev_only}@postgres:5432/${POSTGRES_DB:-traceguard}
+      DATABASE_URL: postgres://gateway_runtime:${GATEWAY_DB_PASSWORD:-gateway_dev_pw}@postgres:5432/${POSTGRES_DB:-traceguard}
       API_KEY: ${API_KEY:-dev_key_change_me}
       APPROVER_KEY: ${APPROVER_KEY:-dev_approver_change_me}
       APPROVAL_ARGS_KEY: ${APPROVAL_ARGS_KEY}
@@ -58,6 +87,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-roles:
+        condition: service_completed_successfully
     networks:
       - front
       - tools
