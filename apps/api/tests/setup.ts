@@ -1,3 +1,6 @@
+import { beforeAll } from "vitest";
+import { Pool } from "pg";
+
 // Test-only defaults. CI passes real values through the environment;
 // local runs fall back to the dev database and throwaway keys.
 process.env.API_KEY ??= "test_key";
@@ -15,3 +18,22 @@ process.env.DATABASE_URL ??=
 // creation-rate knob here; the dedicated protection tests lower it again to
 // prove enforcement.
 process.env.APPROVAL_RATE_PER_MINUTE ??= "100";
+
+// Every file shares one database and none of them clean up, so whichever file
+// runs first decides what the next one sees (approvals saw 403s from a policy
+// left behind elsewhere). Migrations seed no rows, so wiping everything before
+// each file is safe.
+beforeAll(async () => {
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  try {
+    const { rows } = await pool.query<{ tablename: string }>(
+      "select tablename from pg_tables where schemaname = 'public'"
+    );
+    if (rows.length > 0) {
+      const tables = rows.map((row) => `"${row.tablename}"`).join(", ");
+      await pool.query(`TRUNCATE ${tables} RESTART IDENTITY CASCADE`);
+    }
+  } finally {
+    await pool.end();
+  }
+});

@@ -9,7 +9,10 @@ export default defineConfig({
     // default 10s is tight when the whole file suite runs in parallel.
     hookTimeout: 30_000,
     // A hung-upstream case legitimately waits for the SDK's bounded retry.
-    testTimeout: 30_000
+    testTimeout: 30_000,
+    // Files share one database; setup.ts wipes it per file, so they must not
+    // run at the same time.
+    fileParallelism: false
   },
   resolve: {
     alias: {
