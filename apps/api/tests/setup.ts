@@ -1,4 +1,7 @@
 import { beforeAll } from "vitest";
+import { mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Pool } from "pg";
 
 // Test-only defaults. CI passes real values through the environment;
@@ -12,6 +15,11 @@ process.env.ALLOW_PRIVATE_UPSTREAMS ??= "true";
 // §7.5 pins only allowlisted `_meta` keys; the suite pins one key so the
 // allowlist path is exercised rather than skipped.
 process.env.TOOL_PIN_META_ALLOWLIST ??= "io.example/flag";
+// §13.3 pins the highest accepted policy version in a gateway-writable file
+// so a rolled-back pointer cannot pass verification. Each test file runs in
+// its own process with its own directory, wiped before the file's tests so
+// the truncated database and the anchor start from the same place.
+process.env.GATEWAY_STATE_DIR ??= join(tmpdir(), `traceguard-gateway-state-${process.pid}`);
 process.env.DATABASE_URL ??=
   process.env.TEST_DATABASE_URL ??
   "postgres://traceguard:traceguard_dev_only@localhost:5432/traceguard";
@@ -27,6 +35,14 @@ process.env.APPROVAL_RATE_PER_MINUTE ??= "100";
 // left behind elsewhere). Migrations seed no rows, so wiping everything before
 // each file is safe.
 beforeAll(async () => {
+  // Wipe the gateway policy anchor too: the database is about to be empty,
+  // and a surviving anchor from an earlier run would read every first
+  // publish as a rollback.
+  const stateDir = process.env.GATEWAY_STATE_DIR ?? "";
+  if (stateDir) {
+    rmSync(stateDir, { recursive: true, force: true });
+    mkdirSync(stateDir, { recursive: true });
+  }
   const pool = new Pool({ connectionString: process.env.DATABASE_URL });
   try {
     const { rows } = await pool.query<{ tablename: string }>(

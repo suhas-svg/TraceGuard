@@ -76,15 +76,19 @@ describe("argument constraints", () => {
 });
 
 describe("approval binding", () => {
-  it("any change of caller, args, or request id breaks the hash", () => {
-    const h = requestHash("c", "s", "t", { a: 1 }, "req-1");
-    expect(requestHash("c", "s", "t", { a: 1 }, "req-1")).toBe(h);
-    expect(requestHash("other", "s", "t", { a: 1 }, "req-1")).not.toBe(h);
-    expect(requestHash("c", "s", "t", { a: 2 }, "req-1")).not.toBe(h);
-    expect(requestHash("c", "s", "t", { a: 1 }, "req-2")).not.toBe(h);
-    // Key order must not matter.
-    expect(requestHash("c", "s", "t", { b: 2, a: 1 }, "req-1")).toBe(
-      requestHash("c", "s", "t", { a: 1, b: 2 }, "req-1")
+  it("any change of caller, args, request id, or pin breaks the hash", () => {
+    const pin = "a".repeat(64);
+    const h = requestHash("c", "s", "t", { a: 1 }, "req-1", pin);
+    expect(requestHash("c", "s", "t", { a: 1 }, "req-1", pin)).toBe(h);
+    expect(requestHash("other", "s", "t", { a: 1 }, "req-1", pin)).not.toBe(h);
+    expect(requestHash("c", "s", "t", { a: 2 }, "req-1", pin)).not.toBe(h);
+    expect(requestHash("c", "s", "t", { a: 1 }, "req-2", pin)).not.toBe(h);
+    // §9.1 binds the tool-definition pin: a re-approved or changed definition
+    // must not reuse an approval issued for the old one.
+    expect(requestHash("c", "s", "t", { a: 1 }, "req-1", "b".repeat(64))).not.toBe(h);
+    // Key order must not matter (RFC 8785 canonical JSON).
+    expect(requestHash("c", "s", "t", { b: 2, a: 1 }, "req-1", pin)).toBe(
+      requestHash("c", "s", "t", { a: 1, b: 2 }, "req-1", pin)
     );
   });
 });

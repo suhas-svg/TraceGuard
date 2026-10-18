@@ -7,6 +7,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { buildApp } from "../src/index.js";
 import { buildGateway } from "../src/gateway.js";
 import { pool } from "../src/db.js";
+import { publishTestPolicy } from "./policy-helper.js";
 
 const PROTOCOL = "2026-07-28";
 
@@ -78,6 +79,7 @@ describe("tool definition pins", () => {
     const disc = await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     expect(disc.statusCode).toBe(200);
     expect(disc.json().pinned).toEqual(["echo"]);
+    await publishTestPolicy(pool);
   });
 
   afterAll(async () => {

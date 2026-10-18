@@ -59,6 +59,7 @@ const ROUTES: [string, string][] = [
   ["/v1/webhooks/deliveries", "read"],
   ["/v1/evaluations", "admin"],
   ["/v1/policies", "read"],
+  ["/v1/policy-versions", "read"],
   ["/v1/servers", "read"],
   ["/v1/budgets", "admin"],
   ["/v1/pricing", "admin"],

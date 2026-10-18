@@ -6,6 +6,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { buildApp } from "../src/index.js";
 import { buildGateway } from "../src/gateway.js";
 import { pool } from "../src/db.js";
+import { publishTestPolicy } from "./policy-helper.js";
 
 // §9.2/§9.4 behaviours that the legacy approval flow did not have: queue
 // caps, a creation rate limit, an ambiguous-outcome terminal state, MCP tool
@@ -53,6 +54,7 @@ describe("approval state machine v2", () => {
       payload: { name: `approvals-hold-${tag}`, priority: 10, server_id: serverId,
         effect: "require_approval" } });
     expect(rule.statusCode).toBe(201);
+    await publishTestPolicy(pool);
   });
 
   afterAll(async () => {

@@ -4,13 +4,16 @@ import { z } from "zod";
 import type { PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
+import { verifyAuditChain } from "@traceguard/audit-chain";
 import {
+  argsHash,
   evaluate,
   requestHash,
   sha256Hex,
   stableStringify,
   type PolicyRule
 } from "./policy.js";
+import { loadActivePolicy, rulesFromBundle } from "./policy-bundle.js";
 import { callUpstreamTool, checkUpstreamUrlResolved, definitionHash, definitionIssue, discoverTools, pinnedDefinition } from "./upstream.js";
 import { hashesEqual, parseKey, seal, tryOpen } from "./seal.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
@@ -104,6 +107,8 @@ async function enforceBudget(
 async function recordDecision(client: PoolClient, d: {
   workspace_id: string; caller: string; server_id: string | null; tool_name: string;
   args_hash: string; decision: string; policy_id?: string | null; policy_version?: number | null;
+  // The exact signed policy version this decision evaluated (§8.5).
+  policy_version_id?: string | null;
   matched?: unknown[]; reason?: string; approval_id?: string | null;
   // Section 14's policy-decision budget, measured from the start of handling
   // the call to the moment the decision is recorded. The upstream round trip
@@ -114,10 +119,10 @@ async function recordDecision(client: PoolClient, d: {
   await client.query(
     `INSERT INTO policy_decisions
        (workspace_id, caller, server_id, tool_name, args_hash, decision,
-        policy_id, policy_version, matched_rules, reason, approval_id, overhead_ms)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12)`,
+        policy_id, policy_version, policy_version_id, matched_rules, reason, approval_id, overhead_ms)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13)`,
     [d.workspace_id, d.caller, d.server_id, d.tool_name, d.args_hash, d.decision,
-     d.policy_id ?? null, d.policy_version ?? null,
+     d.policy_id ?? null, d.policy_version ?? null, d.policy_version_id ?? null,
      JSON.stringify(d.matched ?? []), d.reason ?? "", d.approval_id ?? null,
      d.overhead_ms ?? null]
   );
@@ -455,7 +460,8 @@ export function buildGateway() {
     tool: string,
     args: Record<string, unknown>,
     caller: string,
-    decisionMeta: { approval_id?: string | null; policy_id?: string | null; policy_version?: number | null; matched?: unknown[]; overheadMs?: number }
+    decisionMeta: { approval_id?: string | null; policy_id?: string | null; policy_version?: number | null;
+      policy_version_id?: string | null; matched?: unknown[]; overheadMs?: number }
   ): Promise<unknown> {
     // Gateway fails closed: any upstream or policy error denies, never allows.
     // Re-validate before every forward; a failure surfaces through the
@@ -469,6 +475,7 @@ export function buildGateway() {
         workspace_id: server.workspace_id, caller, server_id: server.id, tool_name: tool,
         args_hash: sha256Hex(stableStringify(args)), decision: "error",
         policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
+        policy_version_id: decisionMeta.policy_version_id,
         matched: decisionMeta.matched, reason: `upstream fails validation: ${urlRecheck.reason}`,
         approval_id: decisionMeta.approval_id ?? null, overhead_ms: decisionMeta.overheadMs ?? null
       });
@@ -488,6 +495,7 @@ export function buildGateway() {
         workspace_id: server.workspace_id, caller, server_id: server.id, tool_name: tool,
         args_hash: sha256Hex(stableStringify(args)), decision: "error",
         policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
+        policy_version_id: decisionMeta.policy_version_id,
         matched: decisionMeta.matched, reason: `upstream error: ${detail}`,
         approval_id: decisionMeta.approval_id ?? null, overhead_ms: decisionMeta.overheadMs ?? null
       });
@@ -500,6 +508,7 @@ export function buildGateway() {
       workspace_id: server.workspace_id, caller, server_id: server.id, tool_name: tool,
       args_hash: sha256Hex(stableStringify(args)), decision: decisionMeta.approval_id ? "approved_retry" : "allow",
       policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
+      policy_version_id: decisionMeta.policy_version_id,
       matched: decisionMeta.matched, reason: decisionMeta.approval_id ? "approved" : "allowed",
       approval_id: decisionMeta.approval_id ?? null, overhead_ms: decisionMeta.overheadMs ?? null
     });
@@ -532,14 +541,47 @@ export function buildGateway() {
         return reply.code(403).send({ error: "workspace_forbidden", workspace_id: server.workspace_id });
       }
 
+      // §13.3 fails closed: no verified signed policy version, no protected
+      // call. The gate runs before anything else measures the request, and
+      // its denial is recorded like any other.
+      const policyLoad = await loadActivePolicy(client, server.workspace_id);
+      if (!policyLoad.ok) {
+        const reason = `policy unavailable: ${policyLoad.reason}`;
+        await recordDecision(client, { workspace_id: server.workspace_id, caller,
+          server_id, tool_name: tool, args_hash: argsHash(args as Record<string, unknown>),
+          decision: "deny", reason, overhead_ms: overheadMs() });
+        await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
+          resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied",
+          metadata: { reason: "policy_unavailable", detail: policyLoad.reason } });
+        await recordDeniedSpan(client, parsed.data, server.id, tool, reason);
+        return reply.code(503).send({ error: "policy_unavailable", reason: policyLoad.reason });
+      }
+      const policy = policyLoad.policy;
+
+      // The server itself must be in the signed manifest: a registered row is
+      // a draft, only the manifest makes it connectable (§7.4).
+      const manifestServer = policy.bundle.servers.find((s) => s.server_id === server.id);
+      if (!manifestServer || manifestServer.base_url !== server.base_url) {
+        const reason = "server is not in the active signed policy";
+        await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+          tool_name: tool, args_hash: argsHash(args as Record<string, unknown>), decision: "deny", reason,
+          policy_version_id: policy.policy_version_id, overhead_ms: overheadMs() });
+        await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
+          resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied",
+          metadata: { reason: "server_not_in_policy" } });
+        await recordDeniedSpan(client, parsed.data, server.id, tool, reason);
+        return reply.code(403).send({ error: "tool_blocked", reason });
+      }
+
       const toolRow = await client.query(
         "SELECT * FROM server_tools WHERE server_id = $1 AND tool_name = $2", [server_id, tool]
       );
       if (!toolRow.rows[0] || toolRow.rows[0].quarantined) {
         const reason = toolRow.rows[0] ? "tool quarantined" : "unknown tool";
         await recordDecision(client, { workspace_id: server.workspace_id, caller,
-          server_id, tool_name: tool, args_hash: sha256Hex(stableStringify(args)),
-          decision: "deny", reason, overhead_ms: overheadMs() });
+          server_id, tool_name: tool, args_hash: argsHash(args as Record<string, unknown>),
+          decision: "deny", reason, policy_version_id: policy.policy_version_id,
+          overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
           resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied" });
         // Alerts never block the denial they report.
@@ -566,29 +608,63 @@ export function buildGateway() {
         return reply.code(403).send({ error: "tool_blocked", reason: "unknown or quarantined tool" });
       }
 
+      // The pin manifest: a tool executes only when the definition the signed
+      // policy activated is the one the upstream serves now. A definition
+      // that changed after publication, or was never published, blocks the
+      // call (§7.5, §13.3).
+      const pin = policy.bundle.pins.find((p) => p.server_id === server.id && p.tool_name === tool);
+      const pinIssue = !pin
+        ? "tool is not in the active signed policy"
+        : pin.definition_hash !== toolRow.rows[0].definition_hash
+          ? "tool definition changed since it was published"
+          : null;
+      if (pinIssue) {
+        await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+          tool_name: tool, args_hash: argsHash(args as Record<string, unknown>), decision: "deny",
+          reason: pinIssue, policy_version_id: policy.policy_version_id, overhead_ms: overheadMs() });
+        await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
+          resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied",
+          metadata: { reason: "pin_not_active" } });
+        void notify(server.workspace_id, "tool.denied",
+          { caller, server_id, tool, reason: pinIssue });
+        await recordDeniedSpan(client, parsed.data, server.id, tool, pinIssue);
+        // A held approval for a pin that is no longer active is dead with it.
+        if (parsed.data.approval_id) {
+          const prior = await client.query(
+            "SELECT * FROM approvals WHERE id = $1 AND status = 'approved'",
+            [parsed.data.approval_id]
+          );
+          if (prior.rows[0]) {
+            await client.query(
+              `UPDATE approvals SET status='policy_invalidated', terminal_at=now(), decision_reason=$2,
+                 args='{}'::jsonb, args_enc=false, args_summary=$3 WHERE id=$1 AND status='approved'`,
+              [prior.rows[0].id, `invalidated: ${pinIssue}`, safeSummary(prior.rows[0])]
+            );
+            await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.policy_invalidated",
+              resource_type: "approval", resource_id: prior.rows[0].id, result: "deny",
+              metadata: { reason: pinIssue } });
+          }
+        }
+        return reply.code(403).send({ error: "tool_blocked", reason: pinIssue });
+      }
+
       // Policy evaluation runs before any approval handling: an approval
       // issued earlier must never override a deny rule added since (§11.3,
       // "approval must not override an unconditional deny"). Retries are
       // re-evaluated against the current policy set, not the set that
       // existed when the approval was issued.
-      const policyRows = await client.query(
-        "SELECT * FROM policies WHERE workspace_id = $1 AND superseded_by IS NULL", [server.workspace_id]
-      );
-      const rules: PolicyRule[] = policyRows.rows.map((r) => ({
-        id: r.id, version: r.version, name: r.name, enabled: r.enabled, priority: r.priority,
-        agent_id: r.agent_id, server_id: r.server_id, tool_name: r.tool_name,
-        effect: r.effect, conditions: (r.conditions ?? {}) as PolicyRule["conditions"]
-      }));
+      const rules = rulesFromBundle(policy.bundle);
       const verdict = evaluate(rules, {
         caller, agent_id: parsed.data.agent_id ?? null, server_id, tool_name: tool,
         args: args as Record<string, unknown>
       });
-      const argsHash = sha256Hex(stableStringify(args));
+      const callArgsHash = argsHash(args as Record<string, unknown>);
 
       if (verdict.decision === "deny") {
         await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
-          tool_name: tool, args_hash: argsHash, decision: "deny",
+          tool_name: tool, args_hash: callArgsHash, decision: "deny",
           policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null,
+          policy_version_id: policy.policy_version_id,
           matched: verdict.matched, reason: verdict.reason,
           approval_id: parsed.data.approval_id ?? null, overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
@@ -630,8 +706,8 @@ export function buildGateway() {
       if (exhausted) {
         const reason = `budget exhausted (${exhausted.scope} ${exhausted.id})`;
         await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
-          tool_name: tool, args_hash: argsHash, decision: "deny",
-          matched: verdict.matched, reason,
+          tool_name: tool, args_hash: callArgsHash, decision: "deny",
+          policy_version_id: policy.policy_version_id, matched: verdict.matched, reason,
           approval_id: parsed.data.approval_id ?? null, overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
           resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied",
@@ -676,7 +752,8 @@ export function buildGateway() {
             [approval.id, safeSummary(approval)]
           );
           await recordDecision(client, { workspace_id: server.workspace_id, caller,
-            server_id, tool_name: tool, args_hash: argsHash,
+            server_id, tool_name: tool, args_hash: callArgsHash,
+            policy_version_id: policy.policy_version_id,
             decision: "deny", reason: "approval expired", approval_id: approval.id,
             overhead_ms: overheadMs() });
           await audit(client, { actor_type: "agent", actor_id: caller, action: "approval.expired",
@@ -700,7 +777,8 @@ export function buildGateway() {
             [approval.id, safeSummary(approval)]
           );
           await recordDecision(client, { workspace_id: server.workspace_id, caller,
-            server_id, tool_name: tool, args_hash: argsHash,
+            server_id, tool_name: tool, args_hash: callArgsHash,
+            policy_version_id: policy.policy_version_id,
             decision: "deny", reason: "approval expired", approval_id: approval.id,
             overhead_ms: overheadMs() });
           await audit(client, { actor_type: "agent", actor_id: caller, action: "approval.expired",
@@ -708,10 +786,11 @@ export function buildGateway() {
           await client.query("COMMIT");
           return reply.code(410).send({ error: "approval_expired" });
         }
-        const want = requestHash(caller, server_id, tool, args, approval.request_id);
+        const want = requestHash(caller, server_id, tool, args, approval.request_id, String(toolRow.rows[0].definition_hash));
         if (!hashesEqual(want, approval.args_hash) || approval.caller !== caller) {
           await recordDecision(client, { workspace_id: server.workspace_id, caller,
-            server_id, tool_name: tool, args_hash: argsHash,
+            server_id, tool_name: tool, args_hash: callArgsHash,
+            policy_version_id: policy.policy_version_id,
             decision: "deny", reason: "approval binding mismatch", approval_id: approval.id,
             overhead_ms: overheadMs() });
           // A replay or a transplanted approval is the most tell-tale event
@@ -731,19 +810,24 @@ export function buildGateway() {
           await client.query("ROLLBACK");
           return reply.code(500).send({ error: "approval_unreadable" });
         }
-        // Consume-time full re-evaluation, in the same transaction as the
-        // claim: a deny or a quarantined pin added after approval invalidates
-        // it and nothing is dispatched. Prior human approval never overrides
-        // a current deny.
-        const recheck = evaluate(rules, {
-          caller, agent_id: parsed.data.agent_id ?? null, server_id, tool_name: tool,
-          args: stored
-        });
+        // Consume-time full re-evaluation (§9.2 rule 4), in the same
+        // transaction as the claim: the *current* signed policy is loaded
+        // again, so a deny, a dropped pin, or a quarantined tool added after
+        // the approval invalidates it and nothing is dispatched. Prior human
+        // approval never overrides a current deny.
+        const freshLoad = await loadActivePolicy(client, server.workspace_id);
+        if (!freshLoad.ok) {
+          // Fail closed without consuming: the approval stays approved and a
+          // retry can proceed once policy storage is healthy again.
+          await client.query("ROLLBACK");
+          return reply.code(503).send({ error: "policy_unavailable", reason: freshLoad.reason });
+        }
+        const freshPolicy = freshLoad.policy;
         const toolNow = await client.query(
-          "SELECT quarantined FROM server_tools WHERE server_id = $1 AND tool_name = $2",
+          "SELECT quarantined, definition_hash FROM server_tools WHERE server_id = $1 AND tool_name = $2",
           [server_id, tool]
         );
-        if (toolNow.rows[0]?.quarantined) {
+        if (!toolNow.rows[0] || toolNow.rows[0].quarantined) {
           await client.query(
             `UPDATE approvals SET status='tool_quarantined', terminal_at=now(), args='{}'::jsonb,
                args_enc=false, args_summary=$2 WHERE id=$1 AND status='approved'`,
@@ -754,6 +838,35 @@ export function buildGateway() {
           await client.query("COMMIT");
           return reply.code(403).send({ error: "tool_quarantined", approval_id: approval.id });
         }
+        // The pin that was active when the approval was issued must still be
+        // the active pin now, or the approval authorized a definition the
+        // signed policy no longer carries.
+        const freshPin = freshPolicy.bundle.pins.find(
+          (p) => p.server_id === server.id && p.tool_name === tool
+        );
+        if (!freshPin || freshPin.definition_hash !== toolNow.rows[0].definition_hash) {
+          const why = "the tool pin is no longer active in the signed policy";
+          await client.query(
+            `UPDATE approvals SET status='policy_invalidated', terminal_at=now(), decision_reason=$2,
+               args='{}'::jsonb, args_enc=false, args_summary=$3 WHERE id=$1 AND status='approved'`,
+            [approval.id, `invalidated: ${why}`,
+             summarizeArgs(stored, { captureRaw: captureRawEnabled() })]
+          );
+          await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+            tool_name: tool, args_hash: callArgsHash, decision: "deny",
+            policy_version_id: freshPolicy.policy_version_id,
+            reason: `approval invalidated: ${why}`,
+            approval_id: approval.id, overhead_ms: overheadMs() });
+          await audit(client, { actor_type: "agent", actor_id: caller, action: "approval.policy_invalidated",
+            resource_type: "approval", resource_id: approval.id, result: "deny",
+            metadata: { reason: why } });
+          await client.query("COMMIT");
+          return reply.code(403).send({ error: "policy_invalidated", reason: why });
+        }
+        const recheck = evaluate(rulesFromBundle(freshPolicy.bundle), {
+          caller, agent_id: parsed.data.agent_id ?? null, server_id, tool_name: tool,
+          args: stored
+        });
         if (recheck.decision === "deny") {
           await client.query(
             `UPDATE approvals SET status='policy_invalidated', terminal_at=now(), decision_reason=$2,
@@ -762,8 +875,9 @@ export function buildGateway() {
              summarizeArgs(stored, { captureRaw: captureRawEnabled() })]
           );
           await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
-            tool_name: tool, args_hash: argsHash, decision: "deny",
+            tool_name: tool, args_hash: callArgsHash, decision: "deny",
             policy_id: recheck.rule?.id ?? null, policy_version: recheck.rule?.version ?? null,
+            policy_version_id: freshPolicy.policy_version_id,
             matched: recheck.matched,
             reason: `approval invalidated by current policy: ${recheck.reason}`,
             approval_id: approval.id, overhead_ms: overheadMs() });
@@ -795,7 +909,7 @@ export function buildGateway() {
         let result: unknown;
         try {
           result = await forward(client, server, tool, stored,
-            caller, { approval_id: approval.id, overheadMs: overheadMs() });
+            caller, { approval_id: approval.id, policy_version_id: freshPolicy.policy_version_id, overheadMs: overheadMs() });
         } catch (err) {
           // The gateway cannot prove the upstream did not act: burn the
           // approval into a visible ambiguity, never auto-retry.
@@ -848,7 +962,7 @@ export function buildGateway() {
           return reply.code(429).send({ error: "approval_rate_limited", retry_after_seconds: 60 });
         }
         const requestId = parsed.data.request_id ?? `req-${randomUUID()}`;
-        const hash = requestHash(caller, server_id, tool, args as Record<string, unknown>, requestId);
+        const hash = requestHash(caller, server_id, tool, args as Record<string, unknown>, requestId, String(toolRow.rows[0].definition_hash));
         const expiresAt = new Date(Date.now() + APPROVAL_TTL_SECONDS * 1000).toISOString();
         const sealed = seal(ARGS_KEY, args as Record<string, unknown>, requestId);
         const ap = await client.query(
@@ -861,8 +975,9 @@ export function buildGateway() {
         );
         const row = ap.rows[0] ?? (await client.query("SELECT id, request_id, status, expires_at FROM approvals WHERE request_id=$1", [requestId])).rows[0];
         await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
-          tool_name: tool, args_hash: argsHash, decision: "need_approval",
+          tool_name: tool, args_hash: callArgsHash, decision: "need_approval",
           policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null,
+          policy_version_id: policy.policy_version_id,
           matched: verdict.matched, reason: verdict.reason, approval_id: row.id,
           overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.request",
@@ -875,7 +990,8 @@ export function buildGateway() {
 
       try {
         const result = await forward(client, server, tool, args as Record<string, unknown>, caller,
-          { policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null, matched: verdict.matched, overheadMs: overheadMs() });
+          { policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null,
+            policy_version_id: policy.policy_version_id, matched: verdict.matched, overheadMs: overheadMs() });
         return { result };
       } catch {
         return reply.code(502).send({ error: "upstream_failed" });
@@ -1063,6 +1179,54 @@ export function buildGateway() {
     const res = await pool.query(
       `SELECT * FROM audit_events ${where.length ? "WHERE " + where.join(" AND ") : ""}
        ORDER BY timestamp DESC LIMIT $${params.length}`, params
+    );
+    return { items: res.rows };
+  });
+
+  // §10: verification recomputes every event hash and checks every link. The
+  // table is append-only at the database layer (migration 022), so any
+  // mutation it detects came from something with schema rights — which is
+  // exactly the party an operator-controlled checkpoint exists to catch.
+  app.post("/v1/audit/verify", async (req) => {
+    const q = (req.query ?? {}) as { limit?: string };
+    const limit = Math.min(Math.max(Number(q.limit ?? 200_000), 1), 1_000_000);
+    const res = await pool.query(
+      `SELECT id, timestamp, actor_type, actor_id, action, resource_type, resource_id,
+              result, metadata, prev_hash, hash
+         FROM audit_events ORDER BY timestamp ASC, id ASC LIMIT $1`,
+      [limit + 1]
+    );
+    const truncated = res.rows.length > limit;
+    const rows = res.rows.slice(0, limit) as Parameters<typeof verifyAuditChain>[0];
+    const verification = verifyAuditChain(rows);
+    // A bounded read cannot prove the tail it never saw; say so instead of
+    // reporting a prefix as the whole chain.
+    return {
+      ...verification,
+      truncated,
+      checked_to: rows.length > 0 ? rows[rows.length - 1].hash : null
+    };
+  });
+
+  // The immutable signed policy editions, newest first, with whether the
+  // active pointer currently cites each one. Draft rules live in /v1/policies;
+  // only a published version governs enforcement.
+  app.get("/v1/policy-versions", async (req) => {
+    const params: unknown[] = [];
+    const limit = Math.min(Math.max(Number((req.query as { limit?: string }).limit ?? 50), 1), 200);
+    const scope = scopeClause(req.principal, params, "pv.workspace_id");
+    params.push(limit);
+    const res = await pool.query(
+      `SELECT pv.id, pv.workspace_id, pv.version, pv.content_hash, pv.previous_version_hash,
+              pv.published_at, pv.published_by, pv.signing_key_id,
+              pk.key_id, (pk.retired_at IS NOT NULL) AS key_retired,
+              (ac.policy_version_id = pv.id) AS active
+         FROM policy_versions pv
+         JOIN policy_signing_keys pk ON pk.id = pv.signing_key_id
+         LEFT JOIN active_config ac ON ac.workspace_id = pv.workspace_id
+        ${scope ? `WHERE ${scope}` : ""}
+        ORDER BY pv.version DESC LIMIT $${params.length}`,
+      params
     );
     return { items: res.rows };
   });

@@ -1,7 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
-import { evaluate, type PolicyRule } from "./policy.js";
+import { evaluate } from "./policy.js";
+import { loadActivePolicy, rulesFromBundle } from "./policy-bundle.js";
 import type { Principal } from "./auth.js";
 
 // The agent-facing boundary is the MCP Streamable HTTP profile of the
@@ -33,17 +34,6 @@ async function resolveWorkspace(principal?: Principal): Promise<string | null> {
   if (principal && Array.isArray(principal.workspaces)) return principal.workspaces[0] ?? null;
   const found = await pool.query("SELECT id FROM workspaces WHERE name = 'default'");
   return (found.rows[0]?.id as string | undefined) ?? null;
-}
-
-async function loadRules(workspaceId: string): Promise<PolicyRule[]> {
-  const rows = await pool.query(
-    "SELECT * FROM policies WHERE workspace_id = $1 AND superseded_by IS NULL", [workspaceId]
-  );
-  return rows.rows.map((r) => ({
-    id: r.id, version: r.version, name: r.name, enabled: r.enabled, priority: r.priority,
-    agent_id: r.agent_id, server_id: r.server_id, tool_name: r.tool_name,
-    effect: r.effect, conditions: (r.conditions ?? {}) as PolicyRule["conditions"]
-  }));
 }
 
 interface RpcEnvelope {
@@ -151,7 +141,13 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
   // §9.5: an approval needing call without the shim's stable logical id is
   // refused explicitly rather than silently creating an unmatchable hold.
   if (!logicalId) {
-    const verdict = evaluate(await loadRules(workspaceId), {
+    const loaded = await loadActivePolicy(pool, workspaceId);
+    if (!loaded.ok) {
+      return rpcError(env.id, -32008, "Policy unavailable", {
+        error: "POLICY_UNAVAILABLE", reason: loaded.reason
+      });
+    }
+    const verdict = evaluate(rulesFromBundle(loaded.policy.bundle), {
       caller, agent_id: null, server_id: server.id, tool_name: tool, args
     });
     if (verdict.decision === "need_approval") {
@@ -276,8 +272,21 @@ export function registerMcpRoutes(app: FastifyInstance): void {
             tools: [], ttlMs: TOOLS_TTL_MS, cacheScope: "workspace", resultType: "complete"
           });
         }
+        // Listing is gated by the signed manifests: only servers the active
+        // policy carries, and only tools whose exact pinned definition it
+        // activated, are ever shown to a client (§7.2, §13.3).
+        const loaded = await loadActivePolicy(pool, workspaceId);
+        if (!loaded.ok) {
+          return rpcError(env.id, -32008, "Policy unavailable", {
+            error: "POLICY_UNAVAILABLE", reason: loaded.reason
+          });
+        }
+        const manifest = new Map(loaded.policy.bundle.servers.map((s) => [s.server_id, s]));
+        const pins = new Set(
+          loaded.policy.bundle.pins.map((p) => `${p.server_id}|${p.tool_name}|${p.definition_hash}`)
+        );
         const rows = await pool.query(
-          `SELECT s.gateway_alias, t.tool_name, t.definition, t.definition_hash
+          `SELECT s.id AS server_id, s.gateway_alias, t.tool_name, t.definition, t.definition_hash
              FROM mcp_servers s JOIN server_tools t ON t.server_id = s.id
             WHERE s.workspace_id = $1 AND t.quarantined = false
             ORDER BY s.gateway_alias, t.tool_name`,
@@ -287,10 +296,16 @@ export function registerMcpRoutes(app: FastifyInstance): void {
           // The reviewed definition is what clients see: every field the pin
           // covers, so a client cannot observe a description or schema the
           // human never approved (§7.5).
-          tools: rows.rows.map((r) => {
-            const d = (r.definition ?? {}) as Record<string, unknown>;
-            return { ...d, name: `${r.gateway_alias}__${r.tool_name}` };
-          }),
+          tools: rows.rows
+            .filter((r) => {
+              const listed = manifest.get(r.server_id as string);
+              return listed?.alias === r.gateway_alias &&
+                pins.has(`${r.server_id}|${r.tool_name}|${r.definition_hash}`);
+            })
+            .map((r) => {
+              const d = (r.definition ?? {}) as Record<string, unknown>;
+              return { ...d, name: `${r.gateway_alias}__${r.tool_name}` };
+            }),
           ttlMs: TOOLS_TTL_MS,
           cacheScope: "workspace",
           resultType: "complete"

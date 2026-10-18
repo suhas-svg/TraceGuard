@@ -6,6 +6,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { buildApp } from "../src/index.js";
 import { buildGateway } from "../src/gateway.js";
 import { pool } from "../src/db.js";
+import { publishTestPolicy } from "./policy-helper.js";
 
 const PROTOCOL = "2026-07-28";
 
@@ -76,6 +77,7 @@ describe("MCP streamable HTTP gateway", () => {
       });
       expect([200, 201]).toContain(r.statusCode);
     }
+    await publishTestPolicy(pool);
   });
 
   afterAll(async () => {
