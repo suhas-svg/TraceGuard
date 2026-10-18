@@ -91,6 +91,23 @@ export function pathWithin(value: string, allowedDir: string): boolean {
   return v === base || v.startsWith(base.endsWith("/") ? base : base + "/");
 }
 
+// T8: a rule pattern is bounded on both sides. The schema refuses invalid,
+// oversized, backreference and nested-quantifier patterns where a rule is
+// stored or a bundle is loaded; this caps the subject so a match cannot run
+// away on a huge argument, and an unusable pattern denies instead of throwing.
+// shortcut: the caps bound the cost, they do not prove linear time for every
+// pattern inside them; a real timeout needs worker threads. Upgrade if policy
+// authors are not trusted.
+export const MAX_REGEX_SUBJECT = 4096;
+
+export function regexMatches(pattern: string, value: string): boolean {
+  try {
+    return new RegExp(pattern).test(value.slice(0, MAX_REGEX_SUBJECT));
+  } catch {
+    return false;
+  }
+}
+
 export function checkField(value: unknown, rule: FieldConstraint): boolean {
   if (rule.max_length !== undefined) {
     if (typeof value !== "string" || value.length > rule.max_length) return false;
@@ -100,7 +117,7 @@ export function checkField(value: unknown, rule: FieldConstraint): boolean {
   }
   if (rule.regex !== undefined) {
     if (typeof value !== "string") return false;
-    if (!new RegExp(rule.regex).test(value)) return false;
+    if (!regexMatches(rule.regex, value)) return false;
   }
   if (rule.path_within !== undefined) {
     if (!pathWithin(String(value ?? ""), rule.path_within)) return false;

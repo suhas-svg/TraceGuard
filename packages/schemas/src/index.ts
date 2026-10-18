@@ -51,14 +51,41 @@ export const BUNDLE_VERSION = 1;
 export const PROTOCOL_PROFILE = "mcp-2026-07-28";
 
 // The fixed operator set of §8.4, nothing else: no expressions, no code.
-const fieldConstraintSchema = z.object({
+// A regex is validated here rather than at match time because this schema runs
+// on both paths that matter: the draft API that stores a rule, and the bundle
+// loader that enforces one.
+// Backreferences, and an unbounded quantifier (+ * {n,}) over a group that
+// itself repeats or alternates: the shapes that backtrack catastrophically.
+// Bounded repetition over such a group ((a|b){1,3}, (ab+){2}) stays allowed,
+// because the bound caps the work.
+const UNSAFE_REGEX = /\\[1-9]|\([^()]*[|+*}][^()]*\)(?:\+|\*|\{\d+,\})/;
+const regexSchema = z
+  .string()
+  .min(1)
+  .max(512)
+  .refine((p) => {
+    try {
+      new RegExp(p);
+      return true;
+    } catch {
+      return false;
+    }
+  }, "pattern is not a valid regular expression")
+  .refine(
+    (p) => !UNSAFE_REGEX.test(p),
+    "backreferences and nested quantifiers are not supported (T8: they are the shapes that backtrack catastrophically)"
+  );
+
+export const fieldConstraintSchema = z.object({
   path_within: z.string().min(1).max(4096).optional(),
-  regex: z.string().min(1).max(512).optional(),
+  regex: regexSchema.optional(),
   enum: z.array(z.unknown()).max(256).optional(),
   max_length: z.number().int().min(0).max(1_000_000).optional()
 }).strict();
 
-const argConditionsSchema = z.object({
+// Shared with the control API so a draft is refused at creation rather than
+// only when a bundle carrying it is loaded (fail-closed, but late is worse).
+export const argConditionsSchema = z.object({
   required: z.array(z.string().min(1).max(128)).max(128).default([]),
   arguments: z.record(fieldConstraintSchema).optional()
 }).strict();

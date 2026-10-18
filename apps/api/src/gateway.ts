@@ -5,6 +5,7 @@ import type { PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
 import { verifyAuditChain } from "@traceguard/audit-chain";
+import { argConditionsSchema } from "@traceguard/schemas";
 import {
   argsHash,
   evaluate,
@@ -334,7 +335,9 @@ export function buildGateway() {
     server_id: z.string().uuid().nullable().optional(),
     tool_name: z.string().max(128).nullable().optional(),
     effect: z.enum(["allow", "deny", "require_approval"]),
-    conditions: z.record(z.unknown()).default({})
+    // The typed condition shape, not a free record: an unsupported pattern is
+    // refused here rather than at bundle load (T8).
+    conditions: argConditionsSchema.default({ required: [] })
   });
 
   app.post("/v1/policies", async (req, reply) => {

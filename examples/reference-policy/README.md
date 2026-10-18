@@ -76,7 +76,10 @@ curl -s -X POST http://localhost:8091/v1/approvals/<approval-id>/decision \
 
 - `required: ["path"]` (a conditions-level list) — the argument must be present.
 - `path_within: "/srv/data"` — canonicalized path must stay inside the prefix.
-- `regex: "^/tmp/"` — anchor carefully; invalid patterns fail closed.
+- `regex: "^/tmp/"` — anchor carefully. Patterns are validated where the rule
+  is stored: invalid syntax, over 512 characters, backreferences, and an
+  unbounded quantifier over a repeating or alternating group (`(a+)+`,
+  `(a|aa)+`) are refused, and the subject is capped when matching (T8).
 - `enum: ["a", "b"]` — exact allowed values.
 - `max_length: 256` — string length cap.
 
