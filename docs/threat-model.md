@@ -51,8 +51,8 @@ checkpoint anchors history against that.
 | T14 | **S** Stolen API key | Hashed at rest, scoped, revocable, rate-limited | Implemented |
 | T15 | **T** Duplicate external side effect after a timeout | Post-dispatch ambiguity becomes `OUTCOME_UNKNOWN`; never auto-retried; UI says the action may have executed | Implemented |
 | T16 | **T** Unsigned or rolled-back policy | Only the active signed bundle is enforced: content hash, Ed25519 signature, recomputed key id, retired-key refusal, version/history agreement, and rollback/fork/history-gap detection against the gateway's own accepted-version anchor | Implemented (`policy-bundle.ts`, `signed-policy.test.ts`) |
-| T17 | **S** Forged or replayed OAuth token | Access tokens are validated as JWTs against the issuer's published keys: signature (EdDSA / RS256 / ES256 only), kid lookup with bounded refetch so rotation needs no restart, issuer, canonical audience, expiry and nbf with skew, and scope mapping; the gateway serves RFC 9728 protected-resource metadata and challenges with it; production refuses to start without an issuer and stops accepting static keys | Implemented (`oauth.ts`, `oauth.test.ts`); residual: no introspection mode, and the bundled client shim still authenticates with a static key |
-| T18 | **T** UI or API compromise changes execution authority | Gateway enforces from signed bundles it verifies itself; the control surface writes drafts only and no endpoint can sign, activate, or roll back a version; approve/reject requires the approver key at the gateway listener; migration 023 makes the denials database privileges (API cannot touch `policy_versions`/`active_config`/`policy_signing_keys`, write audit directly, or transition approvals) and `apps/api/tests/db-roles.test.ts` proves the matrix | Implemented; residual: services still connect as the database owner until a deployment enables the role logins (`docs/operations.md`) |
+| T17 | **S** Forged or replayed OAuth token | Access tokens are validated as JWTs against the issuer's published keys: signature (EdDSA / RS256 / ES256 only), kid lookup with bounded refetch so rotation needs no restart, issuer, canonical audience, expiry and nbf with skew, and scope mapping; the gateway serves RFC 9728 protected-resource metadata and challenges with it; the bundled client discovers that metadata plus the issuer's, sends the RFC 8707 resource indicator, checks the issuer binding, and refreshes its cached token once on a 401; production refuses to start without an issuer and stops accepting static keys | Implemented (`oauth.ts`, `oauth.test.ts`, `packages/mcp-client-shim`); residual: no introspection mode, and no interactive Authorization Code + PKCE (the shim is headless) |
+| T18 | **T** UI or API compromise changes execution authority | Gateway enforces from signed bundles it verifies itself; the control surface writes drafts only and no endpoint can sign, activate, or roll back a version; approve/reject requires the approver key at the gateway listener; migration 023 makes the denials database privileges (API cannot touch `policy_versions`/`active_config`/`policy_signing_keys`, write audit directly, or transition approvals), `apps/api/tests/db-roles.test.ts` proves the matrix, and both deploy paths connect the services as their roles | Implemented |
 
 ## Residual limitations
 
@@ -88,7 +88,8 @@ Status in this tree: 1 (partial — no compose agent container), 2–4, 6–7,
 9–12 are covered by `apps/api/tests` (`signed-policy.test.ts`, `pins.test.ts`,
 `oauth.test.ts`, `approvals.test.ts`, `integration.test.ts`) and
 `tools/policy-publisher/tests`; 5 is covered at the application layer only; 8
-is covered in `integration.test.ts`. What remains for the release gate is the
-client half of FR-002 — the shim's own OAuth client flow (registered client,
-PKCE, RFC 8707 resource indicator) — which today sends the static development
-key, and a compose-network bypass test with a real agent container.
+is covered in `integration.test.ts`. The one release-gate item still open is
+a compose-network bypass test with a real agent container (FR-004's automated
+half); the client half of FR-002 is covered by the shim's OAuth tests for the
+headless flow, and interaction consent (Authorization Code + PKCE) remains a
+browser-client concern rather than a gate item.

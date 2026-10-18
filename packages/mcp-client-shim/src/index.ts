@@ -19,56 +19,35 @@ const META_PROTOCOL = "io.modelcontextprotocol/protocolVersion";
 const META_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
 const META_LOGICAL = "io.traceguard/logical_request_id";
 
-export class ShimError extends Error {
-  code?: string;
-  constructor(message: string, code?: string) {
-    super(message);
-    this.name = new.target.name;
-    this.code = code;
-  }
-}
+import {
+  ApprovalClientRequiredError,
+  ApprovalPendingError,
+  ApprovalTerminalError,
+  OutcomeUnknownError,
+  ShimError
+} from "./errors.js";
+import { OAuthTokenSource, type OAuthClientOptions } from "./oauth.js";
 
-export class ApprovalClientRequiredError extends ShimError {
-  constructor(message: string) {
-    super(message, "APPROVAL_CLIENT_REQUIRED");
-  }
-}
-
-export class ApprovalPendingError extends ShimError {
-  logicalRequestId: string;
-  approvalId?: string;
-  expiresAt?: string;
-  constructor(message: string, logicalRequestId: string, approvalId?: string, expiresAt?: string) {
-    super(message, "APPROVAL_PENDING");
-    this.logicalRequestId = logicalRequestId;
-    this.approvalId = approvalId;
-    this.expiresAt = expiresAt;
-  }
-}
-
-export class ApprovalTerminalError extends ShimError {
-  status?: string;
-  approvalId?: string;
-  constructor(message: string, status?: string, approvalId?: string) {
-    super(message, "APPROVAL_TERMINAL");
-    this.status = status;
-    this.approvalId = approvalId;
-  }
-}
-
-export class OutcomeUnknownError extends ShimError {
-  approvalId?: string;
-  constructor(message: string, approvalId?: string) {
-    super(message, "OUTCOME_UNKNOWN");
-    this.approvalId = approvalId;
-  }
-}
+export {
+  ApprovalClientRequiredError,
+  ApprovalPendingError,
+  ApprovalTerminalError,
+  OutcomeUnknownError,
+  ShimError
+} from "./errors.js";
+export { OAuthClientError, type OAuthClientOptions } from "./oauth.js";
 
 export interface CertifiedClientOptions {
   /** Gateway MCP endpoint, e.g. http://localhost:8091/mcp */
   url: string;
-  /** Gateway bearer token (dev profile: the static gateway key). */
-  token: string;
+  /** Gateway bearer token (dev profile: the static gateway key). Exactly one of token or oauth. */
+  token?: string;
+  /**
+   * FR-002 client half: discover the gateway's protected-resource metadata,
+   * fetch a token for this resource from the advertised issuer, and refresh
+   * it. Use it when the deployment runs on OAuth (OAUTH_ISSUER set).
+   */
+  oauth?: OAuthClientOptions;
   /** Backoff seed between APPROVAL_PENDING retries. Default 2s. */
   retryIntervalMs?: number;
   /** Overall deadline for one logical call. Default 15 minutes. */
@@ -89,19 +68,33 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class CertifiedClient {
   private readonly url: string;
-  private readonly token: string;
+  private readonly token?: string;
+  private readonly oauth?: OAuthTokenSource;
   private readonly retryIntervalMs: number;
   private readonly deadlineMs: number;
   private readonly requestTimeoutMs: number;
   private readonly fetchImpl: typeof fetch;
 
   constructor(opts: CertifiedClientOptions) {
+    if ((opts.token ? 1 : 0) + (opts.oauth ? 1 : 0) !== 1) {
+      throw new ShimError("CertifiedClient needs exactly one of token or oauth", "CONFIG");
+    }
     this.url = opts.url;
     this.token = opts.token;
+    this.oauth = opts.oauth
+      ? new OAuthTokenSource({ ...opts.oauth, fetchImpl: opts.oauth.fetchImpl ?? opts.fetchImpl })
+      : undefined;
     this.retryIntervalMs = opts.retryIntervalMs ?? 2_000;
     this.deadlineMs = opts.deadlineMs ?? 15 * 60_000;
     this.requestTimeoutMs = opts.requestTimeoutMs ?? 120_000;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+  }
+
+  // FR-002: in OAuth mode the bearer is fetched (and refreshed) as needed;
+  // in the development profile it is the configured static key.
+  private async authorization(): Promise<string> {
+    if (this.oauth) return this.oauth.token();
+    return this.token as string;
   }
 
   async callTool(
@@ -114,9 +107,17 @@ export class CertifiedClient {
     let delay = this.retryIntervalMs;
     let approvalId: string | undefined;
     let expiresAt: string | undefined;
+    let authRefreshed = false;
 
     for (;;) {
       const res = await this.post(name, args, logicalRequestId);
+      if (res.status === 401 && this.oauth && !authRefreshed) {
+        // A 401 comes from the auth hook, before anything is dispatched, so a
+        // single retry with a fresh token cannot duplicate an action.
+        this.oauth.invalidate();
+        authRefreshed = true;
+        continue;
+      }
       if (res.status >= 500) {
         // The gateway may have dispatched before failing to answer.
         throw new OutcomeUnknownError(
@@ -188,12 +189,16 @@ export class CertifiedClient {
         }
       }
     };
+    // Resolve the credential before the try: a token-endpoint failure means
+    // the call never left for the gateway, so it must surface as itself
+    // rather than as an ambiguous transport outcome.
+    const authorization = `Bearer ${await this.authorization()}`;
     let res: Response;
     try {
       res = await this.fetchImpl(this.url, {
         method: "POST",
         headers: {
-          authorization: `Bearer ${this.token}`,
+          authorization,
           "content-type": "application/json",
           accept: "application/json",
           "mcp-protocol-version": PROTOCOL_VERSION,
