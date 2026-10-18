@@ -359,6 +359,18 @@ export interface AuditEvent {
   metadata: Record<string, unknown>;
 }
 
+export interface PolicyVersion {
+  id: string;
+  version: number;
+  content_hash: string;
+  previous_version_hash: string | null;
+  published_at: string;
+  published_by: string;
+  key_id: string;
+  key_retired: boolean;
+  active: boolean;
+}
+
 export const gwApi = {
   servers: () => gw<{ items: McpServer[] }>("/v1/servers"),
   createServer: (s: { name: string; base_url: string; auth_secret?: string }) =>
@@ -385,7 +397,12 @@ export const gwApi = {
       { method: "PUT", body: JSON.stringify({ quarantined }) }
     ),
   audit: (action?: string) =>
-    gw<{ items: AuditEvent[] }>(`/v1/audit-events${action ? `?action=${encodeURIComponent(action)}` : ""}`)
+    gw<{ items: AuditEvent[] }>(`/v1/audit-events${action ? `?action=${encodeURIComponent(action)}` : ""}`),
+  policyVersions: () => gw<{ items: PolicyVersion[] }>("/v1/policy-versions"),
+  auditVerify: () =>
+    gw<{ ok: boolean; checked: number; truncated: boolean; problems: { id: string; problem: string }[] }>(
+      "/v1/audit/verify", { method: "POST", body: "{}" }
+    )
 };
 
 export interface Webhook {

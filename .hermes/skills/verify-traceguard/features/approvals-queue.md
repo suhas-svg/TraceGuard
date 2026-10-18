@@ -22,13 +22,18 @@ Preconditions:
 
 - Baseline met; gateway up (:8091) and the dashboard's approver key matches the gateway
   (`dev_approver_change_me` by default).
-- A fresh pending approval exists. The reliable recipe (proven 2026-10-16): bring up the
-  compose mock upstream (`docker compose up -d mock-tools` — it is on the internal `tools`
-  network, so the gateway reaches it as `http://mock-tools:8092/mcp`; `localhost:8092` is the
-  host's view and is unreachable from the gateway container), register it
-  (`POST /v1/servers` with that url), `POST /v1/servers/:id/discover`, add a server-scoped
-  `require_approval` rule (`POST /v1/policies` with `server_id`, `tool_name: "wipe_disk"`,
-  `priority: 100`), then call `POST /v1/gateway/tools/call` with that server id and tool.
+- A fresh pending approval exists. The reliable recipe (proven 2026-10-16, updated for
+  signed policy): bring up the compose mock upstream (`docker compose up -d mock-tools` —
+  it is on the internal `tools` network, so the gateway reaches it as
+  `http://mock-tools:8092/mcp`; `localhost:8092` is the host's view and is unreachable
+  from the gateway container), register it (`POST /v1/servers` with that url),
+  `POST /v1/servers/:id/discover`, add a server-scoped `require_approval` rule
+  (`POST /v1/policies` with `server_id`, `tool_name: "wipe_disk"`, `priority: 100`),
+  then **publish the signed policy** (`npm run policy:keygen` and
+  `npm run policy:trust -- --workspace default` once, then
+  `npm run policy:publish -- --workspace default` — without a publish the call fails
+  closed with `503 policy_unavailable` and no rule ever matches). Then call
+  `POST /v1/gateway/tools/call` with that server id and tool.
   The response carries `approval_id` + `expires_at`. Do this immediately before driving —
   the TTL is 300 s by default. If none exists, the queue's empty state is the only
   verifiable path — report the rest as skipped with this precondition unmet.

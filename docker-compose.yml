@@ -47,6 +47,12 @@ services:
       GATEWAY_PORT: 8091
       APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS:-300}
       ALLOW_PRIVATE_UPSTREAMS: "true"
+      # §13.3: the gateway records the highest policy version it accepted so a
+      # rolled-back pointer fails closed. The volume is writable only by the
+      # gateway, and it must survive restarts to keep that anchor meaningful.
+      GATEWAY_STATE_DIR: /app/gateway-state
+    volumes:
+      - gateway_state:/app/gateway-state
     ports:
       - "8091:8091"
     depends_on:
@@ -87,3 +93,4 @@ networks:
 
 volumes:
   pgdata:
+  gateway_state:

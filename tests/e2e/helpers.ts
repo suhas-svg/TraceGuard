@@ -1,8 +1,41 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { existsSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type { APIRequestContext, Page } from "@playwright/test";
-import { API_KEY, API_URL, APPROVER_KEY, GATEWAY_URL, MOCK_TOOLS_URL } from "./env";
+import { API_KEY, API_URL, APPROVER_KEY, DATABASE_URL, GATEWAY_STATE_DIR, GATEWAY_URL, MOCK_TOOLS_URL } from "./env";
 
 const auth = (key: string) => ({ authorization: `Bearer ${key}` });
+
+// Playwright is invoked from the repo root (see package.json's test:e2e), and
+// the specs compile as CJS, so import.meta is not available here.
+const repoRoot = process.cwd();
+const e2eKeys = join(repoRoot, "test-results", "e2e-policy-keys");
+
+// The operator-side publish, run exactly as the docs give it: keygen once,
+// trust once per database, then publish the drafts. Without this the gateway
+// fails closed (503 policy_unavailable) because nothing is signed yet.
+export function publishPolicy(): void {
+  const keyFile = join(e2eKeys, "signing-key.pem");
+  // node + the tsx loader directly: a bare "npx" is not executable via
+  // spawn on Windows, and this stays the same program the docs invoke.
+  const run = (args: string[]) =>
+    execFileSync(process.execPath, ["node_modules/tsx/dist/cli.mjs", "tools/policy-publisher/src/index.ts", ...args], {
+      cwd: repoRoot,
+      env: { ...process.env, DATABASE_URL, POLICY_SIGNING_KEY_FILE: keyFile },
+      stdio: "pipe"
+    });
+  if (!existsSync(keyFile)) run(["keygen", "--out", e2eKeys]);
+  run(["trust", "--workspace", "default", "--public-key", join(e2eKeys, "signing-key.pub.pem")]);
+  run(["publish", "--workspace", "default"]);
+}
+
+// The gateway's accepted-version anchor belongs to the database it was built
+// against; the e2e run recreates the database, so the anchor goes too or the
+// first publish reads as a rollback.
+export function resetPolicyAnchor(): void {
+  rmSync(GATEWAY_STATE_DIR, { recursive: true, force: true });
+}
 
 export function event(over: Record<string, unknown>): Record<string, unknown> {
   return {

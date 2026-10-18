@@ -1,7 +1,67 @@
 import { describe, expect, it } from "vitest";
 import type { AddressInfo } from "node:net";
 import { createServer } from "node:http";
-import { checkUpstreamUrl, guardedFetch, isPrivateHost } from "../src/upstream.js";
+import {
+  checkUpstreamUrl,
+  definitionHash,
+  definitionIssue,
+  guardedFetch,
+  isPrivateHost,
+  pinnedDefinition
+} from "../src/upstream.js";
+
+// §7.5: the pin covers every declared definition field, so any change the
+// client or model could observe — a title, an output schema, an annotation,
+// an icon, an execution hint, allowlisted _meta — changes the hash and
+// quarantines the tool.
+describe("tool definition pin", () => {
+  const base = { name: "echo", description: "echo back", inputSchema: { type: "object" } };
+
+  it("changes when any covered field changes", () => {
+    const h = definitionHash(base);
+    expect(definitionHash({ ...base, title: "Echo" }), "title").not.toBe(h);
+    expect(definitionHash({ ...base, description: "echo back!" }), "description").not.toBe(h);
+    expect(definitionHash({ ...base, outputSchema: { type: "object" } }), "outputSchema").not.toBe(h);
+    expect(definitionHash({ ...base, annotations: { readOnlyHint: true } }), "annotations").not.toBe(h);
+    expect(definitionHash({ ...base, icons: [{ src: "https://example.com/i.png" }] }), "icons").not.toBe(h);
+    expect(definitionHash({ ...base, execution: { taskSupport: "optional" } }), "execution").not.toBe(h);
+    expect(definitionHash({ ...base, meta: { "io.example/hint": 1 } }), "_meta").not.toBe(h);
+    expect(definitionHash({ ...base, inputSchema: { type: "object", properties: {} } }), "inputSchema").not.toBe(h);
+  });
+
+  it("keeps absence and presence distinct in both directions", () => {
+    expect(definitionHash(base)).not.toBe(definitionHash({ ...base, description: "" }));
+    expect(definitionHash({ ...base, title: "Echo" })).not.toBe(definitionHash({ ...base, title: "echo" }));
+    expect(definitionHash(base)).not.toBe(definitionHash({ ...base, icons: [] }));
+  });
+
+  it("is stable across key order and is RFC 8785 canonical", () => {
+    const a = definitionHash({ name: "t", inputSchema: { type: "object", b: 1, a: { z: true } } });
+    const b = definitionHash({ name: "t", inputSchema: { a: { z: true }, b: 1, type: "object" } });
+    expect(a).toBe(b);
+    // The pinned definition carries exactly the declared fields, no defaults.
+    expect(Object.keys(pinnedDefinition(base))).toEqual(["name", "inputSchema", "description"]);
+  });
+
+  it("rejects external $ref values and keeps local ones", () => {
+    expect(definitionIssue({ name: "x", inputSchema: { $ref: "https://evil.example/schema.json" } }))
+      .toMatch(/external \$ref/);
+    expect(definitionIssue({ name: "x", inputSchema: { properties: { a: { $ref: "#/$defs/a" } } } }))
+      .toBeNull();
+    expect(definitionIssue({ name: "x", inputSchema: {}, outputSchema: { $ref: "file:///etc/passwd" } }))
+      .toMatch(/external \$ref/);
+  });
+
+  it("bounds schema depth and node count", () => {
+    const deep: Record<string, unknown> = {};
+    let cursor = deep;
+    for (let i = 0; i < 70; i++) {
+      cursor.properties = {};
+      cursor = cursor.properties as Record<string, unknown>;
+    }
+    expect(definitionIssue({ name: "x", inputSchema: deep })).toMatch(/deep/);
+  });
+});
 
 // The SSRF gate guards registration and is re-checked at discover and call
 // time. These cases pin the ranges the old prefix check missed (metadata,

@@ -51,7 +51,9 @@ jobs:
       - run: ./node_modules/.bin/tsc -p packages/schemas/tsconfig.json
       - run: ./node_modules/.bin/tsc -p packages/canonical-json/tsconfig.json
       - run: ./node_modules/.bin/tsc -p packages/policy-signing/tsconfig.json
+      - run: ./node_modules/.bin/tsc -p packages/audit-chain/tsconfig.json
       - run: ./node_modules/.bin/tsc -p packages/mcp-client-shim/tsconfig.json
+      - run: ./node_modules/.bin/tsc -p tools/policy-publisher/tsconfig.json
       - run: ./node_modules/.bin/tsc -p apps/api/tsconfig.json
       - run: ./node_modules/.bin/tsc -p apps/web/tsconfig.json
       - run: ./node_modules/.bin/tsc -p sdks/typescript/tsconfig.json
@@ -61,7 +63,9 @@ jobs:
       - run: ./node_modules/.bin/vitest run --root apps/web
       - run: ./node_modules/.bin/vitest run --root packages/canonical-json
       - run: ./node_modules/.bin/vitest run --root packages/policy-signing
+      - run: ./node_modules/.bin/vitest run --root packages/audit-chain
       - run: ./node_modules/.bin/vitest run --root packages/mcp-client-shim
+      - run: ./node_modules/.bin/vitest run --root tools/policy-publisher
       - run: ./node_modules/.bin/vitest run --root sdks/typescript
 
   python:
@@ -116,7 +120,12 @@ jobs:
           cache: npm
       - run: npm install --ignore-scripts
       - run: npx playwright install --with-deps chromium
+      # apps/api imports these workspaces, so their dist/ must exist before
+      # the api build - the e2e job does not inherit build-and-test's output.
       - run: ./node_modules/.bin/tsc -p packages/schemas/tsconfig.json
+      - run: ./node_modules/.bin/tsc -p packages/canonical-json/tsconfig.json
+      - run: ./node_modules/.bin/tsc -p packages/policy-signing/tsconfig.json
+      - run: ./node_modules/.bin/tsc -p packages/audit-chain/tsconfig.json
       - run: npm run build -w apps/api -w apps/web
       - run: npx playwright test --config tests/e2e/playwright.config.ts
       - uses: actions/upload-artifact@v4

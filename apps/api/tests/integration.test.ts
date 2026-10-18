@@ -7,6 +7,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { buildApp } from "../src/index.js";
 import { buildGateway } from "../src/gateway.js";
 import { pool } from "../src/db.js";
+import { publishTestPolicy } from "./policy-helper.js";
 
 // Full-path suite against a real database and a real MCP upstream. Every
 // denial test asserts both the error AND that the upstream saw nothing.
@@ -138,6 +139,8 @@ describe("integration and security", () => {
       payload: { name: `deny-${tag}`, priority: 100, server_id: serverId, tool_name: "echo", effect: "deny",
         conditions: { arguments: { text: { regex: "^nope" } } } } });
     expect(deny.statusCode).toBe(201);
+    await publishTestPolicy(pool);
+    await publishTestPolicy(pool);
     const before = upstreamHits;
     const ok = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: "hi" }, caller: "t" } });
@@ -165,6 +168,7 @@ describe("integration and security", () => {
     await gw.inject({ method: "POST", url: `/v1/servers/${id}/discover`, headers: key });
     await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `ovh-allow-${tag}`, server_id: id, tool_name: "echo", effect: "allow" } });
+    await publishTestPolicy(pool);
 
     const started = Date.now();
     const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
@@ -203,6 +207,7 @@ describe("integration and security", () => {
     const agentKey = { authorization: `Bearer ${ak.json().key}` };
     await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `appr-${tag}`, priority: 50, server_id: serverId, effect: "require_approval" } });
+    await publishTestPolicy(pool);
     const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: "wait" }, caller: "t", request_id: `r-${tag}` } });
     expect(call.statusCode).toBe(202);
@@ -344,6 +349,7 @@ describe("integration and security", () => {
       payload: { name: `hook-upstream-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp` } });
     const hookServerId = reg.json().id;
     await gw.inject({ method: "POST", url: `/v1/servers/${hookServerId}/discover`, headers: key });
+    await publishTestPolicy(pool);
     const received: { headers: Record<string, string | string[] | undefined>; body: string }[] = [];
     const stub = createServer((req, res) => {
       let data = "";
@@ -689,6 +695,7 @@ describe("integration and security", () => {
     const agentA = (await pool.query("SELECT id FROM agents WHERE name = $1", [agentName])).rows[0].id;
     await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `agent-deny-${tag}`, priority: 200, agent_id: agentA, effect: "deny" } });
+    await publishTestPolicy(pool);
     const before = upstreamHits;
     const hit = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: "hi" }, caller: "t", agent_id: agentA } });
@@ -704,6 +711,7 @@ describe("integration and security", () => {
     const runId = randomUUID();
     await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
       payload: { events: [ev({ run_id: runId })] } });
+    await publishTestPolicy(pool);
     const denied = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "ghost", arguments: {}, caller: "t", run_id: runId } });
     expect(denied.statusCode).toBe(403);
@@ -715,6 +723,7 @@ describe("integration and security", () => {
   });
 
   it("consumes an approved call exactly once under concurrent retries", async () => {
+    await publishTestPolicy(pool);
     const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: "racy" }, caller: "t" } });
     expect(call.statusCode).toBe(202);
@@ -788,6 +797,7 @@ describe("integration and security", () => {
       await gw.inject({ method: "POST", url: `/v1/servers/${sid}/discover`, headers: key });
       await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
         payload: { name: `flaky-allow-${tag}`, server_id: sid, tool_name: "boom", effect: "allow" } });
+    await publishTestPolicy(pool);
       const res = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
         payload: { server_id: sid, tool: "boom", arguments: {}, caller: "t" } });
       expect(res.statusCode).toBe(502);
@@ -812,6 +822,7 @@ describe("integration and security", () => {
   });
   it("re-evaluates policy on approval retry: a newer deny beats the approval", async () => {
     const staleArgs = { text: `stale-${tag}` };
+    await publishTestPolicy(pool);
     const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: staleArgs, caller: "t",
         request_id: `stale-${tag}` } });
@@ -826,6 +837,7 @@ describe("integration and security", () => {
       payload: { name: `late-deny-${tag}`, priority: 300, server_id: serverId, tool_name: "echo",
         effect: "deny", conditions: { arguments: { text: { enum: [staleArgs.text] } } } } });
     expect(deny.statusCode).toBe(201);
+    await publishTestPolicy(pool);
     const before = upstreamHits;
     const retry = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: staleArgs, caller: "t",
@@ -848,6 +860,7 @@ describe("integration and security", () => {
     expect(budget.statusCode).toBe(201);
     await pool.query("UPDATE budgets SET spent_micro = 100 WHERE id = $1", [budget.json().id]);
     const before = upstreamHits;
+    await publishTestPolicy(pool);
     const denied = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: "afford?" }, caller: "t",
         run_id: runId } });
@@ -1254,6 +1267,7 @@ describe("integration and security", () => {
     await gw.inject({ method: "POST", url: `/v1/servers/${warnServerId}/discover`, headers: key });
     await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `warn-allow-${tag}`, server_id: warnServerId, tool_name: "echo", effect: "allow" } });
+    await publishTestPolicy(pool);
     const runId = randomUUID();
     const budget = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
       payload: { scope: "run", ref_id: runId, limit_micro: 100, effect: "warn" } });
@@ -1324,6 +1338,7 @@ describe("integration and security", () => {
     await gw.inject({ method: "POST", url: `/v1/servers/${sweepServerId}/discover`, headers: key });
     await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `sweep-hold-${tag}`, priority: 90, server_id: sweepServerId, effect: "require_approval" } });
+    await publishTestPolicy(pool);
     const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: sweepServerId, tool: "echo", arguments: { text: `sweep-${tag}` },
         caller: "t", request_id: `sweep-${tag}` } });
@@ -1463,6 +1478,7 @@ describe("integration and security", () => {
     await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `peek-appr-${tag}`, priority: 200, server_id: serverId,
         tool_name: "echo", effect: "require_approval" } });
+    await publishTestPolicy(pool);
     const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo",
         arguments: { text: "classified-payload" }, caller: "peek", request_id: `peek-${tag}` } });

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { posix } from "node:path";
+import { canonicalize } from "@traceguard/canonical-json";
 
 export type Effect = "allow" | "deny" | "require_approval";
 export type Decision = "allow" | "deny" | "need_approval";
@@ -58,16 +59,24 @@ export function sha256Hex(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
 
-// Binds an approval to one exact call. Any change of caller, target, args, or
-// request id produces a different hash and the approval will not apply.
+// Args hash for decision records, over RFC 8785 canonical bytes.
+export function argsHash(args: Record<string, unknown>): string {
+  return sha256Hex(canonicalize(args));
+}
+
+// Binds an approval to one exact call (§9.1): any change of caller, target,
+// args, logical request id, or tool-definition pin produces a different hash
+// and the approval will not apply. RFC 8785 canonical JSON, so two
+// implementations agree on the bytes.
 export function requestHash(
   caller: string,
   serverId: string,
   toolName: string,
   args: Record<string, unknown>,
-  requestId: string
+  requestId: string,
+  pinHash: string
 ): string {
-  return sha256Hex([caller, serverId, toolName, stableStringify(args), requestId].join("|"));
+  return sha256Hex(canonicalize([caller, serverId, toolName, args, requestId, pinHash]));
 }
 
 // path_within canonicalizes .. and duplicate separators before comparing, so

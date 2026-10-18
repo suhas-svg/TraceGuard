@@ -10,3 +10,7 @@ export const MOCK_TOOLS_URL = process.env.E2E_MOCK_TOOLS_URL ?? "http://localhos
 export const API_KEY = "test_key";
 export const APPROVER_KEY = "test_approver";
 export const APPROVAL_ARGS_KEY = "ab".repeat(32);
+// The gateway's accepted-policy-version anchor. Defaults under test-results so
+// an e2e run cannot collide with a developer's own ./gateway-state.
+export const GATEWAY_STATE_DIR =
+  process.env.E2E_GATEWAY_STATE_DIR ?? "test-results/e2e-gateway-state";

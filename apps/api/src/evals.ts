@@ -457,7 +457,7 @@ export function registerEvalRoutes(app: FastifyInstance) {
     // Anything outside the caller's workspaces reads as missing, so a
     // compare cannot launder another team's numbers.
     if (runs.rows.length !== ids.length) return reply.code(404).send({ error: "eval_run_not_found" });
-    const out = [];
+    const out: Record<string, unknown>[] = [];
     for (const r of runs.rows) {
       const res = await pool.query("SELECT * FROM eval_results WHERE eval_run_id = $1", [r.id]);
       const lat = res.rows.map((x) => Number(x.latency_ms));
@@ -497,6 +497,9 @@ export function registerEvalRoutes(app: FastifyInstance) {
         violations: spanCount > 0 ? Number(denied.rows[0].denied) : null
       });
     }
-    return { runs: out };
+    // The caller asked for specific ids in a specific order (a, b, ...); the
+    // database is free to return rows in any order, so the response is
+    // ordered by the request instead of by whichever plan ran.
+    return { runs: ids.map((id) => out.find((r) => r.eval_run_id === id)).filter(Boolean) };
   });
 }

@@ -27,6 +27,13 @@ for p in $(jq -c '.[]' policies.json); do
     -H "authorization: Bearer $API_KEY" -H "content-type: application/json" \
     -d "$p"
 done
+
+# 4. Sign and publish the rules + server manifest + reviewed pins as the
+#    active policy version. Until this runs, every gateway call fails closed
+#    (503 policy_unavailable): these rules are drafts.
+npm run policy:keygen                                  # once, writes ./policy-keys/
+npm run policy:trust -- --workspace default            # once, audited
+npm run policy:publish -- --workspace default
 ```
 
 ## What each rule does
@@ -74,5 +81,8 @@ curl -s -X POST http://localhost:8091/v1/approvals/<approval-id>/decision \
 - `max_length: 256` — string length cap.
 
 Unmatched tool calls are denied by default (FR-014). Every decision is written
-to `policy_decisions` citing the exact policy version, and outcomes land in the
-hash-chained `audit_events` table.
+to `policy_decisions` citing the exact signed policy version id, matched rules,
+and the tool-definition pin the call was gated on; outcomes land in the
+hash-chained `audit_events` table. Rules only take effect after
+`policy-publisher publish` signs them into the active bundle — before the
+first publish, calls fail closed with `503 policy_unavailable`.

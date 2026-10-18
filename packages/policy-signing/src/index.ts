@@ -79,3 +79,10 @@ export function verifyPayload(
     return false;
   }
 }
+
+// The one content hash for policy bundles: publisher and gateway both use
+// this so the bytes that were signed and the bytes that are verified cannot
+// diverge.
+export function contentHashOf(payload: unknown): string {
+  return createHash("sha256").update(canonicalBytes(payload)).digest("hex");
+}

@@ -8,3 +8,7 @@ infra/k8s/secrets.yaml
 .pytest_cache/
 test-results/
 playwright-report/
+# Operator-side policy signing keys and the gateway's accepted-version anchor
+# are host state, never repository content.
+policy-keys/
+gateway-state/
