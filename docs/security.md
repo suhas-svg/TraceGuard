@@ -62,7 +62,9 @@ running each probe under `SET ROLE`; it fails if a grant widens.
 
 Model output truth, prompt injection in general, safety of tools called
 outside the gateway, or protection when the agent can reach upstream
-servers directly. Run upstreams on the internal tools network.
+servers directly. Run upstreams on the internal `tools` network and the
+agent on `agent_edge`: the gateway is then the only container with a foot on
+both, and `tests/security/bypass.mjs` fails if that stops being true.
 
 The `caller` and `agent_id` fields on gateway calls are attribution the
 caller supplies, not authenticated identity; policy scoping on them tells

@@ -134,3 +134,24 @@ jobs:
           name: playwright-report
           path: test-results
           retention-days: 7
+
+  # FR-004: an agent container on agent_edge must not reach the upstream tools
+  # network, by service name or by IP, while the gateway answers on the same
+  # edge. This builds the real images, so it also keeps the Dockerfiles honest.
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install --ignore-scripts
+      - name: Bring up the boundary
+        run: |
+          printf 'APPROVAL_ARGS_KEY=%s\n' "$(openssl rand -hex 32)" > .env
+          docker compose up -d --build --wait gateway mock-tools agent api
+      - run: npm run test:security
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

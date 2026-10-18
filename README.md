@@ -21,6 +21,9 @@ against a running stack; see the file header for the commands.
 ## Run it
 
 Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
+The demo agent runs as the `agent` container on `agent_edge`: the gateway is
+the only container it can reach, and `npm run test:security` proves that from
+inside it (upstream, api and postgres must all refuse the agent).
 
 1. Copy `.env.example` to `.env` and set `API_KEY` and `APPROVER_KEY`.
 2. `docker compose up --build`
@@ -30,8 +33,11 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
    watch it with `docker compose logs db-roles`. Running outside compose,
    apply `apps/api/migrations/*.sql` yourself and run the `ALTER ROLE` lines
    in `docs/operations.md`.
-4. Install the SDK and run the demo: `python -m pip install ./sdks/python`
-   then `TRACEGUARD_URL=http://localhost:8090 python examples/demo-agent/main.py`
+4. Run the demo through the boundary: `docker compose exec agent python main.py`
+   — the agent container can only reach the gateway, so the demo also
+   demonstrates FR-004. (On the host instead: `python -m pip install
+   ./sdks/python` then `TRACEGUARD_URL=http://localhost:8090 python
+   examples/demo-agent/main.py`.)
 5. Open http://localhost:5173, set the API URL and key in the header, browse runs.
 
 ## Signed policy: the operator flow

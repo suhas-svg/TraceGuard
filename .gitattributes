@@ -1,0 +1,6 @@
+# Shell scripts and container entrypoints run in Linux containers: they must
+# be LF on every checkout, whatever the developer's core.autocrlf says. A CRLF
+# bootstrap.sh dies in busybox sh with "set: illegal option -".
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.mjs text eol=lf

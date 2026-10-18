@@ -19,6 +19,7 @@
     "build": "npm run build --workspaces",
     "test": "npm run test --workspaces --if-present",
     "test:e2e": "playwright test --config tests/e2e/playwright.config.ts",
+    "test:security": "node tests/security/bypass.mjs",
     "db:migrate": "for f in apps/api/migrations/*.sql; do psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f \"$f\" || exit 1; done",
     "policy:keygen": "tsx tools/policy-publisher/src/index.ts keygen",
     "policy:trust": "tsx tools/policy-publisher/src/index.ts trust",
