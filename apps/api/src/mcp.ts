@@ -277,18 +277,20 @@ export function registerMcpRoutes(app: FastifyInstance): void {
           });
         }
         const rows = await pool.query(
-          `SELECT s.gateway_alias, t.tool_name, t.description, t.input_schema
+          `SELECT s.gateway_alias, t.tool_name, t.definition, t.definition_hash
              FROM mcp_servers s JOIN server_tools t ON t.server_id = s.id
             WHERE s.workspace_id = $1 AND t.quarantined = false
             ORDER BY s.gateway_alias, t.tool_name`,
           [workspaceId]
         );
         return rpcResult(env.id, {
-          tools: rows.rows.map((r) => ({
-            name: `${r.gateway_alias}__${r.tool_name}`,
-            description: r.description,
-            inputSchema: r.input_schema
-          })),
+          // The reviewed definition is what clients see: every field the pin
+          // covers, so a client cannot observe a description or schema the
+          // human never approved (§7.5).
+          tools: rows.rows.map((r) => {
+            const d = (r.definition ?? {}) as Record<string, unknown>;
+            return { ...d, name: `${r.gateway_alias}__${r.tool_name}` };
+          }),
           ttlMs: TOOLS_TTL_MS,
           cacheScope: "workspace",
           resultType: "complete"

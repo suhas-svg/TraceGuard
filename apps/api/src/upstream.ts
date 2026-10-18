@@ -1,17 +1,93 @@
+import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { sha256Hex, stableStringify } from "./policy.js";
+import { canonicalize } from "@traceguard/canonical-json";
+import { sha256Hex } from "./policy.js";
 
 export interface DiscoveredTool {
   name: string;
-  description: string;
+  title?: string;
+  description?: string;
   inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+  annotations?: Record<string, unknown>;
+  icons?: unknown[];
+  execution?: Record<string, unknown>;
+  // Allowlisted _meta entries only; see TOOL_PIN_META_ALLOWLIST below.
+  meta?: Record<string, unknown>;
 }
 
-// Hash of name, description, and schema. A changed upstream definition gets a
-// new hash and the tool is quarantined until a human re-approves it.
+// §7.5: the pin covers every declared field that may affect what the client
+// sees or how the tool executes. Absent fields stay absent (an added or
+// removed field changes the hash both ways), and the object is canonicalized
+// with RFC 8785 before hashing so two implementations agree on the bytes.
+export function pinnedDefinition(tool: DiscoveredTool): Record<string, unknown> {
+  const d: Record<string, unknown> = { name: tool.name, inputSchema: tool.inputSchema ?? {} };
+  if (tool.title !== undefined) d.title = tool.title;
+  if (tool.description !== undefined) d.description = tool.description;
+  if (tool.outputSchema !== undefined) d.outputSchema = tool.outputSchema;
+  if (tool.annotations !== undefined) d.annotations = tool.annotations;
+  if (tool.icons !== undefined) d.icons = tool.icons;
+  if (tool.execution !== undefined) d.execution = tool.execution;
+  if (tool.meta !== undefined) d._meta = tool.meta;
+  return d;
+}
+
 export function definitionHash(tool: DiscoveredTool): string {
-  return sha256Hex(stableStringify([tool.name, tool.description, tool.inputSchema]));
+  return createHash("sha256").update(canonicalize(pinnedDefinition(tool))).digest("hex");
+}
+
+// $ref values that do not start with "#" point outside the document; fetching
+// or dereferencing them would make hashing depend on network content, so they
+// are rejected outright. Depth, node and reference counts are bounded so a
+// hostile definition cannot make the gateway's work unbounded.
+const MAX_SCHEMA_DEPTH = 64;
+const MAX_SCHEMA_NODES = 4096;
+const MAX_SCHEMA_REFS = 512;
+const MAX_DEFINITION_BYTES = 256 * 1024;
+
+export function schemaSafetyIssue(schema: unknown): string | null {
+  let nodes = 0;
+  let refs = 0;
+  const walk = (value: unknown, depth: number): string | null => {
+    if (depth > MAX_SCHEMA_DEPTH) return "schema nested too deeply";
+    if (++nodes > MAX_SCHEMA_NODES) return "schema has too many nodes";
+    if (typeof value === "string") return null;
+    if (value === null || typeof value !== "object") return null;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const issue = walk(item, depth + 1);
+        if (issue) return issue;
+      }
+      return null;
+    }
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (key === "$ref") {
+        if (++refs > MAX_SCHEMA_REFS) return "schema has too many $ref values";
+        if (typeof item !== "string" || !item.startsWith("#")) {
+          return "external $ref values are not allowed";
+        }
+      }
+      const issue = walk(item, depth + 1);
+      if (issue) return issue;
+    }
+    return null;
+  };
+  return walk(schema, 0);
+}
+
+// One gate for the whole pinned definition: schema-safety of both schemas and
+// a byte-size bound on the canonical form.
+export function definitionIssue(tool: DiscoveredTool): string | null {
+  const inputIssue = schemaSafetyIssue(tool.inputSchema ?? {});
+  if (inputIssue) return `inputSchema: ${inputIssue}`;
+  if (tool.outputSchema !== undefined) {
+    const outputIssue = schemaSafetyIssue(tool.outputSchema);
+    if (outputIssue) return `outputSchema: ${outputIssue}`;
+  }
+  const bytes = new TextEncoder().encode(canonicalize(pinnedDefinition(tool))).length;
+  if (bytes > MAX_DEFINITION_BYTES) return "definition is too large to pin";
+  return null;
 }
 
 // SSRF guard: http(s) only, no credentials in the URL, cloud metadata
@@ -190,17 +266,48 @@ async function withClient<T>(
   return run(false);
 }
 
+// Only these `_meta` keys are covered by the pin (§7.5 allowlist). An empty
+// allowlist (the default) pins no metadata at all.
+function pinnedMetaKeys(): string[] {
+  return (process.env.TOOL_PIN_META_ALLOWLIST ?? "")
+    .split(",")
+    .map((k) => k.trim())
+    .filter(Boolean);
+}
+
+function pickMeta(meta: unknown): Record<string, unknown> | undefined {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return undefined;
+  const allowed = pinnedMetaKeys();
+  if (allowed.length === 0) return undefined;
+  const source = meta as Record<string, unknown>;
+  const picked: Record<string, unknown> = {};
+  for (const key of allowed) {
+    if (source[key] !== undefined) picked[key] = source[key];
+  }
+  return Object.keys(picked).length > 0 ? picked : undefined;
+}
+
 export async function discoverTools(
   baseUrl: string,
   authSecret: string | null
 ): Promise<DiscoveredTool[]> {
   return withClient(baseUrl, authSecret, async (client) => {
     const res = await client.listTools();
-    return res.tools.map((t) => ({
-      name: t.name,
-      description: t.description ?? "",
-      inputSchema: (t.inputSchema as Record<string, unknown>) ?? {}
-    }));
+    return res.tools.map((t) => {
+      const tool: DiscoveredTool = {
+        name: t.name,
+        inputSchema: (t.inputSchema as Record<string, unknown>) ?? {}
+      };
+      if (t.title !== undefined) tool.title = t.title;
+      if (t.description !== undefined) tool.description = t.description;
+      if (t.outputSchema !== undefined) tool.outputSchema = t.outputSchema as Record<string, unknown>;
+      if (t.annotations !== undefined) tool.annotations = t.annotations as Record<string, unknown>;
+      if (t.icons !== undefined) tool.icons = t.icons as unknown[];
+      if (t.execution !== undefined) tool.execution = t.execution as Record<string, unknown>;
+      const meta = pickMeta(t._meta);
+      if (meta) tool.meta = meta;
+      return tool;
+    });
   }, true);
 }
 

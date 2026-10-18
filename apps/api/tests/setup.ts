@@ -9,6 +9,9 @@ process.env.APPROVER_KEY ??= "test_approver";
 // are never committed.
 process.env.APPROVAL_ARGS_KEY ??= "ab".repeat(32);
 process.env.ALLOW_PRIVATE_UPSTREAMS ??= "true";
+// §7.5 pins only allowlisted `_meta` keys; the suite pins one key so the
+// allowlist path is exercised rather than skipped.
+process.env.TOOL_PIN_META_ALLOWLIST ??= "io.example/flag";
 process.env.DATABASE_URL ??=
   process.env.TEST_DATABASE_URL ??
   "postgres://traceguard:traceguard_dev_only@localhost:5432/traceguard";
