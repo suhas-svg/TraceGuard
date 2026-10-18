@@ -1,5 +1,7 @@
 // Deterministic checks only. No model judging in v1: every assertion is a
 // pure function of the recorded output, tool sequence, and final status.
+import { MAX_REGEX_SUBJECT } from "./policy.js";
+
 export interface AssertCtx {
   output: string;
   tools: string[];
@@ -30,7 +32,9 @@ export function runAssertion(a: Record<string, unknown>, ctx: AssertCtx): Assert
       } catch {
         return { passed: false, message: "invalid regex in assertion" };
       }
-      return re.test(ctx.output)
+      // Same subject bound as rule matching: an eval case cannot make the
+      // runner backtrack on a huge model output.
+      return re.test(ctx.output.slice(0, MAX_REGEX_SUBJECT))
         ? { passed: true, message: `matches ${a.pattern}` }
         : { passed: false, message: `no match for ${a.pattern}` };
     }
