@@ -20,6 +20,10 @@ describe("approval state machine v2", () => {
   let serverId = "";
   let httpServer: ReturnType<typeof createServer>;
 
+  // A fresh server per request: one Protocol instance cannot be connected to
+
+  // two transports, and two gateway calls can be in flight at once.
+  const newMock = () => {
   const mock = new McpServer({ name: "approval-tools", version: "0.1.0" });
   mock.registerTool("echo", { description: "echo", inputSchema: { text: z.string() } },
     async ({ text }) => ({ content: [{ type: "text", text: `echo:${text}` }] }));
@@ -30,12 +34,15 @@ describe("approval state machine v2", () => {
   mock.registerTool("err", { description: "tool error", inputSchema: {} },
     async () => ({ content: [{ type: "text", text: "upstream refused" }], isError: true }));
 
+  return mock;
+  };
+
   beforeAll(async () => {
     httpServer = createServer(async (req, res) => {
       if (req.method === "POST") {
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
         res.on("close", () => transport.close().catch(() => undefined));
-        await mock.connect(transport);
+        await newMock().connect(transport);
         await transport.handleRequest(req, res);
         return;
       }
