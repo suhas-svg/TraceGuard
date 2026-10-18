@@ -46,6 +46,19 @@ spec:
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: PORT } }
             - name: DASHBOARD_ORIGIN
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: DASHBOARD_ORIGIN } }
+            # Identity mode (§7.3). NODE_ENV=production with the OAUTH_* keys
+            # filled in runs on issuer-validated access tokens; empty values
+            # keep the static development keys.
+            - name: NODE_ENV
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: NODE_ENV } }
+            - name: OAUTH_ISSUER
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: OAUTH_ISSUER } }
+            - name: OAUTH_AUDIENCE
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: OAUTH_AUDIENCE } }
+            - name: OAUTH_JWKS_FILE
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: OAUTH_JWKS_FILE } }
+            - name: OAUTH_JWKS_URL
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: OAUTH_JWKS_URL } }
           livenessProbe:
             httpGet: { path: /healthz, port: 8080 }
             periodSeconds: 15

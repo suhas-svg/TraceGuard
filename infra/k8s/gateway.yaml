@@ -64,6 +64,17 @@ spec:
             # be told from a fresh deployment.
             - name: GATEWAY_STATE_DIR
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: GATEWAY_STATE_DIR } }
+            # Identity mode (§7.3), as on the api Deployment.
+            - name: NODE_ENV
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: NODE_ENV } }
+            - name: OAUTH_ISSUER
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: OAUTH_ISSUER } }
+            - name: OAUTH_AUDIENCE
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: OAUTH_AUDIENCE } }
+            - name: OAUTH_JWKS_FILE
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: OAUTH_JWKS_FILE } }
+            - name: OAUTH_JWKS_URL
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: OAUTH_JWKS_URL } }
           volumeMounts:
             - name: gateway-state
               mountPath: /var/lib/traceguard/gateway-state

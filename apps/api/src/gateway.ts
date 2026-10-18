@@ -16,6 +16,7 @@ import { loadActivePolicy, rulesFromBundle } from "./policy-bundle.js";
 import { callUpstreamTool, checkUpstreamUrlResolved, definitionHash, definitionIssue, discoverTools, pinnedDefinition } from "./upstream.js";
 import { hashesEqual, parseKey, seal, tryOpen } from "./seal.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
+import { assertProductionAuth, oauthConfigFromEnv, protectedResourceMetadata } from "./oauth.js";
 import { gatewayAlias, registerMcpRoutes } from "./mcp.js";
 import { notify } from "./notify.js";
 import { captureRawEnabled, redactDeep, summarizeArgs } from "./redact.js";
@@ -128,9 +129,19 @@ async function recordDecision(client: PoolClient, d: {
 }
 
 export function buildGateway() {
+  assertProductionAuth();
   const app = Fastify({ logger: true, genReqId: () => randomUUID() });
 
   app.get("/healthz", async () => ({ ok: true }));
+
+  // RFC 9728 §7.3: how a client learns which authorization server issues
+  // tokens for this gateway. Served only in OAuth mode; in the development
+  // profile there is no issuer to point at.
+  app.get("/.well-known/oauth-protected-resource", async (_req, reply) => {
+    const cfg = oauthConfigFromEnv();
+    if (!cfg) return reply.code(404).send({ error: "not_found" });
+    return protectedResourceMetadata(cfg);
+  });
 
   app.addHook("onRequest", async (req, reply) => {
     reply.header("Access-Control-Allow-Origin", DASHBOARD_ORIGIN);

@@ -12,3 +12,11 @@ data:
   # The gateway's accepted-policy-version anchor (backed by the gateway-state
   # PVC in gateway.yaml).
   GATEWAY_STATE_DIR: "/var/lib/traceguard/gateway-state"
+  # OAuth resource-server mode (§7.3). Fill these in and set NODE_ENV=production
+  # to run on real access tokens; leave them empty and the static dev keys in
+  # the Secret keep working.
+  NODE_ENV: ""
+  OAUTH_ISSUER: ""
+  OAUTH_AUDIENCE: ""
+  OAUTH_JWKS_FILE: ""
+  OAUTH_JWKS_URL: ""

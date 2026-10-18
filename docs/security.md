@@ -18,6 +18,12 @@
 - The audit log is append-only at the database layer (UPDATE/DELETE rejected
   by trigger), hash-chained, and verifiable through `POST /v1/audit/verify`;
   a detected mutation means a database owner disabled the guard.
+- Access tokens are validated as JWTs against the configured issuer's keys
+  when OAuth is on (`OAUTH_ISSUER` + `OAUTH_AUDIENCE` + a JWKS source): the
+  algorithm is pinned to EdDSA / RS256 / ES256, the issuer, audience,
+  expiry, and nbf are checked, and a token that fails validation is never
+  retried as some other credential. `NODE_ENV=production` refuses to start
+  without an issuer and stops accepting the static development keys.
 - Costs are estimates from provider-reported usage and versioned prices,
   never billing truth.
 

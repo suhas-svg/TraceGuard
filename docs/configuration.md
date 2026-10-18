@@ -24,6 +24,11 @@ variable, which is how the compose file reads them.
 | GATEWAY_STATE_DIR | gateway | ./gateway-state | where the gateway records the highest signed policy version it accepted (§13.3); must persist across restarts |
 | TOOL_PIN_META_ALLOWLIST | gateway | (empty) | comma-separated `_meta` keys covered by a tool's definition pin; empty pins no metadata |
 | POLICY_SIGNING_KEY_FILE | policy-publisher | ./policy-keys/signing-key.pem | operator-side private key path; never present in the API or gateway containers |
+| OAUTH_ISSUER | api + gateway | (empty) | OAuth 2.1 issuer used to validate access tokens (§7.3). Together with `OAUTH_AUDIENCE` and a JWKS source this switches both services from static keys to JWT validation |
+| OAUTH_AUDIENCE | api + gateway | (empty) | the canonical audience/resource the tokens must name, e.g. `http://localhost:8091/mcp`; also the base of the RFC 9728 metadata URL |
+| OAUTH_JWKS_FILE | api + gateway | (empty) | path to the issuer's JWKS document; use instead of the URL when the issuer is reachable only through a sidecar or mounted secret |
+| OAUTH_JWKS_URL | api + gateway | (empty) | issuer JWKS URL; keys are refetched when a token names an unknown `kid`, at most once per 10 s |
+| NODE_ENV | api + gateway | (unset) | `production` refuses to start without `OAUTH_ISSUER` + `OAUTH_AUDIENCE` + a JWKS source, and stops accepting the static `API_KEY`/`APPROVER_KEY` |
 | PORT | api | 8080 | container side; compose maps the host to 8090 |
 
 Ports on a dev machine: API 8090, gateway 8091, mock tools 8092

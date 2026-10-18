@@ -17,6 +17,16 @@ The gateway holds upstream bearer tokens and injects them at call time.
 Agent tokens never travel upstream, and upstream secrets never come back
 down: list endpoints select every column except the secret.
 
+Identity has two modes. The development profile authenticates callers with
+static keys from the environment. Configuring `OAUTH_ISSUER`, `OAUTH_AUDIENCE`
+and a JWKS source switches both services to real OAuth: bearer tokens are
+validated as JWTs (signature against the issuer's keys, issuer, audience,
+expiry), the issuer's scopes become the principal's scopes, its `workspaces`
+claim becomes the principal's write scope, the gateway advertises the issuer
+at `/.well-known/oauth-protected-resource`, and a 401 carries the RFC 9728
+challenge. A production start without an issuer is refused rather than
+silently falling back to development keys.
+
 Policy enforcement is a verification problem before it is an evaluation
 problem. The gateway loads the active `policy_versions` row, checks its
 content hash and Ed25519 signature against the pinned public key, and only

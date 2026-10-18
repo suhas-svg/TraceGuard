@@ -10,6 +10,7 @@ import { registerReconciliationRoutes } from "./reconciliation.js";
 import { attrsToObject, mapOtlpSpan, type OtlpSpan } from "./otlp.js";
 import { decodeTraceRequest, encodeEmptyTraceResponse } from "./otlp_proto.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
+import { assertProductionAuth } from "./oauth.js";
 import { audit } from "./audit.js";
 import { registerUserRoutes } from "./users.js";
 import { captureRawEnabled, redactDeep } from "./redact.js";
@@ -23,6 +24,10 @@ const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN ?? "http://localhost:5173"
 
 export function buildApp() {
   const app = Fastify({ logger: true, genReqId: () => randomUUID() });
+
+  // §7.3: a production deployment authenticates people and agents through
+  // the configured OAuth issuer, not through static bearer keys.
+  assertProductionAuth();
 
   // Privacy default check. Raw-capture mode is opt-in and loud: it weakens
   // the "no raw prompt/response/args unless asked" guarantee on every

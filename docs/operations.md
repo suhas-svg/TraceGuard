@@ -149,6 +149,24 @@ include the tool-definition pin. Pending approvals created before the upgrade
 will not match a retry; they expire within the TTL (≤60 minutes). Deploy
 with an empty queue, or let old holds expire and recreate them.
 
+## OAuth deployments
+
+With `OAUTH_ISSUER`, `OAUTH_AUDIENCE` and a JWKS source set, tokens are
+validated against the issuer on every request; nothing is cached beyond the
+issuer's public keys. Operationally:
+
+- **Issuer key rotation** needs no gateway restart: an unknown `kid`
+  triggers a JWKS refetch, rate-limited to one fetch per 10 s per source.
+  Nothing to do on the TraceGuard side.
+- **Audience changes** (a new public hostname) are a config change on both
+  services: the old tokens stop validating the moment the audience changes,
+  so cut over with a short overlap by accepting the new audience first.
+- **Leaving production mode** (clearing the OAUTH_* keys) is a fail-open
+  action: the static keys in the environment start authenticating again.
+  Treat those values as live credentials for as long as they are set.
+- A 401 on the MCP endpoint carries the `resource_metadata` challenge, so a
+  client that speaks RFC 9728 can find the issuer without documentation.
+
 ## Restore drill
 
 A backup nobody has restored is a guess. Once a quarter: restore the latest dump

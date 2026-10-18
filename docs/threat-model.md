@@ -51,7 +51,7 @@ checkpoint anchors history against that.
 | T14 | **S** Stolen API key | Hashed at rest, scoped, revocable, rate-limited | Implemented |
 | T15 | **T** Duplicate external side effect after a timeout | Post-dispatch ambiguity becomes `OUTCOME_UNKNOWN`; never auto-retried; UI says the action may have executed | Implemented |
 | T16 | **T** Unsigned or rolled-back policy | Only the active signed bundle is enforced: content hash, Ed25519 signature, recomputed key id, retired-key refusal, version/history agreement, and rollback/fork/history-gap detection against the gateway's own accepted-version anchor | Implemented (`policy-bundle.ts`, `signed-policy.test.ts`) |
-| T17 | **S** Forged or replayed OAuth token | Issuer, audience, expiry and scope validation; JWKS/introspection | **Missing** — static development keys only |
+| T17 | **S** Forged or replayed OAuth token | Access tokens are validated as JWTs against the issuer's published keys: signature (EdDSA / RS256 / ES256 only), kid lookup with bounded refetch so rotation needs no restart, issuer, canonical audience, expiry and nbf with skew, and scope mapping; the gateway serves RFC 9728 protected-resource metadata and challenges with it; production refuses to start without an issuer and stops accepting static keys | Implemented (`oauth.ts`, `oauth.test.ts`); residual: no introspection mode, and the bundled client shim still authenticates with a static key |
 | T18 | **T** UI or API compromise changes execution authority | Gateway enforces from signed bundles it verifies itself; the control surface writes drafts only and no endpoint can sign, activate, or roll back a version; approve/reject requires the approver key at the gateway listener | Implemented for policy activation; residual: single DB role in local dev (grants work still open) |
 
 ## Residual limitations
@@ -85,9 +85,10 @@ No release candidate until automated tests cover, at minimum:
 12. Wrong-issuer / wrong-audience token is rejected (T17).
 
 Status in this tree: 1 (partial — no compose agent container), 2–4, 6–7,
-9–11 are covered by `apps/api/tests` (`signed-policy.test.ts`, `pins.test.ts`,
-`approvals.test.ts`, `integration.test.ts`) and `tools/policy-publisher/tests`;
-5 is covered at the application layer only; 8 is covered in
-`integration.test.ts`; 12 is open — the OAuth resource server (T17) is the
-largest remaining item, and until it lands the deployment is a development
-profile: static bearer keys only, and the compatibility matrix says so.
+9–12 are covered by `apps/api/tests` (`signed-policy.test.ts`, `pins.test.ts`,
+`oauth.test.ts`, `approvals.test.ts`, `integration.test.ts`) and
+`tools/policy-publisher/tests`; 5 is covered at the application layer only; 8
+is covered in `integration.test.ts`. What remains for the release gate is the
+client half of FR-002 — the shim's own OAuth client flow (registered client,
+PKCE, RFC 8707 resource indicator) — which today sends the static development
+key, and a compose-network bypass test with a real agent container.
