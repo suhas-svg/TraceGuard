@@ -25,6 +25,10 @@ describe("MCP streamable HTTP gateway", () => {
   let alias = "";
   let httpServer: ReturnType<typeof createServer>;
 
+  // A fresh server per request: one Protocol instance cannot be connected to
+
+  // two transports, and two gateway calls can be in flight at once.
+  const newMock = () => {
   const mock = new McpServer({ name: "mcp-test-tools", version: "0.1.0" });
   mock.registerTool("echo", { description: "echo back", inputSchema: { text: z.string() } },
     async ({ text }) => {
@@ -42,12 +46,15 @@ describe("MCP streamable HTTP gateway", () => {
       return { content: [{ type: "text", text: "wiped" }] };
     });
 
+  return mock;
+  };
+
   beforeAll(async () => {
     httpServer = createServer(async (req, res) => {
       if (req.method === "POST") {
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
         res.on("close", () => transport.close().catch(() => undefined));
-        await mock.connect(transport);
+        await newMock().connect(transport);
         await transport.handleRequest(req, res);
         return;
       }

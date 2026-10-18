@@ -31,6 +31,9 @@ describe("signed policy enforcement", () => {
   let v1Id = "";
 
   async function startMock(): Promise<void> {
+    // A fresh server per request: one Protocol instance cannot be connected to
+    // two transports, and two gateway calls can be in flight at once.
+    const newMock = () => {
     const mock = new Server({ name: "signed-tools", version: "0.1.0" }, { capabilities: { tools: {} } });
     mock.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [{
@@ -43,11 +46,14 @@ describe("signed policy enforcement", () => {
       hits += 1;
       return { content: [{ type: "text", text: "ok" }] };
     });
+    return mock;
+    };
+
     const server = createServer(async (req, res) => {
       if (req.method === "POST") {
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
         res.on("close", () => transport.close().catch(() => undefined));
-        await mock.connect(transport);
+        await newMock().connect(transport);
         await transport.handleRequest(req, res);
         return;
       }

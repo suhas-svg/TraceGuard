@@ -8,6 +8,10 @@ import { z } from "zod";
 const PORT = Number(process.env.MOCK_TOOLS_PORT ?? 8092);
 let hits = 0;
 
+// A fresh server per request: one Protocol instance cannot be connected to
+
+// two transports, and two gateway calls can be in flight at once.
+const newServer = () => {
 const server = new McpServer({ name: "mock-tools", version: "0.1.0" });
 server.registerTool("read_file", {
   description: "Read a file inside the workspace",
@@ -24,6 +28,9 @@ server.registerTool("wipe_disk", {
   return { content: [{ type: "text", text: `wiped ${target} (mock, nothing happened)` }] };
 });
 
+return server;
+};
+
 const httpServer = createServer(async (req, res) => {
   if (req.url === "/hits") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -33,7 +40,7 @@ const httpServer = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/mcp") {
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => transport.close().catch(() => undefined));
-    await server.connect(transport);
+    await newServer().connect(transport);
     await transport.handleRequest(req, res);
     return;
   }
