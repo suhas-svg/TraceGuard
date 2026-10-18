@@ -33,7 +33,11 @@ variable, which is how the compose file reads them.
 | PORT | api | 8080 | container side; compose maps the host to 8090 |
 
 Ports on a dev machine: API 8090, gateway 8091, mock tools 8092
-(internal network only), web 5173.
+(internal network only), web 5173. Four networks keep the boundary real:
+`front` (api, gateway, postgres, web), `tools` (gateway, mock-tools;
+`internal: true`, so the upstream has no route off the host), `agent_edge`
+(gateway, agent) and the agent's lack of everything else. `npm run
+test:security` asserts that from inside the agent container.
 
 ## Users and scoped keys
 

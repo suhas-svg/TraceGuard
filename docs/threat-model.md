@@ -35,7 +35,7 @@ checkpoint anchors history against that.
 
 | # | Threat (STRIDE) | Mitigation in this repo | Status |
 |---|---|---|---|
-| T1 | **S** Agent bypasses the gateway and calls an upstream directly | Gateway is the only container on the upstream network; upstreams publish no host ports; bypass test planned in `tests/security` | Partial — compose has no agent container yet |
+| T1 | **S** Agent bypasses the gateway and calls an upstream directly | Gateway is the only container on the upstream network; upstreams publish no host ports; `tests/security/bypass.mjs` runs **inside** the agent container and proves it cannot reach the upstream by service name or by IP, cannot reach the control API or postgres, and can reach the gateway (asserted as an unauthenticated 401, not just a TCP connect) | Implemented (compose; `security` CI job); residual: the k8s path relies on the cluster's NetworkPolicy, which is not shipped here |
 | T2 | **T** Agent alters or replays an approval | `request_hash` over caller, server, tool, canonical args (RFC 8785), logical request id, and the tool-definition pin; single-use CAS to executing; retries keyed by logical request id | Implemented (`gateway.ts`, approval tests) |
 | T3 | **T** Concurrent retries dispatch twice | `SELECT … FOR UPDATE` + CAS to `executing`; later retries observe the terminal state | Implemented |
 | T4 | **S/T** Admin changes a tool description or schema | Pin covers title/description/both schemas/annotations/icons/execution/allowlisted _meta over RFC 8785; drift quarantines with the previous pin kept for the diff; external `$ref`, depth, node, and size bounds never pin; only a published bundle activates a pin | Implemented (`upstream.ts`, `pins.test.ts`) |
@@ -88,8 +88,9 @@ Status in this tree: 1 (partial — no compose agent container), 2–4, 6–7,
 9–12 are covered by `apps/api/tests` (`signed-policy.test.ts`, `pins.test.ts`,
 `oauth.test.ts`, `approvals.test.ts`, `integration.test.ts`) and
 `tools/policy-publisher/tests`; 5 is covered at the application layer only; 8
-is covered in `integration.test.ts`. The one release-gate item still open is
-a compose-network bypass test with a real agent container (FR-004's automated
-half); the client half of FR-002 is covered by the shim's OAuth tests for the
-headless flow, and interaction consent (Authorization Code + PKCE) remains a
+is covered in `integration.test.ts`. The release gate's network-segmentation
+item is covered by `tests/security/bypass.mjs` (agent on `agent_edge` cannot
+reach the upstream, the api, or postgres, and gets a 401 from the gateway);
+the client half of FR-002 is covered by the shim's OAuth tests for the
+headless flow, and interactive consent (Authorization Code + PKCE) remains a
 browser-client concern rather than a gate item.
