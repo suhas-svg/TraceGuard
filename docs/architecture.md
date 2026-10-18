@@ -8,7 +8,7 @@ it never runs as a service.
 
 ```
 agent/SDK ---> API :8090 ---> postgres
-agent ------> gateway :8091 ---> upstream MCP (tools network only)
+agent ------> gateway :8091 ---> upstream MCP   (agent_edge -> tools; upstream internal)
 human ------> web :5173 ---> API / gateway
 operator ---> policy-publisher ---> postgres   (signs; holds the private key)
 ```

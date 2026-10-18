@@ -47,6 +47,9 @@ services:
     build:
       context: .
       dockerfile: ./apps/api/Dockerfile
+    # Named so the gateway reuses this build instead of keeping a second
+    # image that can silently go stale.
+    image: traceguard-api
     environment:
       DATABASE_URL: postgres://api_runtime:${API_DB_PASSWORD:-api_dev_pw}@postgres:5432/${POSTGRES_DB:-traceguard}
       DATABASE_URL_RETENTION: postgres://retention_job:${RETENTION_DB_PASSWORD:-retention_dev_pw}@postgres:5432/${POSTGRES_DB:-traceguard}
@@ -66,6 +69,7 @@ services:
     build:
       context: .
       dockerfile: ./apps/api/Dockerfile
+    image: traceguard-api
     command: ["node", "apps/api/dist/gateway.js"]
     environment:
       DATABASE_URL: postgres://gateway_runtime:${GATEWAY_DB_PASSWORD:-gateway_dev_pw}@postgres:5432/${POSTGRES_DB:-traceguard}
@@ -84,6 +88,13 @@ services:
       - gateway_state:/app/gateway-state
     ports:
       - "8091:8091"
+    healthcheck:
+      # The agent waits for this, and tests/security/bypass.mjs treats a
+      # healthy gateway on agent_edge as the "gateway can" half of FR-004.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8091/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     depends_on:
       postgres:
         condition: service_healthy
@@ -92,6 +103,7 @@ services:
     networks:
       - front
       - tools
+      - agent_edge
 
   # Demo upstream only. It lives on the tools network with no route from
   # agents or the public side, which is what makes gateway enforcement real.
@@ -108,6 +120,23 @@ services:
     networks:
       - tools
 
+  # FR-004: the agent sits on agent_edge only. It reaches the gateway and
+  # nothing else — not postgres, not the api, and not the tools network the
+  # upstream lives on. tests/security/bypass.mjs asserts exactly that from
+  # inside this container, and README's demo flow runs here.
+  agent:
+    build:
+      context: .
+      dockerfile: ./examples/demo-agent/Dockerfile
+    environment:
+      TRACEGUARD_URL: http://gateway:8091
+      TRACEGUARD_API_KEY: ${API_KEY:-dev_key_change_me}
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks:
+      - agent_edge
+
   web:
     build:
       context: .
@@ -121,6 +150,9 @@ networks:
   front:
   tools:
     internal: true
+  # FR-004: agent_edge carries the agent's traffic to the gateway and nothing
+  # else. The gateway is the only container with a foot on both sides.
+  agent_edge:
 
 volumes:
   pgdata:
