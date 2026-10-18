@@ -39,8 +39,11 @@ spec:
           ports:
             - containerPort: 8091
           env:
+            - name: GATEWAY_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: GATEWAY_DB_PASSWORD } }
+            # §13.4: enforcement connects as gateway_runtime, not as the owner.
             - name: DATABASE_URL
-              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: DATABASE_URL } }
+              value: postgres://gateway_runtime:$(GATEWAY_DB_PASSWORD)@postgres:5432/traceguard
             - name: API_KEY
               valueFrom: { secretKeyRef: { name: traceguard-secrets, key: API_KEY } }
             - name: APPROVER_KEY

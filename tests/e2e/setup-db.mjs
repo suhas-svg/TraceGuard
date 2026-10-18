@@ -35,5 +35,17 @@ const migrations = join(here, "..", "..", "apps", "api", "migrations");
 for (const f of readdirSync(migrations).filter((f) => f.endsWith(".sql")).sort()) {
   await db.query(readFileSync(join(migrations, f), "utf8"));
 }
+// The api, gateway, publisher and sweep connect as their least-privilege
+// roles (§13.4), so the e2e run exercises the grants rather than the owner.
+// Test-only passwords; a deployment sets its own before enabling LOGIN.
+const ROLE_PASSWORDS = {
+  api_runtime: "e2e_api_pw",
+  gateway_runtime: "e2e_gateway_pw",
+  policy_publisher: "e2e_publisher_pw",
+  retention_job: "e2e_retention_pw"
+};
+for (const [role, password] of Object.entries(ROLE_PASSWORDS)) {
+  await db.query(`ALTER ROLE ${role} LOGIN PASSWORD '${password}'`);
+}
 await db.end();
-console.log(`e2e database ${dbName} reset and migrated`);
+console.log(`e2e database ${dbName} reset, migrated, and role logins enabled`);

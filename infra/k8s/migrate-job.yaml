@@ -36,13 +36,33 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
               for f in $(ls /migrations/*.sql | sort); do
-                echo "applying $f";
-                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" || exit 1;
+                name=$(basename "$f")
+                applied=$(psql "$DATABASE_URL" -tAc "SELECT 1 FROM schema_migrations WHERE name = '$name'")
+                if [ "$applied" = "1" ]; then continue; fi
+                echo "applying $f"
+                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" || exit 1
+                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "INSERT INTO schema_migrations (name) VALUES ('$name')" || exit 1
               done
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<SQL
+              ALTER ROLE api_runtime      LOGIN PASSWORD '${API_DB_PASSWORD}';
+              ALTER ROLE gateway_runtime  LOGIN PASSWORD '${GATEWAY_DB_PASSWORD}';
+              ALTER ROLE retention_job    LOGIN PASSWORD '${RETENTION_DB_PASSWORD}';
+              ALTER ROLE policy_publisher LOGIN PASSWORD '${PUBLISHER_DB_PASSWORD}';
+              SQL
+              echo "migrations applied; role logins enabled"
           env:
             - name: DATABASE_URL
               valueFrom: { secretKeyRef: { name: traceguard-secrets, key: DATABASE_URL } }
+            - name: API_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: API_DB_PASSWORD } }
+            - name: GATEWAY_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: GATEWAY_DB_PASSWORD } }
+            - name: RETENTION_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: RETENTION_DB_PASSWORD } }
+            - name: PUBLISHER_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: PUBLISHER_DB_PASSWORD } }
           resources:
             requests: { memory: "64Mi", cpu: "100m" }
             limits: { memory: "256Mi" }

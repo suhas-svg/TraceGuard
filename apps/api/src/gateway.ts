@@ -459,8 +459,10 @@ export function buildGateway() {
         [ctx.span_id ?? randomUUID(), ctx.run_id, `gw-${randomUUID()}`, tool,
          new Date().toISOString(), JSON.stringify(redactDeep({ server_id: serverId, tool, reason }, { captureRaw: true }))]
       );
-    } catch {
-      // The denial stands even when the trace write cannot land.
+    } catch (err) {
+      // The denial stands even when the trace write cannot land, but a
+      // silently missing denial is unauditable: leave a reason in the log.
+      app.log.warn(`denied-span write failed: ${(err as Error).message}`);
     }
   }
 

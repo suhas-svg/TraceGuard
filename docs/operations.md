@@ -170,8 +170,13 @@ issuer's public keys. Operationally:
 ## Least-privilege roles
 
 Migration `023` creates six roles, all `NOLOGIN`. Development runs
-everything as the database owner and is unaffected. A deployment enables
-only the logins it needs, each with its own password from the secret store:
+everything as the database owner and is unaffected. **Compose does the
+switch for you**: the `db-roles` service applies the migrations and then
+enables the logins with the passwords in `.env` (`API_DB_PASSWORD`,
+`GATEWAY_DB_PASSWORD`, `RETENTION_DB_PASSWORD`, `PUBLISHER_DB_PASSWORD`),
+and the api, gateway and retention sweep connect as their own roles. In a
+deployment assembled by hand, enable only the logins you need, each with its
+own password from the secret store:
 
 ```sql
 -- once, as the database owner
@@ -192,6 +197,16 @@ Gotchas worth knowing before you switch:
 - `audit_events` is owned by `audit_owner`, so any database that ran
   migrations before `023` must be migrated with a role that can
   `ALTER TABLE ... OWNER`; a plain runtime role cannot.
+- The compose `db-roles` service keeps a `schema_migrations` ledger and skips
+  what it has already applied, because older migrations are not
+  re-runnable. A database migrated before the ledger existed is adopted once:
+
+  ```sql
+  CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
+  INSERT INTO schema_migrations (name)
+    SELECT f FROM unnest(ARRAY['001_init.sql', '002_gateway.sql', /* ... every file already applied ... */]) AS f
+    ON CONFLICT DO NOTHING;
+  ```
 - A runtime role cannot `INSERT` audit rows directly — that is the point —
   so anything you add that writes audit must call `append_audit_event`
   (the shared `@traceguard/audit-chain` already does).

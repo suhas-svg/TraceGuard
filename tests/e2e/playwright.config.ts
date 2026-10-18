@@ -1,5 +1,8 @@
 import { defineConfig } from "@playwright/test";
-import { API_KEY, APPROVAL_ARGS_KEY, APPROVER_KEY, DATABASE_URL, GATEWAY_STATE_DIR } from "./env";
+import {
+  API_KEY, APPROVAL_ARGS_KEY, APPROVER_KEY, API_DATABASE_URL, GATEWAY_DATABASE_URL, GATEWAY_STATE_DIR,
+  RETENTION_DATABASE_URL
+} from "./env";
 
 // End-to-end run against the real stack: API, gateway, mock MCP upstream and
 // the built dashboard, each started as its own process. One worker on purpose:
@@ -27,7 +30,8 @@ export default defineConfig({
       timeout: 60_000,
       env: {
         PORT: "8090",
-        DATABASE_URL,
+        DATABASE_URL: API_DATABASE_URL,
+        DATABASE_URL_RETENTION: RETENTION_DATABASE_URL,
         API_KEY,
         APPROVER_KEY,
         APPROVAL_ARGS_KEY,
@@ -42,7 +46,7 @@ export default defineConfig({
       timeout: 60_000,
       env: {
         GATEWAY_PORT: "8091",
-        DATABASE_URL,
+        DATABASE_URL: GATEWAY_DATABASE_URL,
         API_KEY,
         APPROVER_KEY,
         APPROVAL_ARGS_KEY,
