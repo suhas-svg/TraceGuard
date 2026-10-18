@@ -29,6 +29,7 @@ variable, which is how the compose file reads them.
 | OAUTH_JWKS_FILE | api + gateway | (empty) | path to the issuer's JWKS document; use instead of the URL when the issuer is reachable only through a sidecar or mounted secret |
 | OAUTH_JWKS_URL | api + gateway | (empty) | issuer JWKS URL; keys are refetched when a token names an unknown `kid`, at most once per 10 s |
 | NODE_ENV | api + gateway | (unset) | `production` refuses to start without `OAUTH_ISSUER` + `OAUTH_AUDIENCE` + a JWKS source, and stops accepting the static `API_KEY`/`APPROVER_KEY` |
+| DATABASE_URL_RETENTION | api | (unset) | connection string for the retention sweep, so approval pruning runs as `retention_job` (§13.4). Unset, the sweep uses `DATABASE_URL` |
 | PORT | api | 8080 | container side; compose maps the host to 8090 |
 
 Ports on a dev machine: API 8090, gateway 8091, mock tools 8092

@@ -27,6 +27,37 @@
 - Costs are estimates from provider-reported usage and versioned prices,
   never billing truth.
 
+## Database roles
+
+Since migration `023`, the boundary between "can enforce" and "can rewrite
+policy" is a database privilege, not a convention. Six roles exist, all
+`NOLOGIN` until a deployment gives them credentials:
+
+| Role | Holds | Denied |
+|---|---|---|
+| `api_runtime` | reads; drafts (`policies`, `mcp_servers`); users/keys; runs, spans, budgets, evals, webhooks, retention rules; trace-data deletes | every write to `policy_versions`, `policy_signing_keys`, `active_config`; direct insert/update/delete on `audit_events`; all approval transitions (it cannot UPDATE or DELETE `approvals`) |
+| `gateway_runtime` | reads of signed policy, trust keys, active config; approval transitions, decisions, pins, discovery; spans | publish or alter `policy_versions`/`active_config`/`policy_signing_keys`; direct `audit_events` DML |
+| `policy_publisher` | inserts `policy_versions` and trust keys, moves the active pointer, appends audit | update/delete of `policy_versions` (the immutability trigger backs this up); any audit DML |
+| `retention_job` | deletes `spans`, `runs`, terminal `approvals`, webhook deliveries; its own run bookkeeping | no privilege at all on `audit_events`, `policy_versions`, or trust state |
+| `audit_owner` | owns `audit_events` and `append_audit_event`; cannot log in | runtime traffic |
+| `migration_owner` | a membership target for the deployer; migrations should run as it | runtime traffic |
+
+The append-only guarantee is now structural: runtime roles hold no `INSERT`
+on `audit_events`. They call `append_audit_event(...)`, which takes the chain
+lock, refuses an append that does not link to the current head (returning
+`false`, so a caller's transaction survives the retry), and inserts. The hash
+formula stays in `@traceguard/audit-chain`, where the verifier shares it.
+
+Two deviations from the spec's §13.4 table, on purpose: the gateway holds
+table-level `UPDATE` on `approvals` (its CAS transitions are one shape in one
+file) rather than one procedure per transition, and this single-node
+deployment serves the policy screens from the gateway, so `gateway_runtime`
+keeps the draft writes those routes make. Tightening either is a follow-up
+that does not change the denials above.
+
+`apps/api/tests/db-roles.test.ts` proves the matrix at the database layer by
+running each probe under `SET ROLE`; it fails if a grant widens.
+
 ## What it does not do
 
 Model output truth, prompt injection in general, safety of tools called

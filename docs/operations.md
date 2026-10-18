@@ -167,6 +167,38 @@ issuer's public keys. Operationally:
 - A 401 on the MCP endpoint carries the `resource_metadata` challenge, so a
   client that speaks RFC 9728 can find the issuer without documentation.
 
+## Least-privilege roles
+
+Migration `023` creates six roles, all `NOLOGIN`. Development runs
+everything as the database owner and is unaffected. A deployment enables
+only the logins it needs, each with its own password from the secret store:
+
+```sql
+-- once, as the database owner
+ALTER ROLE api_runtime       LOGIN PASSWORD '<from secret>';
+ALTER ROLE gateway_runtime   LOGIN PASSWORD '<from secret>';
+ALTER ROLE policy_publisher  LOGIN PASSWORD '<from secret>';   -- operator host
+ALTER ROLE retention_job     LOGIN PASSWORD '<from secret>';
+```
+
+Then point each connection at its role: `DATABASE_URL` for the API and the
+gateway (one each), `DATABASE_URL_RETENTION` for the sweep, and the
+publisher's `--database-url`/`DATABASE_URL` on the operator host. Verify with
+`npm run test --workspace apps/api -- tests/db-roles.test.ts`, which asserts
+the whole allowance/denial matrix.
+
+Gotchas worth knowing before you switch:
+
+- `audit_events` is owned by `audit_owner`, so any database that ran
+  migrations before `023` must be migrated with a role that can
+  `ALTER TABLE ... OWNER`; a plain runtime role cannot.
+- A runtime role cannot `INSERT` audit rows directly — that is the point —
+  so anything you add that writes audit must call `append_audit_event`
+  (the shared `@traceguard/audit-chain` already does).
+- Retention of *terminal approvals* is `retention_job`'s alone. Without
+  `DATABASE_URL_RETENTION`, a sweep run as `api_runtime` fails closed on an
+  approvals rule rather than silently skipping it.
+
 ## Restore drill
 
 A backup nobody has restored is a guess. Once a quarter: restore the latest dump
