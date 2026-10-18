@@ -6,7 +6,7 @@ import { publish, resolveWorkspaceId, trustKey } from "../../../tools/policy-pub
 // policy, exactly the way the operator CLI does. The suite therefore
 // exercises the real signature path, not a bypass.
 const key = generateSigningKey();
-let trustedWorkspaces = new Set<string>();
+const trustedWorkspaces = new Set<string>();
 
 export async function publishTestPolicy(pool: Pool, workspace = "default"): Promise<number> {
   const workspaceId = await resolveWorkspaceId(pool, workspace);

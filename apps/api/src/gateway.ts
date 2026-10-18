@@ -10,8 +10,7 @@ import {
   evaluate,
   requestHash,
   sha256Hex,
-  stableStringify,
-  type PolicyRule
+  stableStringify
 } from "./policy.js";
 import { loadActivePolicy, rulesFromBundle } from "./policy-bundle.js";
 import { callUpstreamTool, checkUpstreamUrlResolved, definitionHash, definitionIssue, discoverTools, pinnedDefinition } from "./upstream.js";

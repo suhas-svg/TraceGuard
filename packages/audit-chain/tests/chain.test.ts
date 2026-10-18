@@ -49,19 +49,36 @@ describe("audit chain", () => {
     rows[0].metadata = { version: 1, injected: true };
     const result = verifyAuditChain(rows);
     expect(result.ok).toBe(false);
+    expect(result.problems).toHaveLength(1);
+    expect(result.problems[0].id).toBe(rows[0].id);
     expect(result.problems[0].problem).toMatch(/modified/);
-    // The break is noticed on the edited row; the link to the next row also
-    // fails because the edited row's hash no longer matches.
-    expect(result.problems.length).toBeGreaterThan(1);
   });
 
-  it("detects a removed event", () => {
-    const rows = chain().filter((r) => r.id.startsWith("1111"));
-    // The remainder starts mid-chain: its prev_hash cites a hash that is no
-    // longer present.
+  it("detects a modified event whose hash was recomputed to match", () => {
+    // The stronger tamper: edit the content and fix up the row's own hash.
+    // The next row still cites the original hash, so the link breaks.
+    const rows = chain();
+    rows[0].metadata = { version: 99 };
+    rows[0].hash = auditHash("", ts1, {
+      ...base, metadata: rows[0].metadata as Record<string, unknown>
+    });
+    const result = verifyAuditChain(rows);
+    expect(result.ok).toBe(false);
+    expect(result.problems.some((p) => /chain link broken/.test(p.problem))).toBe(true);
+  });
+
+  it("flags a chain that no longer starts at the beginning", () => {
+    const rows = chain().filter((r) => !r.id.startsWith("1111"));
     const result = verifyAuditChain(rows);
     expect(result.ok).toBe(false);
     expect(result.problems[0].problem).toMatch(/chain link broken/);
+  });
+
+  it("cannot see a removed tail without an external anchor", () => {
+    // A prefix of an intact chain is internally consistent — only a signed,
+    // externally stored checkpoint can prove the tail ever existed. This is
+    // a documented property, not a verifier gap.
+    expect(verifyAuditChain(chain().slice(0, 1)).ok).toBe(true);
   });
 
   it("detects reordered events", () => {

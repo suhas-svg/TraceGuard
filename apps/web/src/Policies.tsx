@@ -311,12 +311,94 @@ function BudgetsSection({ onError }: { onError: (m: string) => void }) {
   );
 }
 
+function SignedPolicySection() {
+  const query = useQuery({ queryKey: ["policy-versions"], queryFn: () => gwApi.policyVersions() });
+  const items = query.data?.items ?? [];
+  const active = items.find((v) => v.active);
+  return (
+    <>
+      <h3 className="mb-2 mt-6 text-sm font-semibold text-ink-700">Signed policy</h3>
+      <p className="mb-3 max-w-3xl text-xs text-ink-500">
+        Rules above are drafts. Enforcement reads only the active signed bundle: an operator runs
+        <span className="mx-1 font-mono">policy-publisher publish</span>
+        to sign the current drafts and servers with the signing key, and a changed tool definition
+        stays quarantined until a new bundle activates it.
+      </p>
+      {query.isPending ? (
+        <ListSkeleton rows={2} label="Loading signed versions..." />
+      ) : items.length === 0 ? (
+        <Empty hint="Nothing published yet. Tool calls fail closed until policy-publisher publishes a signed policy." />
+      ) : (
+        <Card className="mb-5 divide-y divide-ink-100">
+          {active && (
+            <div className="flex flex-wrap items-center gap-3 px-4 py-3 text-xs">
+              <Badge tone="ok">active</Badge>
+              <span className="font-medium text-ink-800">v{active.version}</span>
+              <span className="truncate font-mono text-ink-500" title={active.content_hash}>
+                sha256 {active.content_hash.slice(0, 16)}...
+              </span>
+              <span className="text-ink-500">by {active.published_by}</span>
+              <span className="tg-nums text-ink-500">{new Date(active.published_at).toLocaleString()}</span>
+              {active.key_retired && <Badge tone="bad">key retired - republish</Badge>}
+            </div>
+          )}
+          {items.filter((v) => !v.active).slice(0, 5).map((v) => (
+            <div key={v.id} className="flex flex-wrap items-center gap-3 px-4 py-2 text-xs text-ink-500">
+              <span className="font-medium text-ink-600">v{v.version}</span>
+              <span className="truncate font-mono" title={v.content_hash}>
+                sha256 {v.content_hash.slice(0, 16)}...
+              </span>
+              <span>by {v.published_by}</span>
+              <span className="tg-nums">{new Date(v.published_at).toLocaleString()}</span>
+            </div>
+          ))}
+        </Card>
+      )}
+    </>
+  );
+}
+
 function AuditSection() {
   const query = useQuery({ queryKey: ["audit-events"], queryFn: () => gwApi.audit() });
+  const [verification, setVerification] = useState<
+    { ok: boolean; checked: number; truncated: boolean; problems: { id: string; problem: string }[] } | null
+  >(null);
+  const [verifying, setVerifying] = useState(false);
   const items = (query.data?.items ?? []).slice(0, 50);
   return (
     <>
-      <h3 className="mb-2 mt-6 text-sm font-semibold text-ink-700">Audit history</h3>
+      <div className="mb-2 mt-6 flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-ink-700">Audit history</h3>
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={verifying}
+          onClick={async () => {
+            setVerifying(true);
+            try {
+              setVerification(await gwApi.auditVerify());
+            } finally {
+              setVerifying(false);
+            }
+          }}
+        >
+          {verifying ? "Verifying..." : "Verify chain"}
+        </Button>
+      </div>
+      {verification && (
+        <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
+          <Badge tone={verification.ok ? "ok" : "bad"}>
+            {verification.ok ? "chain verified" : "tampering detected"}
+          </Badge>
+          <span className="text-ink-500">{verification.checked} events recomputed</span>
+          {verification.truncated && <span className="text-ink-500">newest segment only (bounded read)</span>}
+          {verification.problems.slice(0, 2).map((p) => (
+            <span key={p.id} className="truncate font-mono text-ink-500" title={p.problem}>
+              {p.id.slice(0, 8)}: {p.problem}
+            </span>
+          ))}
+        </div>
+      )}
       {query.isPending ? (
         <ListSkeleton rows={3} label="Loading audit events..." />
       ) : items.length === 0 ? (
@@ -429,6 +511,7 @@ export default function PoliciesView() {
           </tbody>
         </Table>
       )}
+      <SignedPolicySection />
       <BudgetsSection onError={setError} />
       <AuditSection />
     </Page>

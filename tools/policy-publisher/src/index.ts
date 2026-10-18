@@ -156,11 +156,16 @@ export async function trustKey(pool: Pool, opts: TrustOptions): Promise<TrustRes
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    // Serialized per workspace: without the lock, two concurrent trusts on a
+    // fresh workspace can both see "no live key" and both insert, leaving two
+    // live keys the gateway would equally trust.
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`policy-keys:${opts.workspaceId}`]);
     const existing = await client.query(
       "SELECT id, key_id, retired_at FROM policy_signing_keys WHERE workspace_id = $1", [opts.workspaceId]
     );
+    const forThisKey = existing.rows.find((r) => r.key_id === keyId);
     const live = existing.rows.filter((r) => !r.retired_at);
-    if (live.some((r) => r.key_id === keyId)) {
+    if (forThisKey && !forThisKey.retired_at) {
       await client.query("COMMIT");
       return { keyId, retired: [], alreadyTrusted: true };
     }
@@ -179,14 +184,24 @@ export async function trustKey(pool: Pool, opts: TrustOptions): Promise<TrustRes
       });
       retired.push(String(row.key_id));
     }
-    await client.query(
-      "INSERT INTO policy_signing_keys (workspace_id, key_id, public_key_pem) VALUES ($1,$2,$3)",
-      [opts.workspaceId, keyId, opts.publicKeyPem.trim()]
-    );
+    if (forThisKey) {
+      // A previously retired key coming back: re-activate the same row, never
+      // a second row for the same key material (the unique index would refuse
+      // it, and two rows would make retirement ambiguous).
+      await client.query(
+        "UPDATE policy_signing_keys SET retired_at = NULL WHERE id = $1", [forThisKey.id]
+      );
+    } else {
+      await client.query(
+        "INSERT INTO policy_signing_keys (workspace_id, key_id, public_key_pem) VALUES ($1,$2,$3)",
+        [opts.workspaceId, keyId, opts.publicKeyPem.trim()]
+      );
+    }
     await appendAuditEvent(client, {
       actor_type: "admin", actor_id: opts.trustedBy ?? "operator",
       action: "policy.signing_key.trusted", resource_type: "policy_signing_key",
-      resource_id: keyId, result: "success"
+      resource_id: keyId, result: "success",
+      metadata: forThisKey ? { reactivated: true } : {}
     });
     await client.query("COMMIT");
     return { keyId, retired, alreadyTrusted: false };
