@@ -96,6 +96,59 @@ Suggested schedule: finalize every 15 minutes, retention nightly. Retention
 never targets policies, decisions, pending approvals, the audit log, or the
 money tables — the API refuses those targets.
 
+## Policy publication and signing keys
+
+Enforcement reads only the active signed policy bundle; drafts (rules, server
+registrations, reviewed pins) become effective solely through a publish
+(§13.3). The signing key is operator-host state: it never goes into
+PostgreSQL, the API container, or the gateway container.
+
+```bash
+# Create the pair once, on the operator's host.
+npm run policy:keygen                                   # ./policy-keys/
+
+# Trust the public key for a workspace; audited, and refused if another key
+# is already live unless --rotate is passed (rotation retires the old key).
+npm run policy:trust -- --workspace default
+
+# Publish the current drafts as the new active version (monotonic).
+npm run policy:publish -- --workspace default
+npm run policy:publish -- --workspace default --dry-run # inspect without publishing
+npm run policy:status -- --workspace default            # active version + draft summary
+```
+
+Key rotation order matters: `trust --rotate` retires the old key, and the
+gateway refuses versions signed by a retired key, so **publish immediately
+after rotating** or tool calls fail closed in between. A previously retired
+key that is re-trusted is re-activated in place, never duplicated.
+
+The gateway remembers the highest version it accepted in
+`GATEWAY_STATE_DIR` (compose: the `gateway_state` volume). That anchor is
+what turns "someone pointed the database at an older signed bundle" into a
+detected rollback instead of a silent downgrade — it must persist across
+restarts, and a forked anchor is treated as tampering.
+
+## Verifying the audit chain
+
+```bash
+curl -fsS -X POST "$GATEWAY/v1/audit/verify" -H "Authorization: Bearer $API_KEY"
+# -> { ok, checked, truncated, problems: [{ id, problem }] }
+```
+
+The verifier recomputes every event hash and checks every link. Since
+migration 022 the table is append-only at the database layer (UPDATE and
+DELETE are rejected), so a detected mutation means something with schema
+rights disabled the trigger — the party only an externally stored checkpoint
+anchors against. A bounded read reports `truncated: true` rather than
+labelling a prefix as fully verified. The dashboard's Policy tab has the
+same check behind the `Verify chain` button.
+
+Upgrade note: as of the signed-policy change, approval binding hashes
+(`request_hash`, `args_hash`) are computed over RFC 8785 canonical JSON and
+include the tool-definition pin. Pending approvals created before the upgrade
+will not match a retry; they expire within the TTL (≤60 minutes). Deploy
+with an empty queue, or let old holds expire and recreate them.
+
 ## Restore drill
 
 A backup nobody has restored is a guess. Once a quarter: restore the latest dump

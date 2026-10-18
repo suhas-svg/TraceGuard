@@ -33,4 +33,13 @@ on your machine). Tests: `../../node_modules/.bin/vitest run` from
 root. Integration tests need a database with all migrations applied and
 default to the dev one.
 
+The gateway enforces only signed policy: bring a workspace up with
+`npm run policy:keygen`, `npm run policy:trust -- --workspace default`, and
+`npm run policy:publish -- --workspace default` (repeat the publish after
+every rule, server, or reviewed-pin change). The signing key stays in
+`./policy-keys/` on your machine — never in a container. Add
+`GATEWAY_STATE_DIR=test-results/e2e-gateway-state` when running the e2e
+suite locally so its accepted-version anchor does not collide with your dev
+one.
+
 One branch per phase, squash-merge through a PR, keep main green.

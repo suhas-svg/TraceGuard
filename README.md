@@ -29,11 +29,41 @@ Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
    then `TRACEGUARD_URL=http://localhost:8090 python examples/demo-agent/main.py`
 5. Open http://localhost:5173, set the API URL and key in the header, browse runs.
 
+## Signed policy: the operator flow
+
+The control surface edits **drafts** — rules in `policies`, server registrations, and reviewed tool pins. Nothing enforces a draft. Enforcement reads the active signed bundle, and only the operator's key can sign one:
+
+```bash
+# 1. Create the signing key pair (once). Keep the private key on this host.
+npm run policy:keygen                      # writes ./policy-keys/{signing-key.pem,.pub.pem}
+
+# 2. Trust the public key for a workspace (once; audited).
+npm run policy:trust -- --workspace default
+
+# 3. Sign and publish the current drafts as the new active version.
+npm run policy:publish -- --workspace default
+
+# What would be published, without publishing:
+npm run policy:publish -- --workspace default --dry-run
+```
+
+Every publish is a new immutable `policy_versions` row carrying the rule set, the server manifest, the tool-pin manifest, the protocol profile, the version, and the previous version's hash, with an Ed25519 signature. The gateway refuses to enforce anything if the content hash, signature, key id, version, or history does not check out, and it remembers the highest version it accepted (the `gateway_state` volume in compose) so pointing the database back at an older signed bundle is detected as a rollback.
+
+Consequences worth knowing:
+
+- A tool call before the first publish fails closed (`503 policy_unavailable`), and `tools/list` reports `POLICY_UNAVAILABLE` rather than an empty catalog.
+- A registered server or a discovered tool that the active bundle does not carry is not callable; discovery creates candidates, review and publication activate them.
+- A tool whose definition changed after publication is quarantined; re-approval creates a new pin version, and a **new publish** is what makes it executable again.
+- Rotating the signing key retires the old one: the gateway then refuses versions signed by it until a new bundle is published under the replacement.
+- Approval retries are bound to the exact tool pin: an approval issued for one definition cannot consume another.
+
+The dashboard's Policy tab shows the active signed version and its history, and says which state the drafts are in.
+
 ## What works now
 
 - `POST /v1/ingest/events` validates with Zod, dedupes on `event_id`, auto-creates workspace, agent, and run records.
 - `GET /v1/runs`, `GET /v1/runs/:id`, `GET /v1/runs/:id/trace`, `GET /v1/runs/:id/usage` read stored runs with token and cost breakdowns.
-- Gateway on :8091: upstream registry, tool discovery with definition pinning, allow/deny/approval policies, single-use bound approvals, hash-chained audit.
+- Gateway on :8091: upstream registry, tool discovery with complete definition pinning, and **enforcement that reads only a signed, immutable policy bundle**. The rule set, the upstream server manifest, and the tool-pin manifest are assembled by `tools/policy-publisher`, signed with an operator-held Ed25519 key, and published as a monotonic version. The gateway verifies content hash, signature, key, and history, and fails closed on anything else — including a rolled-back or forked pointer. See "Signed policy" below.
 - The gateway exposes the MCP Streamable HTTP profile at `POST /mcp` (`server/discover`, `tools/list`, `tools/call`) with namespaced `alias__tool` names, header/body binding, and the approval retry contract keyed on a stable logical request id; unsupported methods are rejected and never forwarded. See `docs/compatibility.md`.
 - Approvals are a ten-state machine: `pending` → `approved` → `executing` → `response_received` / `outcome_unknown`, plus terminal `rejected`, `expired`, `policy_invalidated` and `tool_quarantined`. A timeout or crash after dispatch is recorded as **outcome unknown** ("the upstream action may have executed") and is never retried. TTL defaults to 15 minutes (hard max 60), with per-caller pending caps and a creation rate limit.
 - The certified client shim (`packages/mcp-client-shim`) drives that contract: one stable logical request id per logical call, fresh JSON-RPC ids per attempt, bounded backoff while pending, and explicit terminal / outcome-unknown errors instead of resubmission.

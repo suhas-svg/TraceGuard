@@ -40,8 +40,11 @@ function readState(): AcceptedState {
   try {
     return JSON.parse(readFileSync(stateFile(), "utf8")) as AcceptedState;
   } catch {
-    // No state = a fresh gateway. The first accepted version bootstraps the
-    // anchor; from then on every load is checked against it.
+    // No state = a fresh gateway, or an anchor file that was removed from
+    // under a running process. Either way the in-process memo must not
+    // pretend an anchor is still on disk: that memo only skips *writes*, and
+    // skipping one for a deleted file would leave rollback detection off.
+    persistedAnchors = {};
     return {};
   }
 }

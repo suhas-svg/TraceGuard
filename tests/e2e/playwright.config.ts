@@ -1,5 +1,5 @@
 import { defineConfig } from "@playwright/test";
-import { API_KEY, APPROVAL_ARGS_KEY, APPROVER_KEY, DATABASE_URL } from "./env";
+import { API_KEY, APPROVAL_ARGS_KEY, APPROVER_KEY, DATABASE_URL, GATEWAY_STATE_DIR } from "./env";
 
 // End-to-end run against the real stack: API, gateway, mock MCP upstream and
 // the built dashboard, each started as its own process. One worker on purpose:
@@ -46,7 +46,10 @@ export default defineConfig({
         API_KEY,
         APPROVER_KEY,
         APPROVAL_ARGS_KEY,
-        ALLOW_PRIVATE_UPSTREAMS: "true"
+        ALLOW_PRIVATE_UPSTREAMS: "true",
+        // The accepted-policy-version anchor for this run; helpers.ts wipes it
+        // alongside the recreated database.
+        GATEWAY_STATE_DIR
       }
     },
     {

@@ -9,3 +9,6 @@ data:
   APPROVAL_TTL_SECONDS: "300"
   ALLOW_PRIVATE_UPSTREAMS: "false"
   DASHBOARD_ORIGIN: "http://localhost:5173"
+  # The gateway's accepted-policy-version anchor (backed by the gateway-state
+  # PVC in gateway.yaml).
+  GATEWAY_STATE_DIR: "/var/lib/traceguard/gateway-state"

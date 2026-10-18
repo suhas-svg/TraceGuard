@@ -36,23 +36,23 @@ checkpoint anchors history against that.
 | # | Threat (STRIDE) | Mitigation in this repo | Status |
 |---|---|---|---|
 | T1 | **S** Agent bypasses the gateway and calls an upstream directly | Gateway is the only container on the upstream network; upstreams publish no host ports; bypass test planned in `tests/security` | Partial — compose has no agent container yet |
-| T2 | **T** Agent alters or replays an approval | `request_hash` over caller, server, tool, canonical args, logical request id, pin hash; single-use `approved → executing` CAS; retries keyed by logical request id | Implemented (`gateway.ts`, approval tests) |
+| T2 | **T** Agent alters or replays an approval | `request_hash` over caller, server, tool, canonical args (RFC 8785), logical request id, and the tool-definition pin; single-use CAS to executing; retries keyed by logical request id | Implemented (`gateway.ts`, approval tests) |
 | T3 | **T** Concurrent retries dispatch twice | `SELECT … FOR UPDATE` + CAS to `executing`; later retries observe the terminal state | Implemented |
-| T4 | **S/T** Admin changes a tool description or schema | Definition hash pin; mismatch quarantines the tool; calls blocked until a new pin is approved | Partial — hash covers name/description/input schema only; no pin versions |
+| T4 | **S/T** Admin changes a tool description or schema | Pin covers title/description/both schemas/annotations/icons/execution/allowlisted _meta over RFC 8785; drift quarantines with the previous pin kept for the diff; external `$ref`, depth, node, and size bounds never pin; only a published bundle activates a pin | Implemented (`upstream.ts`, `pins.test.ts`) |
 | T5 | **S** Malicious upstream URL / SSRF | Destination policy blocks loopback, link-local, metadata, private ranges unless explicitly allowed; DNS revalidated at connect | Partial — application checks only, no egress firewall |
 | T6 | **I** Agent obtains an upstream credential | Inbound bearer tokens are never forwarded; upstream credentials come from gateway-owned refs; inbound auth stripped | Implemented |
 | T7 | **T** Prompt injection drives a protected action | External policy + human approval, not model judgment; deny-overrides | Implemented (policy), partial (OAuth identity) |
 | T8 | **D** ReDoS through a policy regex | Pattern length limits and bounded matching; no arbitrary expressions | Partial — `new RegExp` still unbounded; see `policy.ts` |
 | T9 | **T** Path traversal or symlink escape in arguments | `path_within` canonicalizes and rejects `..`; executor-side enforcement is deployment-specific | Partial — advisory unless the upstream enforces it |
-| T10 | **T** Audit events edited | Hash chain with per-workspace sequence; append-only by convention | Partial — no DB grants/triggers, no verifier route |
+| T10 | **T** Audit events edited | Hash chain in `@traceguard/audit-chain`; migration 022 rejects UPDATE/DELETE at the database layer; `POST /v1/audit/verify` recomputes every event and link | Implemented (`signed-policy.test.ts` tamper case); externally stored checkpoints remain operator-side |
 | T11 | **T** Audit fork under concurrency | Transactional advisory lock around chain-head append | Implemented |
 | T12 | **I** Sensitive arguments leak to logs or UI | Approval arguments encrypted, TTL-limited, deleted on terminal state; approvals carry `Cache-Control: no-store`; content capture off by default | Implemented |
 | T13 | **D** OTLP flood or storage poisoning | Body/span/attribute limits, per-project rate limits, schema validation | Implemented |
 | T14 | **S** Stolen API key | Hashed at rest, scoped, revocable, rate-limited | Implemented |
 | T15 | **T** Duplicate external side effect after a timeout | Post-dispatch ambiguity becomes `OUTCOME_UNKNOWN`; never auto-retried; UI says the action may have executed | Implemented |
-| T16 | **T** Unsigned or rolled-back policy | Signature, key id, monotonic version and previous-hash verification | **Missing** — schema and signing library exist; no publisher or gateway verification yet |
+| T16 | **T** Unsigned or rolled-back policy | Only the active signed bundle is enforced: content hash, Ed25519 signature, recomputed key id, retired-key refusal, version/history agreement, and rollback/fork/history-gap detection against the gateway's own accepted-version anchor | Implemented (`policy-bundle.ts`, `signed-policy.test.ts`) |
 | T17 | **S** Forged or replayed OAuth token | Issuer, audience, expiry and scope validation; JWKS/introspection | **Missing** — static development keys only |
-| T18 | **T** UI or API compromise changes execution authority | Gateway enforces independently; API can only write drafts; approvals need the gateway control listener | Partial — API still writes live policy |
+| T18 | **T** UI or API compromise changes execution authority | Gateway enforces from signed bundles it verifies itself; the control surface writes drafts only and no endpoint can sign, activate, or roll back a version; approve/reject requires the approver key at the gateway listener | Implemented for policy activation; residual: single DB role in local dev (grants work still open) |
 
 ## Residual limitations
 
@@ -83,3 +83,11 @@ No release candidate until automated tests cover, at minimum:
 10. Telemetry outage neither crashes nor blocks the agent (T13).
 11. Invalid signature, rollback, or fork is rejected by the gateway (T16).
 12. Wrong-issuer / wrong-audience token is rejected (T17).
+
+Status in this tree: 1 (partial — no compose agent container), 2–4, 6–7,
+9–11 are covered by `apps/api/tests` (`signed-policy.test.ts`, `pins.test.ts`,
+`approvals.test.ts`, `integration.test.ts`) and `tools/policy-publisher/tests`;
+5 is covered at the application layer only; 8 is covered in
+`integration.test.ts`; 12 is open — the OAuth resource server (T17) is the
+largest remaining item, and until it lands the deployment is a development
+profile: static bearer keys only, and the compatibility matrix says so.

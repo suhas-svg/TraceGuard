@@ -21,6 +21,9 @@ variable, which is how the compose file reads them.
 | DIAG_MAX_TOKENS | api | 1000000 | advisory diagnostics: tokens per run |
 | DIAG_REPEATED_FAILURES | api | 3 | advisory diagnostics: identical tool failures |
 | UPSTREAM_TIMEOUT_MS | gateway | 60000 | ceiling on one upstream MCP exchange; aborts the request itself |
+| GATEWAY_STATE_DIR | gateway | ./gateway-state | where the gateway records the highest signed policy version it accepted (§13.3); must persist across restarts |
+| TOOL_PIN_META_ALLOWLIST | gateway | (empty) | comma-separated `_meta` keys covered by a tool's definition pin; empty pins no metadata |
+| POLICY_SIGNING_KEY_FILE | policy-publisher | ./policy-keys/signing-key.pem | operator-side private key path; never present in the API or gateway containers |
 | PORT | api | 8080 | container side; compose maps the host to 8090 |
 
 Ports on a dev machine: API 8090, gateway 8091, mock tools 8092

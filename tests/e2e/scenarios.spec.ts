@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { expect, test, type Page } from "@playwright/test";
 import {
-  apiGet, apiPost, event, gwCall, gwPost, ingest, seedRun, setKeys, upstreamHits
+  apiGet, apiPost, event, gwCall, gwPost, ingest, publishPolicy, resetPolicyAnchor, seedRun, setKeys, upstreamHits
 } from "./helpers";
 import { API_KEY, GATEWAY_URL } from "./env";
 
@@ -42,6 +42,11 @@ test.beforeAll(async ({ request }) => {
     const res = await gwPost(request, "/v1/policies", policy);
     expect(res.status()).toBe(201);
   }
+
+  // The rules above are drafts; enforcement reads the signed bundle, so the
+  // beforeAll ends with the operator step the docs describe.
+  resetPolicyAnchor();
+  publishPolicy();
 });
 
 async function openTab(page: Page, label: string) {

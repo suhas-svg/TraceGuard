@@ -59,6 +59,14 @@ spec:
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: ALLOW_PRIVATE_UPSTREAMS } }
             - name: DASHBOARD_ORIGIN
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: DASHBOARD_ORIGIN } }
+            # §13.3: the accepted-policy-version anchor. It must live on a
+            # volume that survives restarts, or a rolled-back pointer cannot
+            # be told from a fresh deployment.
+            - name: GATEWAY_STATE_DIR
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: GATEWAY_STATE_DIR } }
+          volumeMounts:
+            - name: gateway-state
+              mountPath: /var/lib/traceguard/gateway-state
           livenessProbe:
             httpGet: { path: /healthz, port: 8091 }
             periodSeconds: 15
@@ -68,3 +76,17 @@ spec:
           resources:
             requests: { memory: "128Mi", cpu: "100m" }
             limits: { memory: "512Mi" }
+      volumes:
+        - name: gateway-state
+          persistentVolumeClaim:
+            claimName: gateway-state
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gateway-state
+  namespace: traceguard
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests: { storage: 1Gi }

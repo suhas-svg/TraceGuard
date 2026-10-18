@@ -3,11 +3,21 @@
 ## What TraceGuard guarantees
 
 - No protected tool runs without a matching allow rule or a granted, bound,
-  unexpired, single-use approval.
+  unexpired, single-use approval — and both are read from a **signed policy
+  bundle** whose content hash, Ed25519 signature, key, version, and history
+  the gateway verifies first. Unsigned, tampered, rolled-back, forked, or
+  retired-key versions fail closed; the gateway never enforces a draft.
+- Only servers listed in the active bundle are connectable, and only tools
+  whose exact reviewed definition the bundle activated are callable. A tool
+  definition that changed after publication is quarantined until a new signed
+  bundle carries the new pin.
 - Denied calls never contact the upstream server. The security suite asserts
   this with upstream hit counters, not just status codes.
 - Agent credentials cannot decide approvals. The decision endpoint takes a
   separate key and answers 403 to agent keys.
+- The audit log is append-only at the database layer (UPDATE/DELETE rejected
+  by trigger), hash-chained, and verifiable through `POST /v1/audit/verify`;
+  a detected mutation means a database owner disabled the guard.
 - Costs are estimates from provider-reported usage and versioned prices,
   never billing truth.
 
@@ -38,9 +48,11 @@ evaluation replay, and gateway-denial span writes.
 | `spans.attributes` | content keys `[NOT CAPTURED]` unless capture is on; recognized secrets always `[REDACTED]` |
 | `approvals.args` / `args_enc` | sealed with AES-256-GCM while pending; wiped on deny, expiry, and consumption |
 | `approvals.args_summary` | redacted summary kept after terminal states |
-| `approvals.args_hash` | argument hash bound into the approval; kept |
+| `approvals.args_hash` | canonical argument hash bound into the approval (caller, server, tool, args, logical request id, tool pin); kept |
 | `policy_decisions.args_hash` | hash only; decisions never store arguments |
 | `audit_events.metadata` | actions and rule ids; never tool arguments or output |
+| `policy_versions.bundle` | trusted rule set, server endpoints, and pin hashes; **never** secret values — the server manifest records only how the gateway authenticates (`auth_mode`) |
+| `policy_signing_keys.public_key_pem` | verification keys only; the private key lives on the operator's host and is never in PostgreSQL or a service container |
 | `users.password_hash`, `api_keys.key_hash` | scrypt and SHA-256 hashes only; plaintext is never stored |
 
 ## Retention
