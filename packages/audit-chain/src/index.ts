@@ -39,7 +39,9 @@ export function stableStringify(value: unknown): string {
 
 // Advisory-lock key for the audit chain. One appender at a time: without it,
 // two concurrent writers read the same tail hash and append sibling rows, and
-// a legitimate fork is indistinguishable from tampering.
+// a legitimate fork is indistinguishable from tampering. The database
+// function append_audit_event (migration 023) takes this lock now — it must
+// keep matching this number.
 export const CHAIN_LOCK = 852100000001;
 
 export function auditHash(prevHash: string, timestamp: string, entry: AuditEntry): string {
@@ -52,27 +54,31 @@ export function auditHash(prevHash: string, timestamp: string, entry: AuditEntry
     .digest("hex");
 }
 
-// Appends one event inside the caller's transaction. The advisory lock is
-// transaction-scoped, so the caller must be inside BEGIN/COMMIT (that is also
-// what lets an approval transition and its execution-intent event commit
-// atomically with their audit link).
+// Appends one event inside the caller's transaction, through the
+// append_audit_event database function (migration 023). The function
+// serializes writers and refuses an append that does not link to the current
+// head; the hash formula stays here, where the verifier can share it. A head
+// that moved between our read and the call is a retry, not a fork — and the
+// function returns false instead of raising precisely so the retry does not
+// abort the caller's transaction (the approval execution-intent path appends
+// in one).
 export async function appendAuditEvent(client: SqlClient, entry: AuditEntry): Promise<void> {
-  await client.query("SELECT pg_advisory_xact_lock($1)", [CHAIN_LOCK]);
-  const prev = await client.query(
-    "SELECT hash FROM audit_events ORDER BY timestamp DESC, id DESC LIMIT 1"
-  );
-  const prevHash = (prev.rows[0] as { hash?: string } | undefined)?.hash ?? "";
-  const timestamp = new Date().toISOString();
-  const hash = auditHash(prevHash, timestamp, entry);
-  await client.query(
-    `INSERT INTO audit_events
-       (timestamp, actor_type, actor_id, action, resource_type, resource_id,
-        result, metadata, prev_hash, hash)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10)`,
-    [timestamp, entry.actor_type, entry.actor_id ?? "", entry.action,
-     entry.resource_type, entry.resource_id ?? "", entry.result,
-     stableStringify(entry.metadata ?? {}), prevHash, hash]
-  );
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const prev = await client.query(
+      "SELECT hash FROM audit_events ORDER BY timestamp DESC, id DESC LIMIT 1"
+    );
+    const prevHash = (prev.rows[0] as { hash?: string } | undefined)?.hash ?? "";
+    const timestamp = new Date().toISOString();
+    const hash = auditHash(prevHash, timestamp, entry);
+    const result = await client.query(
+      `SELECT append_audit_event($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10) AS appended`,
+      [timestamp, entry.actor_type, entry.actor_id ?? "", entry.action,
+       entry.resource_type, entry.resource_id ?? "", entry.result,
+       stableStringify(entry.metadata ?? {}), prevHash, hash]
+    );
+    if ((result.rows[0] as { appended?: boolean } | undefined)?.appended) return;
+  }
+  throw new Error("audit append could not link to the chain head after 8 attempts");
 }
 
 export interface AuditRow {

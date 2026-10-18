@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { PoolClient } from "pg";
-import { pool } from "./db.js";
+import { pool, retentionPool } from "./db.js";
 import { audit } from "./audit.js";
 
 // Retention deletes execution and operational data past its age. It never
@@ -138,17 +138,27 @@ export function registerRetentionRoutes(app: FastifyInstance) {
         [rules.rows[0]?.workspace_id ?? (await defaultWorkspaceId(client))]
       );
       const counts: Record<string, number> = {};
-      await client.query("BEGIN");
+      // The deletes run on the sweep connection: with DATABASE_URL_RETENTION
+      // set, that is the retention_job role, which is the only role granted
+      // to prune terminal approvals (§13.4).
+      const sweep = await (retentionPool ?? pool).connect();
       try {
-        for (const rule of rules.rows) {
-          counts[rule.name] = await applyRule(client, rule);
+        await sweep.query("BEGIN");
+        try {
+          for (const rule of rules.rows) {
+            counts[rule.name] = await applyRule(sweep, rule);
+          }
+          await sweep.query("COMMIT");
+        } catch (err) {
+          await sweep.query("ROLLBACK").catch(() => undefined);
+          throw err;
         }
-        await client.query("COMMIT");
       } catch (err) {
-        await client.query("ROLLBACK").catch(() => undefined);
         await pool.query("UPDATE retention_runs SET status = 'failed', ended_at = now() WHERE id = $1",
           [run.rows[0].id]);
         throw err;
+      } finally {
+        sweep.release();
       }
       await pool.query(
         "UPDATE retention_runs SET status = 'success', ended_at = now(), deleted_counts = $2 WHERE id = $1",
