@@ -834,11 +834,13 @@ export function buildGateway() {
         // the approval invalidates it and nothing is dispatched. Prior human
         // approval never overrides a current deny.
         // §9.2: the consume transaction serializes on the active-config row.
-        // The publisher's activation writes that row, so holding a share lock
-        // here means the signed policy this transaction re-validates cannot
-        // be swapped out from under it before the execution intent commits.
+        // The lock is taken through the definer helper (migration 027) because
+        // a bare SELECT ... FOR SHARE needs UPDATE privilege and the runtime
+        // role deliberately has none; the row lock still lands on this very
+        // transaction, so the publisher's activation waits here until the
+        // execution intent has committed.
         await client.query(
-          "SELECT 1 FROM active_config WHERE workspace_id = $1 FOR SHARE",
+          "SELECT lock_active_config_share($1)",
           [server.workspace_id]
         );
         const freshLoad = await loadActivePolicy(client, server.workspace_id);

@@ -127,6 +127,24 @@ describe("least-privilege database roles", () => {
     });
   });
 
+  it("serializes on active_config through the definer helper without write access", async () => {
+    // §9.2's consume-time row lock needs FOR SHARE, which PostgreSQL checks
+    // against UPDATE privilege — a privilege gateway_runtime deliberately
+    // lacks. Migration 027's SECURITY DEFINER helper is owned by
+    // policy_publisher, and the row lock still lands on the calling
+    // transaction, so serialization holds while the runtime stays read-only.
+    const fn = await pool.query<{ owner: string }>(
+      "SELECT pg_get_userbyid(proowner) AS owner FROM pg_proc WHERE proname = 'lock_active_config_share'"
+    );
+    expect(fn.rows[0]?.owner).toBe("policy_publisher");
+    await asRole("gateway_runtime", async (c) => {
+      expect(await attempt(c, () => c.query(
+        "SELECT lock_active_config_share('00000000-0000-0000-0000-000000000000')"
+      ))).toBe("ok");
+      expect(await attempt(c, () => c.query("UPDATE active_config SET updated_at = now() WHERE false"))).toBe(DENIED);
+    });
+  });
+
   it("policy_publisher appends versions and trust, never rewrites them", async () => {
     await asRole("policy_publisher", async (c) => {
       expect(await attempt(c, () => c.query("UPDATE policy_versions SET content_hash = 'x' WHERE false"))).toBe(DENIED);
