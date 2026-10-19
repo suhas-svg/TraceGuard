@@ -332,4 +332,71 @@ describe("approval state machine v2", () => {
     expect(decided.statusCode).toBe(200);
     expect(decided.headers["cache-control"]).toBe("no-store");
   });
+
+  it("invalidates an approved call when the tool is quarantined before dispatch", async () => {
+    const caller = `quar-${tag}`;
+    const held = await call(caller, "err");
+    expect(held.statusCode).toBe(202);
+    const id = held.json().approval_id as string;
+    expect((await decide(id)).statusCode).toBe(200);
+    // A drift discovered after the human approved must still stop the call:
+    // the human approved the old definition, not this one (§7.5, §9.2).
+    await pool.query(
+      "UPDATE server_tools SET quarantined = true, quarantine_reason = 'definition changed' WHERE server_id = $1 AND tool_name = 'err'",
+      [serverId]
+    );
+    try {
+      const retry = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+        payload: { server_id: serverId, tool: "err", arguments: {}, caller, approval_id: id } });
+      expect(retry.statusCode).toBe(403);
+      expect(retry.json().error).toBe("tool_blocked");
+      expect(retry.json().reason).toBe("unknown or quarantined tool");
+      const row = (await pool.query("SELECT status FROM approvals WHERE id = $1", [id])).rows[0];
+      expect(row.status).toBe("tool_quarantined");
+      const audit = (await pool.query(
+        "SELECT count(*)::int AS n FROM audit_events WHERE action = 'approval.tool_quarantined' AND resource_id = $1", [id])).rows[0];
+      expect(audit.n).toBe(1);
+    } finally {
+      await pool.query(
+        "UPDATE server_tools SET quarantined = false, quarantine_reason = NULL WHERE server_id = $1 AND tool_name = 'err'",
+        [serverId]
+      );
+    }
+  });
+
+  it("invalidates an approved call when a publish drops the pinned tool", async () => {
+    const caller = `drop-${tag}`;
+    const held = await call(caller, "err");
+    expect(held.statusCode).toBe(202);
+    const id = held.json().approval_id as string;
+    expect((await decide(id)).statusCode).toBe(200);
+    try {
+      // Quarantine excludes the pin from the next signed bundle; clearing the
+      // flag without a republish leaves a live tool with no approved pin —
+      // the consume-time pin check must refuse rather than dispatch (§7.5).
+      await pool.query(
+        "UPDATE server_tools SET quarantined = true WHERE server_id = $1 AND tool_name = 'err'", [serverId]);
+      await publishTestPolicy(pool);
+      await pool.query(
+        "UPDATE server_tools SET quarantined = false WHERE server_id = $1 AND tool_name = 'err'", [serverId]);
+      const retry = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+        payload: { server_id: serverId, tool: "err", arguments: {}, caller, approval_id: id } });
+      expect(retry.statusCode).toBe(403);
+      // The manifest check runs before the approval branch: a pin the signed
+      // bundle no longer carries blocks the call and invalidates the hold in
+      // the same transaction (the later consume-time recheck covers the race
+      // where policy changes mid-consume).
+      expect(retry.json().error).toBe("tool_blocked");
+      expect(String(retry.json().reason)).toContain("not in the active signed policy");
+      const row = (await pool.query("SELECT status FROM approvals WHERE id = $1", [id])).rows[0];
+      expect(row.status).toBe("policy_invalidated");
+      const audit = (await pool.query(
+        "SELECT count(*)::int AS n FROM audit_events WHERE action = 'approval.policy_invalidated' AND resource_id = $1", [id])).rows[0];
+      expect(audit.n).toBe(1);
+    } finally {
+      await pool.query(
+        "UPDATE server_tools SET quarantined = false WHERE server_id = $1 AND tool_name = 'err'", [serverId]);
+      await publishTestPolicy(pool);
+    }
+  });
 });

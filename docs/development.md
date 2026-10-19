@@ -34,6 +34,13 @@ on your machine). Tests: `../../node_modules/.bin/vitest run` from
 root. Integration tests need a database with all migrations applied and
 default to the dev one.
 
+Cross-cutting gates live at the repo root: `npm run test:secrets` scans every
+tracked file for credential shapes, `npm run test:faults` boots the API and
+the gateway against a dead database and requires fail-closed answers (build
+`apps/api` first), and `npm run test:oauth` starts a generated RS256
+issuer/JWKS, boots both apps in production OAuth mode, and proves static keys
+are refused while OAuth tokens work. All three run in CI.
+
 Do not source `.env` before running the suites: it exports `API_KEY` and
 friends, which shadow the test defaults that `tests/setup.ts` installs with
 `??=` (every request then 401s). Pass only `DATABASE_URL` — pointing at a

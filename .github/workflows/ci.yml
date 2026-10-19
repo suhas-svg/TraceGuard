@@ -18,6 +18,17 @@ jobs:
       - run: npm install --ignore-scripts
       - run: npx eslint .
 
+  # NFR-006: a floor against committed credentials. Runs on the tracked tree
+  # only, needs no network or extra action, and fails the PR on a finding.
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/secret-scan.mjs
+
   build-and-test:
     runs-on: ubuntu-latest
     services:
@@ -67,6 +78,10 @@ jobs:
       - run: ./node_modules/.bin/vitest run --root packages/mcp-client-shim
       - run: ./node_modules/.bin/vitest run --root tools/policy-publisher
       - run: ./node_modules/.bin/vitest run --root sdks/typescript
+      - name: Fault injection (database outage must fail closed)
+        run: node tests/faults/run.mjs
+      - name: OAuth clean-clone run
+        run: node tests/oauth/clean-run.mjs
 
   python:
     runs-on: ubuntu-latest
