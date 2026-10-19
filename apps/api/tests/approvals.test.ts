@@ -268,4 +268,68 @@ describe("approval state machine v2", () => {
     const adminAtCtl = await ctl.inject({ method: "GET", url: "/_control/v1/approvals", headers: key });
     expect(adminAtCtl.statusCode).toBe(403);
   });
+
+  it("refuses a transplanted approval whose arguments do not match the binding", async () => {
+    const caller = `bind-${tag}`;
+    const held = await call(caller, "echo", { text: "bound" });
+    expect(held.statusCode).toBe(202);
+    const id = held.json().approval_id as string;
+    expect((await decide(id)).statusCode).toBe(200);
+
+    // Same approval id, different arguments: the binding hash (caller +
+    // server + tool + args + logical id + pin) must refuse the transplant,
+    // and the row must not be burned by the attempt.
+    const transplanted = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: "not-bound" }, caller, approval_id: id } });
+    expect(transplanted.statusCode).toBe(403);
+    expect(transplanted.json().error).toBe("approval_binding_mismatch");
+
+    const decision = (await pool.query(
+      "SELECT count(*)::int AS n FROM policy_decisions WHERE approval_id = $1 AND reason = 'approval binding mismatch'", [id])).rows[0];
+    expect(decision.n).toBe(1);
+    const audit = (await pool.query(
+      "SELECT count(*)::int AS n FROM audit_events WHERE action = 'approval.binding_mismatch' AND resource_id = $1", [id])).rows[0];
+    expect(audit.n).toBe(1);
+    const row = (await pool.query("SELECT status FROM approvals WHERE id = $1", [id])).rows[0];
+    expect(row.status).toBe("approved");
+
+    // The genuine request still consumes afterwards.
+    const ok = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: "bound" }, caller, approval_id: id } });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json().result.content[0].text).toBe("echo:bound");
+  });
+
+  it("caps active approvals per workspace at the configured maximum", async () => {
+    // Clear the rows earlier tests left live so the cap math starts at zero.
+    const server = (await pool.query("SELECT workspace_id FROM mcp_servers WHERE id = $1", [serverId])).rows[0];
+    await pool.query(
+      "UPDATE approvals SET status='expired' WHERE workspace_id = $1 AND status IN ('pending','approved')",
+      [server.workspace_id]);
+    const previous = process.env.APPROVAL_MAX_PENDING_PER_WORKSPACE;
+    process.env.APPROVAL_MAX_PENDING_PER_WORKSPACE = "1";
+    try {
+      const first = await call(`ws-cap-a-${tag}`, "echo", { text: "a" });
+      expect(first.statusCode).toBe(202);
+      const second = await call(`ws-cap-b-${tag}`, "echo", { text: "b" });
+      expect(second.statusCode).toBe(429);
+      expect(second.json().error).toBe("approval_limit");
+      expect(second.json().pending_workspace).toBe(1);
+    } finally {
+      if (previous === undefined) delete process.env.APPROVAL_MAX_PENDING_PER_WORKSPACE;
+      else process.env.APPROVAL_MAX_PENDING_PER_WORKSPACE = previous;
+    }
+  });
+
+  it("marks approval responses as non-cacheable", async () => {
+    const held = await call(`cache-${tag}`, "echo", { text: "c" });
+    expect(held.statusCode).toBe(202);
+    expect(held.headers["cache-control"]).toBe("no-store");
+    const listed = await ctl.inject({ method: "GET", url: "/_control/v1/approvals", headers: approver });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.headers["cache-control"]).toBe("no-store");
+    const decided = await decide(held.json().approval_id as string, false);
+    expect(decided.statusCode).toBe(200);
+    expect(decided.headers["cache-control"]).toBe("no-store");
+  });
 });

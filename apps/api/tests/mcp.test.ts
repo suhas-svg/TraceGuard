@@ -157,6 +157,17 @@ describe("MCP streamable HTTP gateway", () => {
     expect(body.error.data.error).toContain("Mcp-Method");
   });
 
+  it("rejects a tool name that disagrees with the Mcp-Name header", async () => {
+    const res = await rpc("tools/call",
+      { name: `${alias}__echo`, arguments: { text: "hi" }, _meta: meta() },
+      { name: `${alias}__echo`, headers: { "mcp-name": `${alias}__wipe` } });
+    expect(res.statusCode).toBe(400);
+    const body = res.json() as JsonBody;
+    expect(body.error.code).toBe(-32600);
+    expect(body.error.data.error).toContain("Mcp-Name");
+    expect(hits.echo).toBe(0);
+  });
+
   it("requires per-request protocol metadata", async () => {
     const res = await rpc("tools/list", {});
     expect(res.statusCode).toBe(400);
