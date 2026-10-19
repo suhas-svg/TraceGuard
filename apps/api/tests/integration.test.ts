@@ -123,6 +123,33 @@ describe("integration and security", () => {
     expect(unauth.statusCode).toBe(401);
   });
 
+  it("never rewrites a finalized run with a late event, and audits the conflict", async () => {
+    const runId = randomUUID();
+    const failed = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId, event_type: "run.failed", error_type: "boom" })] } });
+    expect(failed.statusCode).toBe(200);
+    const first = await pool.query("SELECT status FROM runs WHERE id = $1", [runId]);
+    expect(first.rows[0].status).toBe("failed");
+    // A late completion is a fact about the past, not a rewrite: the run stays
+    // failed and the conflict lands in the audit trail as a correction event.
+    const late = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId, event_type: "run.completed" })] } });
+    expect(late.statusCode).toBe(200);
+    const second = await pool.query("SELECT status, error_type FROM runs WHERE id = $1", [runId]);
+    expect(second.rows[0].status).toBe("failed");
+    expect(second.rows[0].error_type).toBe("boom");
+    const corrections = await pool.query(
+      "SELECT metadata FROM audit_events WHERE action = 'run.status_correction' AND resource_id = $1", [runId]);
+    expect(corrections.rowCount).toBe(1);
+    expect(corrections.rows[0].metadata).toMatchObject({ previous_status: "failed", attempted_status: "success" });
+    // A replay of the same terminal outcome is not a conflict: silence.
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId, event_type: "run.failed", error_type: "boom" })] } });
+    const again = await pool.query(
+      "SELECT count(*)::int AS n FROM audit_events WHERE action = 'run.status_correction' AND resource_id = $1", [runId]);
+    expect(again.rows[0].n).toBe(1);
+  });
+
   it("registers upstreams without leaking secrets, and refuses unsafe URLs", async () => {
     const bad = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `bad-${tag}`, base_url: "ftp://evil/x" } });
@@ -165,6 +192,25 @@ describe("integration and security", () => {
       payload: { server_id: serverId, tool: "ghost", arguments: {}, caller: "t" } });
     expect(unknown.statusCode).toBe(403);
     expect(upstreamHits).toBe(before + 1);
+  });
+
+  it("refuses arguments that do not fit the pinned input schema", async () => {
+    // §8.4/FR-010: the schema pinned at review time is the contract; a
+    // wrong-typed argument is denied before any policy or upstream work.
+    const before = upstreamHits;
+    const res = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: 123 }, caller: "schema-t" } });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("invalid_arguments");
+    expect(upstreamHits).toBe(before);
+    const decision = await pool.query(
+      `SELECT reason FROM policy_decisions WHERE server_id = $1 AND tool_name = 'echo'
+        ORDER BY timestamp DESC LIMIT 1`, [serverId]);
+    expect(String(decision.rows[0].reason)).toContain("arguments do not match the pinned input schema");
+    const audited = await pool.query(
+      `SELECT metadata FROM audit_events WHERE action = 'tool.execute' AND resource_id = $1
+        ORDER BY timestamp DESC LIMIT 1`, [`${serverId}/echo`]);
+    expect(audited.rows[0].metadata).toMatchObject({ reason: "argument_schema_mismatch" });
   });
 
   it("records what the gateway spent deciding, on allow and on deny", async () => {
@@ -339,11 +385,11 @@ describe("integration and security", () => {
     };
     const first = await api.inject({ method: "POST", url: "/v1/traces", headers: key, payload });
     expect(first.statusCode).toBe(200);
-    expect(first.json().partialSuccess.rejectedSpans).toBe(0);
+    expect(first.json().partialSuccess).toBeUndefined();
     const retry = await api.inject({ method: "POST", url: "/v1/traces", headers: key, payload });
     // Retries dedupe on the derived event ids: the batch is accepted again but
     // stores nothing new.
-    expect(retry.json().partialSuccess.rejectedSpans).toBe(0);
+    expect(retry.json().partialSuccess).toBeUndefined();
     const runs = await api.inject({ method: "GET", url: "/v1/runs?limit=50", headers: key });
     const run = runs.json().items.find((r: { agent_name: string }) => r.agent_name === `otel-${tag}`);
     expect(run).toBeDefined();
@@ -493,7 +539,7 @@ describe("integration and security", () => {
     };
     const jsonAgain = await api.inject({ method: "POST", url: "/v1/traces", headers: key,
       payload: { resourceSpans: [{ resource: { attributes: [{ key: "service.name", value: { stringValue: "pb-" + tag } }] }, scopeSpans: [{ spans: [jsonSpan] }] }] } });
-    expect(jsonAgain.json().partialSuccess.rejectedSpans).toBe(0);
+    expect(jsonAgain.json().partialSuccess).toBeUndefined();
     const stillOne = await api.inject({ method: "GET", url: `/v1/runs/${run.id}/trace`, headers: key });
     expect(stillOne.json().spans).toHaveLength(1);
   });
@@ -1537,7 +1583,7 @@ describe("integration and security", () => {
   });
 
   it("links a child that arrives before its parent and orphans parents that never arrive", async () => {
-    const { uuidV5, TRACE_NAMESPACE } = await import("../src/otlp.js");
+    const { spanRowId } = await import("../src/otlp.js");
     const hex = (n: number) => randomUUID().replace(/-/g, "").slice(0, n);
     const nano = (agoMs: number) => String(BigInt(Date.now() - agoMs) * 1_000_000n);
     const agentName = `otlp-order-${tag}`;
@@ -1553,8 +1599,8 @@ describe("integration and security", () => {
         ] }]
       }] } });
     expect(childPost.statusCode).toBe(200);
-    expect(childPost.json().partialSuccess.rejectedSpans).toBe(0);
-    const childRowId = uuidV5(TRACE_NAMESPACE, child);
+    expect(childPost.json().partialSuccess).toBeUndefined();
+    const childRowId = spanRowId("default", child);
     const before = await pool.query("SELECT parent_state FROM spans WHERE id = $1", [childRowId]);
     expect(before.rows[0].parent_state).toBe("unresolved");
     // The parent shows up in a later batch: the link is resolved retroactively.
@@ -1572,15 +1618,16 @@ describe("integration and security", () => {
     // A parent that never arrives is flagged by the orphan sweep, not guessed at.
     const lonelyTrace = hex(32);
     const lonelyChild = hex(16);
+    const lonelyParent = hex(16);
     await api.inject({ method: "POST", url: "/v1/traces", headers: key,
       payload: { resourceSpans: [{
         resource: { attributes: [{ key: "service.name", value: { stringValue: agentName } }] },
         scopeSpans: [{ spans: [
-          { traceId: lonelyTrace, spanId: lonelyChild, parentSpanId: hex(16),
+          { traceId: lonelyTrace, spanId: lonelyChild, parentSpanId: lonelyParent,
             name: "gen_ai.execute_tool", startTimeUnixNano: nano(400), endTimeUnixNano: nano(300) }
         ] }]
       }] } });
-    const lonelyId = uuidV5(TRACE_NAMESPACE, lonelyChild);
+    const lonelyId = spanRowId("default", lonelyChild);
     await pool.query("UPDATE spans SET received_at = now() - interval '1 hour' WHERE id = $1", [lonelyId]);
     const sweep = await api.inject({ method: "POST",
       url: "/v1/admin/finalize-orphan-spans?older_than_seconds=60", headers: key });
@@ -1589,10 +1636,69 @@ describe("integration and security", () => {
     expect(sweep.json().ids).toContain(lonelyId);
     const orphaned = await pool.query("SELECT parent_state FROM spans WHERE id = $1", [lonelyId]);
     expect(orphaned.rows[0].parent_state).toBe("orphaned");
+    // §11.4: a parent inside the 24h late window disproves the orphan verdict
+    // — the child is revived, not left flagged while its link sits on hand.
+    const revive = await api.inject({ method: "POST", url: "/v1/traces", headers: key,
+      payload: { resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: agentName } }] },
+        scopeSpans: [{ spans: [
+          { traceId: lonelyTrace, spanId: lonelyParent, name: "gen_ai.chat",
+            startTimeUnixNano: nano(600), endTimeUnixNano: nano(100) }
+        ] }]
+      }] } });
+    expect(revive.statusCode).toBe(200);
+    const revived = await pool.query("SELECT parent_state FROM spans WHERE id = $1", [lonelyId]);
+    expect(revived.rows[0].parent_state).toBe("resolved");
+  });
+
+  it("keeps same-id spans from different workspaces as distinct rows", async () => {
+    const { spanRowId } = await import("../src/otlp.js");
+    const hex = (n: number) => randomUUID().replace(/-/g, "").slice(0, n);
+    const nano = (agoMs: number) => String(BigInt(Date.now() - agoMs) * 1_000_000n);
+    const trace = hex(32);
+    const span = hex(16);
+    const post = (serviceName: string, workspace: string) => api.inject({ method: "POST", url: "/v1/traces", headers: key,
+      payload: { resourceSpans: [{
+        resource: { attributes: [
+          { key: "service.name", value: { stringValue: serviceName } },
+          { key: "traceguard.workspace", value: { stringValue: workspace } }
+        ] },
+        scopeSpans: [{ spans: [
+          { traceId: trace, spanId: span, name: "gen_ai.chat",
+            startTimeUnixNano: nano(500), endTimeUnixNano: nano(100) }
+        ] }]
+      }] } });
+    // §11.4: the same raw ids replayed from two workspaces are two spans.
+    const first = await post(`otlp-dedupe-a-${tag}`, `dedupe-a-${tag}`);
+    expect(first.statusCode).toBe(200);
+    const second = await post(`otlp-dedupe-b-${tag}`, `dedupe-b-${tag}`);
+    expect(second.statusCode).toBe(200);
+    const a = await pool.query("SELECT count(*)::int AS n FROM spans WHERE id = $1", [spanRowId(`dedupe-a-${tag}`, span)]);
+    const b = await pool.query("SELECT count(*)::int AS n FROM spans WHERE id = $1", [spanRowId(`dedupe-b-${tag}`, span)]);
+    expect(a.rows[0].n).toBe(1);
+    expect(b.rows[0].n).toBe(1);
+    // A retry of the same span through the same path still collapses.
+    const retry = await post(`otlp-dedupe-a-${tag}`, `dedupe-a-${tag}`);
+    expect(retry.statusCode).toBe(200);
+    const again = await pool.query("SELECT count(*)::int AS n FROM spans WHERE id = $1", [spanRowId(`dedupe-a-${tag}`, span)]);
+    expect(again.rows[0].n).toBe(1);
+  });
+
+  it("seeds the default span retention rule for a workspace at creation", async () => {
+    const name = `ret-${tag}`;
+    const created = await api.inject({ method: "POST", url: "/v1/workspaces", headers: key, payload: { name } });
+    expect([200, 201]).toContain(created.statusCode);
+    const rules = await pool.query(
+      `SELECT name, target, older_than_days, max_rows FROM retention_rules
+        WHERE workspace_id = (SELECT id FROM workspaces WHERE name = $1)`, [name]);
+    expect(rules.rowCount).toBe(1);
+    expect(rules.rows[0]).toMatchObject({ name: "default-span-retention", target: "spans" });
+    expect(Number(rules.rows[0].older_than_days)).toBe(7);
+    expect(Number(rules.rows[0].max_rows)).toBe(100000);
   });
 
   it("bounds stored attributes, flags clock skew, and refuses spans outside the late window", async () => {
-    const { uuidV5, TRACE_NAMESPACE } = await import("../src/otlp.js");
+    const { spanRowId } = await import("../src/otlp.js");
     const hex = (n: number) => randomUUID().replace(/-/g, "").slice(0, n);
     const nano = (agoMs: number) => String(BigInt(Date.now() - agoMs) * 1_000_000n);
     const agentName = `otlp-limits-${tag}`;
@@ -1615,10 +1721,10 @@ describe("integration and security", () => {
         ] }]
       }] } });
     expect(post.statusCode).toBe(200);
-    expect(post.json().partialSuccess.rejectedSpans).toBe(0);
+    expect(post.json().partialSuccess).toBeUndefined();
     const stored = await pool.query(
       "SELECT attributes, clock_skew, duration_ms FROM spans WHERE id = $1",
-      [uuidV5(TRACE_NAMESPACE, span)]
+      [spanRowId("default", span)]
     );
     const attrs = stored.rows[0].attributes as Record<string, string>;
     expect(Object.keys(attrs)).toHaveLength(64);

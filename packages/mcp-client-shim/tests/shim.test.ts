@@ -9,9 +9,14 @@ import {
   ShimError
 } from "../src/index.js";
 
+// Upstream request bodies are JSON; the assertions read them field by field,
+// so a shared alias keeps the casts honest and the rule quiet in one place.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type JsonBody = Record<string, any>;
+
 interface Seen {
   headers: Record<string, string | string[] | undefined>;
-  body: Record<string, any>;
+  body: JsonBody;
 }
 
 type Reply = { status?: number; body: unknown } | "destroy";
@@ -21,7 +26,7 @@ async function start(handler: (seen: Seen, index: number) => Reply) {
   const server = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, any>;
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as JsonBody;
     const entry = { headers: req.headers, body };
     seen.push(entry);
     const reply = handler(entry, seen.length - 1);

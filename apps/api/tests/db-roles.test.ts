@@ -178,6 +178,9 @@ describe("least-privilege database roles", () => {
 
   it("the append function is not callable by roles it was not granted to", async () => {
     await asRole("retention_job", async (c) => {
+      // The function's v2 parameters carry defaults, so the historical
+      // 10-argument call still resolves — and still only for the roles the
+      // function was granted to.
       expect(await attempt(c, () => c.query(
         `SELECT append_audit_event(now(), 'test', '', 'a', 'r', '', 'success', '{}'::jsonb, '', repeat('a', 64))`
       ))).toBe(DENIED);

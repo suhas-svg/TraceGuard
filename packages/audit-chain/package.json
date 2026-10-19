@@ -9,6 +9,9 @@
     "build": "tsc",
     "test": "vitest run"
   },
+  "dependencies": {
+    "@traceguard/canonical-json": "0.1.0"
+  },
   "devDependencies": {
     "typescript": "^5.5.0",
     "vitest": "^2.0.0"

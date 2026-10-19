@@ -73,6 +73,18 @@ describe("argument constraints", () => {
     expect(checkConditions({ path: "/etc/x", mode: "read" }, cond)).toBe(false);
     expect(checkConditions({ path: "/data/a", mode: "write" }, cond)).toBe(false);
   });
+
+  it("schema constraints judge the value against the declared JSON Schema", () => {
+    // §8.4/FR-010: a rule can carry a full 2020-12 schema for an argument.
+    const cond = {
+      required: ["meta"],
+      arguments: { meta: { schema: { type: "object", properties: { tag: { type: "string" } }, required: ["tag"] } } }
+    };
+    expect(checkConditions({ meta: { tag: "x" } }, cond)).toBe(true);
+    expect(checkConditions({ meta: { tag: 123 } }, cond)).toBe(false);
+    expect(checkConditions({ meta: "nope" }, cond)).toBe(false);
+    expect(checkConditions({ meta: { other: 1 } }, cond)).toBe(false);
+  });
 });
 
 describe("approval binding", () => {

@@ -399,7 +399,11 @@ export const gwApi = {
   servers: () => gw<{ items: McpServer[] }>("/v1/servers"),
   createServer: (s: { name: string; base_url: string; auth_secret?: string }) =>
     gw<McpServer>("/v1/servers", { method: "POST", body: JSON.stringify(s) }),
-  discover: (id: string) => gw<{ tools: { tool_name: string; quarantined: boolean }[] }>(`/v1/servers/${id}/discover`, { method: "POST", body: "{}" }),
+  discover: (id: string) =>
+    gw<{ tools: { tool_name: string; quarantined: boolean; quarantine_reason?: string | null;
+      definition?: Record<string, unknown> | null; previous_definition?: Record<string, unknown> | null;
+      definition_hash?: string | null; previous_hash?: string | null }[] }>(
+      `/v1/servers/${id}/discover`, { method: "POST", body: "{}" }),
   policies: () => gw<{ items: Policy[] }>("/v1/policies"),
   createPolicy: (p: Record<string, unknown>) =>
     gw<Policy>("/v1/policies", { method: "POST", body: JSON.stringify(p) }),

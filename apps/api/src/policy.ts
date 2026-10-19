@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { posix } from "node:path";
 import { canonicalize } from "@traceguard/canonical-json";
+import { validateAgainstSchema } from "./schema-check.js";
 
 export type Effect = "allow" | "deny" | "require_approval";
 export type Decision = "allow" | "deny" | "need_approval";
@@ -33,6 +34,7 @@ export interface ArgConditions {
 
 export interface FieldConstraint {
   path_within?: string;
+  schema?: Record<string, unknown>;
   regex?: string;
   enum?: unknown[];
   max_length?: number;
@@ -121,6 +123,9 @@ export function checkField(value: unknown, rule: FieldConstraint): boolean {
   }
   if (rule.path_within !== undefined) {
     if (!pathWithin(String(value ?? ""), rule.path_within)) return false;
+  }
+  if (rule.schema !== undefined) {
+    if (!validateAgainstSchema(rule.schema as Record<string, unknown>, value).ok) return false;
   }
   return true;
 }

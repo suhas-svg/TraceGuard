@@ -1,7 +1,8 @@
 // FR-004, automated: from inside the agent container, the upstream tools
 // network must be unreachable — by service name and by IP — while the gateway
-// answers. Runs against a live `docker compose up`; see the `security` job in
-// .github/workflows/ci.yml.
+// answers AND can itself reach that upstream. The two halves together prove a
+// boundary rather than a broken network. Runs against a live `docker compose
+// up`; see the `security` job in .github/workflows/ci.yml.
 //
 //   node tests/security/bypass.mjs            (or: npm run test:security)
 
@@ -27,6 +28,15 @@ function tryInAgent(script) {
   } catch (err) {
     return { ok: false, err };
   }
+}
+
+// The controller's position: the same upstream must be reachable from here,
+// or "the agent cannot reach it" would prove nothing. The gateway image is
+// node:22-alpine, so a one-line fetch script needs no extra tooling.
+function inGateway(script) {
+  return sh("docker", ["compose", "exec", "-T", "gateway", "node", "-e", script], {
+    stdio: ["ignore", "pipe", "pipe"]
+  });
 }
 
 function check(name, fn) {
@@ -70,6 +80,15 @@ check("the agent cannot reach the control API", () => {
 check("the agent cannot reach postgres", () => {
   const res = tryInAgent("timeout 5 sh -c '</dev/tcp/postgres/5432'");
   if (res.ok) throw new Error("the agent opened a TCP connection to postgres");
+});
+
+check("the gateway can reach the upstream — a boundary, not a broken network", () => {
+  const body = inGateway(
+    "fetch('http://mock-tools:8092/hits')" +
+    ".then(async (r) => { if (!r.ok) { throw new Error('HTTP ' + r.status); } console.log(await r.text()); })" +
+    ".catch((e) => { console.error(String((e && e.message) || e)); process.exit(1); })"
+  );
+  if (!body) throw new Error("the gateway reached mock-tools but got an empty body");
 });
 
 check("the agent reaches the gateway, and the gateway answers as itself", () => {

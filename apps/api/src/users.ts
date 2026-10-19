@@ -3,6 +3,8 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
+import { ensureDefaultSpanRetention } from "./retention.js";
+import { oauthConfigFromEnv } from "./oauth.js";
 import { checkPassword, hashPassword, newKey, ROLE_SCOPES } from "./auth.js";
 
 // User management. Registration stays open only until the first user
@@ -55,6 +57,11 @@ export function registerUserRoutes(app: FastifyInstance) {
     if (!user || !checkPassword(parsed.data.password, user.password_hash)) {
       return reply.code(401).send({ error: "bad_login" });
     }
+    // In OAuth mode trusted roles come from the issuer, never from a local
+    // password login minting that role's scopes (§9.3).
+    if (oauthConfigFromEnv() && user.role !== "member") {
+      return reply.code(403).send({ error: "trusted_role_from_issuer" });
+    }
     const { plaintext, hash } = newKey();
     const expires = new Date(Date.now() + 24 * 3600000);
     await pool.query(
@@ -105,6 +112,12 @@ export function registerUserRoutes(app: FastifyInstance) {
     const parsed = creds.extend({ role: z.enum(["admin", "member", "approver"]).default("member") })
       .safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_user" });
+    // §9.3/§14: when an external issuer is configured it is the sole source of
+    // the trusted human roles. The API may vouch for members; it may never
+    // mint an admin or approver, itself or anyone else.
+    if (oauthConfigFromEnv() && parsed.data.role !== "member") {
+      return reply.code(403).send({ error: "trusted_role_from_issuer" });
+    }
     try {
       const created = await pool.query(
         "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role, created_at",
@@ -144,6 +157,11 @@ export function registerUserRoutes(app: FastifyInstance) {
     const owner = await pool.query("SELECT id, role FROM users WHERE id = $1",
       [(req.params as { id: string }).id]);
     if (!owner.rows[0]) return reply.code(404).send({ error: "no_user" });
+    // Same rule as user creation: in OAuth mode the approve/admin scopes are
+    // issued by the trusted issuer, not minted here (§14).
+    if (oauthConfigFromEnv() && parsed.data.scopes.some((s) => s === "admin" || s === "approve")) {
+      return reply.code(403).send({ error: "trusted_role_from_issuer" });
+    }
     const allowed = ROLE_SCOPES[owner.rows[0].role] ?? [];
     // A key can never exceed its owner's role, and only an admin principal
     // reaches this route, so privilege flows one way only.
@@ -245,6 +263,7 @@ export function registerUserRoutes(app: FastifyInstance) {
       const created = await pool.query(
         "INSERT INTO workspaces (name) VALUES ($1) RETURNING id, name, created_at",
         [parsed.data.name]);
+      await ensureDefaultSpanRetention(pool, created.rows[0].id);
       await audit(pool, { actor_type: "user",
         actor_id: req.principal?.userId ?? undefined, action: "workspace.create",
         resource_type: "workspace", resource_id: created.rows[0].id,

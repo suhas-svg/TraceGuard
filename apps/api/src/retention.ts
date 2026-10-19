@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import type { PoolClient } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { pool, retentionPool } from "./db.js";
 import { audit } from "./audit.js";
 
@@ -15,6 +15,22 @@ async function defaultWorkspaceId(client: PoolClient): Promise<string> {
   if (found.rows[0]) return found.rows[0].id;
   const created = await client.query("INSERT INTO workspaces (name) VALUES ('default') RETURNING id");
   return created.rows[0].id;
+}
+
+// §11.4: migration 026 seeded the default trace rule only for workspaces that
+// already existed. Every workspace created from now on gets the same 7-day /
+// 100,000-span rule at birth, so the retention default is real on a fresh
+// install and not just on migrated ones.
+export async function ensureDefaultSpanRetention(
+  db: Pool | PoolClient,
+  workspaceId: string
+): Promise<void> {
+  await db.query(
+    `INSERT INTO retention_rules (workspace_id, name, target, older_than_days, max_rows, enabled)
+     VALUES ($1, 'default-span-retention', 'spans', 7, 100000, true)
+     ON CONFLICT (workspace_id, name) DO NOTHING`,
+    [workspaceId]
+  );
 }
 
 async function applyRule(

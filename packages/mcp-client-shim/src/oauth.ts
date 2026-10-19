@@ -56,20 +56,35 @@ export async function discoverProtectedResource(
   resource: string,
   fetchImpl: typeof fetch
 ): Promise<ProtectedResourceMetadata> {
-  const res = await fetchImpl(wellKnown(resource, "/.well-known/oauth-protected-resource"), {
-    headers: { accept: "application/json" }
-  });
-  if (!res.ok) {
-    throw new OAuthClientError(
-      `protected-resource metadata is unavailable (HTTP ${res.status})`,
-      "OAUTH_METADATA_UNAVAILABLE"
-    );
+  // RFC 9728 §3.1: a resource with a path publishes its metadata at the
+  // path-appended location. Clients must try that one first; deployments
+  // that only serve the bare document keep working through the fallback.
+  const resourceUrl = new URL(resource);
+  const candidates: URL[] = [];
+  const path = resourceUrl.pathname.replace(/\/+$/, "");
+  if (path) {
+    candidates.push(new URL(`/.well-known/oauth-protected-resource${path}`, resourceUrl));
   }
-  const metadata = (await res.json()) as ProtectedResourceMetadata;
-  if (typeof metadata.resource !== "string") {
-    throw new OAuthClientError("protected-resource metadata names no resource");
+  candidates.push(new URL("/.well-known/oauth-protected-resource", resourceUrl));
+
+  let lastStatus = 0;
+  for (const candidate of candidates) {
+    const res = await fetchImpl(candidate, { headers: { accept: "application/json" } });
+    if (!res.ok) {
+      lastStatus = res.status;
+      if (res.status !== 404) break;
+      continue;
+    }
+    const metadata = (await res.json()) as ProtectedResourceMetadata;
+    if (typeof metadata.resource !== "string") {
+      throw new OAuthClientError("protected-resource metadata names no resource");
+    }
+    return metadata;
   }
-  return metadata;
+  throw new OAuthClientError(
+    `protected-resource metadata is unavailable (HTTP ${lastStatus})`,
+    "OAUTH_METADATA_UNAVAILABLE"
+  );
 }
 
 export async function discoverAuthorizationServer(
@@ -196,13 +211,21 @@ export class OAuthTokenSource {
       );
     }
     const payload = (await res.json()) as {
-      access_token?: string; token_type?: string; expires_in?: number;
+      access_token?: string; token_type?: string; expires_in?: number; iss?: string;
     };
     if (typeof payload.access_token !== "string" || !payload.access_token) {
       throw new OAuthClientError("token endpoint returned no access token");
     }
     if (payload.token_type && payload.token_type.toLowerCase() !== "bearer") {
       throw new OAuthClientError(`token endpoint returned type "${payload.token_type}"`);
+    }
+    // RFC 9207: when the issuer stamps the response, it must be the issuer
+    // this flow already decided to trust — a mismatch means a confused deputy.
+    if (typeof payload.iss === "string" && normalize(payload.iss) !== normalize(issuer)) {
+      throw new OAuthClientError(
+        `token endpoint minted the token for issuer "${payload.iss}" instead of "${issuer}"`,
+        "OAUTH_ISSUER_MISMATCH"
+      );
     }
     const lifetimeMs =
       (typeof payload.expires_in === "number" && payload.expires_in > 0 ? payload.expires_in : 300) * 1000;

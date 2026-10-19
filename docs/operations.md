@@ -84,8 +84,9 @@ These are endpoints rather than in-process schedulers, so one operator decision
 drives all of them.
 
 ```bash
-# Close runs orphaned by a crashed SDK. Idempotent, and audited.
-curl -fsS -X POST "$API/v1/admin/finalize-stale-runs?older_than_seconds=3600" \
+# Close runs orphaned by a crashed SDK (§11.3: a run silent for 15 minutes is
+# ORPHANED, not failed). Idempotent, and audited.
+curl -fsS -X POST "$API/v1/admin/finalize-stale-runs?older_than_seconds=900" \
   -H "Authorization: Bearer $API_KEY"
 
 # Flag child spans whose parent never arrived (children may arrive first).
