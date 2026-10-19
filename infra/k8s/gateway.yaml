@@ -68,6 +68,10 @@ spec:
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: APPROVAL_TTL_SECONDS } }
             - name: APPROVAL_CLAIM_LEASE_SECONDS
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: APPROVAL_CLAIM_LEASE_SECONDS, optional: true } }
+            - name: AUDIT_CHECKPOINT_KEY
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: AUDIT_CHECKPOINT_KEY, optional: true } }
+            - name: AUDIT_CHECKPOINT_PUBLIC_KEY
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: AUDIT_CHECKPOINT_PUBLIC_KEY, optional: true } }
             - name: ALLOW_PRIVATE_UPSTREAMS
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: ALLOW_PRIVATE_UPSTREAMS } }
             - name: DASHBOARD_ORIGIN

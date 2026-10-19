@@ -93,8 +93,22 @@ curl -fsS -X POST "$API/v1/admin/finalize-stale-runs?older_than_seconds=900" \
 curl -fsS -X POST "$API/v1/admin/finalize-orphan-spans?older_than_seconds=900" \
   -H "Authorization: Bearer $API_KEY"
 
+# Recover budget holds abandoned past their TTL (§12.3).
+curl -fsS -X POST "$API/v1/admin/sweep-budget-holds" \
+  -H "Authorization: Bearer $API_KEY"
+
 # Apply every enabled retention rule and report per-rule deletion counts.
 curl -fsS -X POST "$API/v1/retention/run" -H "Authorization: Bearer $API_KEY"
+
+# Before any audit pruning: sign a checkpoint over the chain head and keep the
+# signed copy outside the database and containers (§10.3/FR-019). Checkpoints
+# and pruning live on the gateway listener; pruning stays deliberate, never
+# scheduled.
+curl -fsS -X POST "http://localhost:8091/v1/audit/checkpoints" \
+  -H "Authorization: Bearer $API_KEY"
+curl -fsS -X POST "http://localhost:8091/v1/audit/prune" \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"checkpoint_id":"<checkpoint-id>"}'
 ```
 
 Suggested schedule: finalize every 15 minutes, retention nightly. Retention

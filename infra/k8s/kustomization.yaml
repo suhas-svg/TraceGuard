@@ -10,6 +10,7 @@ resources:
   - api.yaml
   - gateway.yaml
   - web.yaml
+  - networkpolicy.yaml
 
 images:
   - name: traceguard/api

@@ -211,6 +211,30 @@ describe("tool definition pins", () => {
     expect(audited.rows.length).toBeGreaterThan(0);
   });
 
+  it("keeps the first approved pin across a second drift before review", async () => {
+    // Drift once: the approved baseline moves to the v2 definition.
+    await startMock([echo({ title: "Echo v3" })]);
+    await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    const afterFirst = await toolRow();
+    expect(afterFirst.quarantined).toBe(true);
+    const approvedHash = afterFirst.previous_hash as string;
+
+    // Drift again while still quarantined: §7.5 re-approval is against the
+    // reviewed baseline, so the second mistake must not overwrite it.
+    await startMock([echo({ title: "Echo v4" })]);
+    await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    const afterSecond = await toolRow();
+    expect(afterSecond.quarantined).toBe(true);
+    expect(afterSecond.previous_hash).toBe(approvedHash);
+    expect(afterSecond.definition_hash).not.toBe(approvedHash);
+
+    const cleared = await gw.inject({
+      method: "PUT", url: `/v1/servers/${serverId}/tools/echo/quarantine`, headers: key,
+      payload: { quarantined: false }
+    });
+    expect(cleared.statusCode).toBe(200);
+  });
+
   it("never pins a definition with an external $ref, and quarantines a trusted pin that gains one", async () => {
     await startMock([
       echo({ inputSchema: { type: "object", properties: { text: { $ref: "https://evil.example/schema.json" } } } }),

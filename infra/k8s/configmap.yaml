@@ -10,6 +10,11 @@ data:
   GATEWAY_CONTROL_PORT: "8093"
   APPROVAL_TTL_SECONDS: "300"
   APPROVAL_CLAIM_LEASE_SECONDS: "30"
+  # §10.3/FR-019: checkpoint signing material for the gateway. Empty by
+  # default; fill from the operator host. Unset -> checkpoint endpoints
+  # answer 503 and pruning is refused.
+  AUDIT_CHECKPOINT_KEY: ""
+  AUDIT_CHECKPOINT_PUBLIC_KEY: ""
   ALLOW_PRIVATE_UPSTREAMS: "false"
   DASHBOARD_ORIGIN: "http://localhost:5173"
   # The gateway's accepted-policy-version anchor (backed by the gateway-state

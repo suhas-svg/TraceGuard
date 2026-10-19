@@ -2,7 +2,7 @@ import Fastify from "fastify";
 import { randomUUID } from "node:crypto";
 import { pool, isDbReady } from "./db.js";
 import { ingestBodySchema } from "@traceguard/schemas";
-import { registerBudgetRoutes } from "./budgets.js";
+import { registerBudgetRoutes, sweepAllExpiredHolds } from "./budgets.js";
 import { registerEvalRoutes } from "./evals.js";
 import { registerWebhookRoutes } from "./webhooks.js";
 import { ensureDefaultSpanRetention, registerRetentionRoutes } from "./retention.js";
@@ -692,6 +692,19 @@ export function buildApp() {
   // Unresolved parents that never arrived are marked ORPHANED, not left
   // half-linked forever (§11.3). Cron-invoked like the run finalizer, with
   // the spec's 15 minute default.
+  // §12.3: abandoned reservations must not wedge a budget forever. The
+  // per-budget reclaims run lazily on that budget's next touch; this
+  // endpoint sweeps every hold past its TTL in one pass for the cron.
+  app.post("/v1/admin/sweep-budget-holds", async () => {
+    const totals = await sweepAllExpiredHolds(pool);
+    if (totals.freed_micro > 0 || totals.budgets > 0) {
+      await audit(pool, { actor_type: "system", action: "budget.holds_swept",
+        resource_type: "budget", result: "success",
+        metadata: { freed_micro: totals.freed_micro, budgets: totals.budgets } });
+    }
+    return totals;
+  });
+
   app.post("/v1/admin/finalize-orphan-spans", async (req) => {
     const q = req.query as { older_than_seconds?: string };
     const seconds = Math.min(Math.max(Number(q.older_than_seconds ?? 900), 60), 86400);

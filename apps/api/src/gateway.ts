@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
-import { verifyAuditChain } from "@traceguard/audit-chain";
+import { signCheckpoint, verifyAuditChain, verifyCheckpoint, type CheckpointPayload } from "@traceguard/audit-chain";
 import { argConditionsSchema } from "@traceguard/schemas";
 import {
   argsHash,
@@ -286,7 +286,8 @@ export function buildGateway() {
           // diff; re-approval records a new version instead of rewriting it.
           await client.query(
             `UPDATE server_tools SET description=$3, input_schema=$4::jsonb,
-               previous_definition=definition, previous_hash=definition_hash,
+               previous_definition=CASE WHEN quarantined THEN previous_definition ELSE definition END,
+          previous_hash=CASE WHEN quarantined THEN previous_hash ELSE definition_hash END,
                definition=$5::jsonb, definition_hash=$6, definition_version=definition_version+1,
                quarantined=true, quarantine_reason='definition changed', updated_at=now()
              WHERE server_id=$1 AND tool_name=$2`,
@@ -1278,6 +1279,76 @@ export function buildGateway() {
   // table is append-only at the database layer (migration 022), so any
   // mutation it detects came from something with schema rights — which is
   // exactly the party an operator-controlled checkpoint exists to catch.
+  // §10.3: a checkpoint signs the chain head with a key held outside the
+  // database and every container. The signed payload is returned so an
+  // operator can store it externally; the row here is the working copy the
+  // prune and the verifier anchor against.
+  app.post("/v1/audit/checkpoints", async (req, reply) => {
+    const privateKeyPem = process.env.AUDIT_CHECKPOINT_KEY;
+    if (!privateKeyPem) return reply.code(503).send({ error: "checkpoint_key_unconfigured" });
+    const head = await pool.query(
+      "SELECT hash, timestamp FROM audit_events ORDER BY timestamp DESC, id DESC LIMIT 1"
+    );
+    if (!head.rows[0]) return reply.code(409).send({ error: "audit_chain_empty" });
+    const count = await pool.query("SELECT count(*)::bigint AS n FROM audit_events");
+    const payload: CheckpointPayload = {
+      v: 1,
+      created_at: new Date().toISOString(),
+      up_to_timestamp: new Date(head.rows[0].timestamp).toISOString(),
+      up_to_hash: head.rows[0].hash as string,
+      event_count: Number(count.rows[0].n)
+    };
+    let signed;
+    try {
+      signed = signCheckpoint(payload, privateKeyPem);
+    } catch {
+      return reply.code(503).send({ error: "checkpoint_key_invalid" });
+    }
+    const inserted = await pool.query(
+      `INSERT INTO audit_checkpoints (up_to_timestamp, up_to_hash, event_count, signature, key_id, payload)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, created_at`,
+      [payload.up_to_timestamp, payload.up_to_hash, payload.event_count,
+       signed.signature, signed.key_id, JSON.stringify(payload)]
+    );
+    await audit(pool, { actor_type: "admin", action: "audit.checkpoint.created",
+      resource_type: "audit_checkpoint", resource_id: inserted.rows[0].id, result: "success",
+      metadata: { up_to_hash: payload.up_to_hash, event_count: payload.event_count } });
+    return reply.code(201).send({ id: inserted.rows[0].id, created_at: inserted.rows[0].created_at,
+      payload, signature: signed.signature, key_id: signed.key_id });
+  });
+
+  // §10.3 / FR-019: pruning is refused unless a valid checkpoint covers the
+  // cut. The definer helper keeps the checkpoint's head row, so the surviving
+  // chain begins with a broken link the verifier can re-anchor.
+  app.post("/v1/audit/prune", async (req, reply) => {
+    const parsed = z.object({ checkpoint_id: z.string().uuid() }).safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_prune" });
+    const publicKeyPem = process.env.AUDIT_CHECKPOINT_PUBLIC_KEY;
+    if (!publicKeyPem) return reply.code(503).send({ error: "checkpoint_public_key_unconfigured" });
+    const cp = await pool.query(
+      "SELECT id, up_to_hash, payload, signature FROM audit_checkpoints WHERE id = $1",
+      [parsed.data.checkpoint_id]
+    );
+    if (!cp.rows[0]) return reply.code(404).send({ error: "checkpoint_not_found" });
+    if (!verifyCheckpoint(cp.rows[0].payload as CheckpointPayload, cp.rows[0].signature, publicKeyPem)) {
+      await audit(pool, { actor_type: "admin", action: "audit.segment.prune_rejected",
+        resource_type: "audit_checkpoint", resource_id: cp.rows[0].id, result: "rejected",
+        metadata: { reason: "checkpoint signature does not verify" } });
+      return reply.code(403).send({ error: "checkpoint_signature_invalid" });
+    }
+    const pruned = await pool.query("SELECT prune_audit_events($1) AS deleted", [cp.rows[0].up_to_hash]);
+    if (Number(pruned.rows[0].deleted) < 0) {
+      await audit(pool, { actor_type: "admin", action: "audit.segment.prune_rejected",
+        resource_type: "audit_checkpoint", resource_id: cp.rows[0].id, result: "rejected",
+        metadata: { reason: "checkpoint does not cover the chain" } });
+      return reply.code(409).send({ error: "checkpoint_does_not_cover" });
+    }
+    await audit(pool, { actor_type: "admin", action: "audit.segment.pruned",
+      resource_type: "audit_checkpoint", resource_id: cp.rows[0].id, result: "success",
+      metadata: { up_to_hash: cp.rows[0].up_to_hash, deleted: Number(pruned.rows[0].deleted) } });
+    return { pruned: Number(pruned.rows[0].deleted), checkpoint_id: cp.rows[0].id };
+  });
+
   app.post("/v1/audit/verify", async (req) => {
     const q = (req.query ?? {}) as { limit?: string };
     const limit = Math.min(Math.max(Number(q.limit ?? 200_000), 1), 1_000_000);
@@ -1294,12 +1365,34 @@ export function buildGateway() {
     const truncated = res.rows.length > limit;
     const rows = res.rows.slice(0, limit) as Parameters<typeof verifyAuditChain>[0];
     const verification = verifyAuditChain(rows);
+    // §10.3: a chain whose first link is broken is only trustworthy if the
+    // missing prefix is covered by a signed checkpoint held outside the
+    // database. Verify that anchor before calling the gap corruption.
+    let anchored: { checkpoint_id: string; up_to_timestamp: string; up_to_hash: string; event_count: number } | null = null;
+    const first = verification.problems[0];
+    const checkpointPublicKey = process.env.AUDIT_CHECKPOINT_PUBLIC_KEY;
+    if (first && rows.length > 0 && first.id === rows[0].id && first.problem.startsWith("chain link broken") && checkpointPublicKey) {
+      const cp = await pool.query(
+        `SELECT id, up_to_timestamp, up_to_hash, event_count, payload, signature FROM audit_checkpoints
+          WHERE up_to_hash IN ($1, $2) AND up_to_timestamp <= $3
+          ORDER BY created_at DESC LIMIT 1`,
+        [rows[0].hash ?? "", rows[0].prev_hash ?? "", rows[0].timestamp]
+      );
+      if (cp.rows[0] && verifyCheckpoint(cp.rows[0].payload as CheckpointPayload, cp.rows[0].signature, checkpointPublicKey)) {
+        verification.problems.shift();
+        verification.ok = verification.problems.length === 0;
+        anchored = { checkpoint_id: cp.rows[0].id,
+          up_to_timestamp: new Date(cp.rows[0].up_to_timestamp).toISOString(),
+          up_to_hash: cp.rows[0].up_to_hash, event_count: Number(cp.rows[0].event_count) };
+      }
+    }
     // A bounded read cannot prove the tail it never saw; say so instead of
     // reporting a prefix as the whole chain.
     return {
       ...verification,
       truncated,
-      checked_to: rows.length > 0 ? rows[rows.length - 1].hash : null
+      checked_to: rows.length > 0 ? rows[rows.length - 1].hash : null,
+      anchored
     };
   });
 

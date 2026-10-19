@@ -83,6 +83,11 @@ services:
       GATEWAY_CONTROL_PORT: 8093
       APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS:-300}
       APPROVAL_CLAIM_LEASE_SECONDS: ${APPROVAL_CLAIM_LEASE_SECONDS:-30}
+      # §10.3/FR-019: PEM strings for the audit checkpoint keypair. The private
+      # key belongs to the operator host (never to the DB or the repo); export
+      # it only for a demo/CI run. Unset: checkpoint route answers 503.
+      AUDIT_CHECKPOINT_KEY: ${AUDIT_CHECKPOINT_KEY:-}
+      AUDIT_CHECKPOINT_PUBLIC_KEY: ${AUDIT_CHECKPOINT_PUBLIC_KEY:-}
       # Demo upstream (mock-tools) lives on the private `tools` network, so
       # the reference deployment opts in explicitly. FR-005: production
       # deployments leave this off and rely on egress controls.

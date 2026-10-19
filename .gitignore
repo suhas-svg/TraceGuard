@@ -12,3 +12,6 @@ playwright-report/
 # are host state, never repository content.
 policy-keys/
 gateway-state/
+
+demo-policy-keys/
+

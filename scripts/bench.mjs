@@ -9,11 +9,15 @@
 //
 // Warm the database first (the numbers below the table's first row are cold
 // starts, which are not what the targets are about).
+//
+// The §14 thresholds are a gate: the script prints PASS/FAIL per target and
+// exits non-zero when any p95 misses its budget.
 
 const BASE = process.env.BASE ?? "http://localhost:8090";
 const GW = process.env.GW ?? "http://localhost:8091";
 const KEY = process.env.KEY ?? process.env.API_KEY ?? "dev_key_change_me";
 const N = Number(process.env.N ?? 50);
+const TARGETS = { dashboardP95: 500, ingestP95: 3000, gatewayOverheadP95: 100 };
 
 const auth = { Authorization: `Bearer ${KEY}` };
 
@@ -163,5 +167,21 @@ if (ovh) {
   console.log(`\nGateway policy overhead: not measured (set DATABASE_URL to read`);
   console.log(`policy_decisions.overhead_ms, or run the gateway first).`);
 }
+// NFR-001..003 as a gate: any miss makes the run fail, so the numbers are
+// usable by a script and not only by a reader.
+const byLabel = (frag) => rows.find((r) => !r.skipped && r.label.includes(frag));
+const overviewRow = byLabel("GET /v1/overview");
+const ingestRow = byLabel("POST /v1/ingest/events");
+let failed = false;
+const verdict = (nfr, label, actual, budget) => {
+  const inside = actual !== null && actual < budget;
+  if (!inside) failed = true;
+  console.log(`${inside ? "PASS" : "FAIL"} ${nfr} ${label}: p95 ${actual === null ? "n/a" : num(actual)} < ${budget}ms`);
+};
+console.log("");
+verdict("NFR-001", "gateway policy overhead", ovh?.p95 ?? null, TARGETS.gatewayOverheadP95);
+verdict("NFR-003", "dashboard queries", overviewRow?.p95 ?? null, TARGETS.dashboardP95);
+verdict("NFR-002", "ingest-to-visible", ingestRow?.p95 ?? null, TARGETS.ingestP95);
 console.log(`\nCold starts miss all three; warm the database and rerun before quoting`);
 console.log(`any of these numbers.\n`);
+process.exitCode = failed ? 1 : 0;
