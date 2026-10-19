@@ -95,18 +95,39 @@ message Resource {
 }
 `;
 
-let requestType: protobuf.Type | null = null;
+const RESPONSE_PROTO = `
+syntax = "proto3";
+package opentelemetry.proto.collector.trace.v1;
 
-function getRequestType(): protobuf.Type {
-  if (!requestType) {
+message ExportTraceServiceResponse {
+  ExportTracePartialSuccess partial_success = 1;
+}
+message ExportTracePartialSuccess {
+  int64 rejected_spans = 1;
+  string error_message = 2;
+}
+`;
+
+let protoRoot: protobuf.Root | null = null;
+
+function getRoot(): protobuf.Root {
+  if (!protoRoot) {
     const root = new protobuf.Root();
-    for (const text of [COMMON_PROTO, RESOURCE_PROTO, TRACE_PROTO]) {
+    for (const text of [COMMON_PROTO, RESOURCE_PROTO, TRACE_PROTO, RESPONSE_PROTO]) {
       protobuf.parse(text, root);
     }
     root.resolveAll();
-    requestType = root.lookupType("opentelemetry.proto.trace.v1.ExportTraceServiceRequest");
+    protoRoot = root;
   }
-  return requestType;
+  return protoRoot;
+}
+
+function getRequestType(): protobuf.Type {
+  return getRoot().lookupType("opentelemetry.proto.trace.v1.ExportTraceServiceRequest");
+}
+
+function getResponseType(): protobuf.Type {
+  return getRoot().lookupType("opentelemetry.proto.collector.trace.v1.ExportTraceServiceResponse");
 }
 
 export interface JsonShape {
@@ -182,8 +203,34 @@ function normalizeSpan(s: Record<string, unknown>): Record<string, unknown> {
   };
 }
 
-export function encodeEmptyTraceResponse(): Buffer {
-  return Buffer.from([0x0a, 0x00]);
+// The collector protocol answers with partial_success when anything was
+// rejected; an empty ExportTraceServiceResponse means full acceptance.
+export interface TracePartialSuccess {
+  rejectedSpans?: number;
+  errorMessage?: string;
+}
+
+export function encodeTraceResponse(partial: TracePartialSuccess = {}): Buffer {
+  const type = getResponseType();
+  const message: Record<string, unknown> = {};
+  const rejected = partial.rejectedSpans ?? 0;
+  if (rejected > 0 || partial.errorMessage) {
+    message.partialSuccess = {
+      rejectedSpans: rejected,
+      ...(partial.errorMessage ? { errorMessage: partial.errorMessage } : {})
+    };
+  }
+  return Buffer.from(type.encode(type.fromObject(message)).finish());
+}
+
+// Test and tooling helper: decodes what encodeTraceResponse produced.
+export function decodeTraceResponse(bytes: Buffer): {
+  partialSuccess?: { rejectedSpans?: string; errorMessage?: string };
+} {
+  const type = getResponseType();
+  return type.toObject(type.decode(bytes), { longs: String, defaults: false }) as {
+    partialSuccess?: { rejectedSpans?: string; errorMessage?: string };
+  };
 }
 
 // Test and tooling helper: builds binary bytes from a plain object using the

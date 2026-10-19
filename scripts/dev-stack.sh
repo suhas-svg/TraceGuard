@@ -16,6 +16,7 @@ set +a
 
 export PORT="${PORT:-8090}"
 export GATEWAY_PORT="${GATEWAY_PORT:-8091}"
+export GATEWAY_CONTROL_PORT="${GATEWAY_CONTROL_PORT:-8093}"
 export MOCK_TOOLS_PORT="${MOCK_TOOLS_PORT:-8092}"
 export ALLOW_PRIVATE_UPSTREAMS=true
 
@@ -73,11 +74,12 @@ for _ in $(seq 1 40); do
 done
 curl -fsS "http://localhost:$PORT/readyz" >/dev/null 2>&1 || ready=0
 curl -fsS "http://localhost:$GATEWAY_PORT/healthz" >/dev/null 2>&1 || ready=0
+curl -fsS "http://localhost:$GATEWAY_CONTROL_PORT/healthz" >/dev/null 2>&1 || ready=0
 curl -fsS "http://localhost:$MOCK_TOOLS_PORT/hits" >/dev/null 2>&1 || ready=0
 curl -fsS "http://localhost:5173" >/dev/null 2>&1 || ready=0
 
 if [ "$ready" = 1 ]; then
-  echo "up: dashboard http://localhost:5173  api http://localhost:$PORT  gateway http://localhost:$GATEWAY_PORT"
+  echo "up: dashboard http://localhost:5173  api http://localhost:$PORT  gateway http://localhost:$GATEWAY_PORT  approval control http://localhost:$GATEWAY_CONTROL_PORT"
 else
   echo "one or more processes failed to start; see /tmp/stack-*.log"
 fi

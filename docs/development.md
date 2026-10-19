@@ -15,8 +15,9 @@ Run each process in its own shell:
 # API on :8090
 DATABASE_URL=... API_KEY=... PORT=8090 DASHBOARD_ORIGIN=http://localhost:5173 \
   node apps/api/dist/index.js
-# gateway on :8091
+# gateway on :8091 (approval control listener on :8093)
 DATABASE_URL=... API_KEY=... APPROVER_KEY=... GATEWAY_PORT=8091 \
+  GATEWAY_CONTROL_PORT=8093 \
   APPROVAL_TTL_SECONDS=300 ALLOW_PRIVATE_UPSTREAMS=true \
   node apps/api/dist/gateway.js
 # mock tools on :8092

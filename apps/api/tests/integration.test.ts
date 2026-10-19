@@ -5,7 +5,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { buildApp } from "../src/index.js";
-import { buildGateway } from "../src/gateway.js";
+import { buildGateway, buildGatewayControl } from "../src/gateway.js";
 import { pool } from "../src/db.js";
 import { publishTestPolicy } from "./policy-helper.js";
 
@@ -14,6 +14,9 @@ import { publishTestPolicy } from "./policy-helper.js";
 describe("integration and security", () => {
   const api = buildApp();
   const gw = buildGateway();
+  // The human approval surface on its own listener: agent credentials are
+  // rejected there, and the agent-facing port no longer serves the queue.
+  const ctl = buildGatewayControl();
   const key = { authorization: "Bearer test_key" };
   const approver = { authorization: "Bearer test_approver" };
   const tag = Date.now().toString(36);
@@ -55,6 +58,7 @@ describe("integration and security", () => {
     httpServer.close();
     await api.close();
     await gw.close();
+    await ctl.close();
     await pool.end();
   });
 
@@ -220,10 +224,10 @@ describe("integration and security", () => {
     expect(call.statusCode).toBe(202);
     expect(upstreamHits).toBe(before);
     const approvalId = call.json().approval_id;
-    const agentDecision = await gw.inject({ method: "POST", url: `/v1/approvals/${approvalId}/decision`,
+    const agentDecision = await ctl.inject({ method: "POST", url: `/_control/v1/approvals/${approvalId}/decision`,
       headers: agentKey, payload: { approved: true } });
     expect(agentDecision.statusCode).toBe(403);
-    const decided = await gw.inject({ method: "POST", url: `/v1/approvals/${approvalId}/decision`,
+    const decided = await ctl.inject({ method: "POST", url: `/_control/v1/approvals/${approvalId}/decision`,
       headers: approver, payload: { approved: true, reason: "test" } });
     expect(decided.json().status).toBe("approved");
     // Sealed at rest while pending/approved: ciphertext, never the plaintext.
@@ -335,15 +339,19 @@ describe("integration and security", () => {
     };
     const first = await api.inject({ method: "POST", url: "/v1/traces", headers: key, payload });
     expect(first.statusCode).toBe(200);
-    expect(first.json()).toMatchObject({ accepted: 2, duplicates: 0 });
+    expect(first.json().partialSuccess.rejectedSpans).toBe(0);
     const retry = await api.inject({ method: "POST", url: "/v1/traces", headers: key, payload });
-    expect(retry.json()).toMatchObject({ accepted: 0, duplicates: 2 });
+    // Retries dedupe on the derived event ids: the batch is accepted again but
+    // stores nothing new.
+    expect(retry.json().partialSuccess.rejectedSpans).toBe(0);
     const runs = await api.inject({ method: "GET", url: "/v1/runs?limit=50", headers: key });
     const run = runs.json().items.find((r: { agent_name: string }) => r.agent_name === `otel-${tag}`);
     expect(run).toBeDefined();
     const trace = await api.inject({ method: "GET", url: `/v1/runs/${run.id}/trace`, headers: key });
     const ops = trace.json().spans.map((s: { operation_type: string }) => s.operation_type).sort();
     expect(ops).toEqual(["model.request", "tool.invocation"]);
+    // Both batches landed the same two spans, not four.
+    expect(trace.json().spans).toHaveLength(2);
     await pool.query("UPDATE runs SET started_at = now() - interval '1 hour' WHERE id = $1", [run.id]);
     const stale = await api.inject({ method: "POST",
       url: "/v1/admin/finalize-stale-runs?older_than_seconds=60", headers: key });
@@ -485,7 +493,9 @@ describe("integration and security", () => {
     };
     const jsonAgain = await api.inject({ method: "POST", url: "/v1/traces", headers: key,
       payload: { resourceSpans: [{ resource: { attributes: [{ key: "service.name", value: { stringValue: "pb-" + tag } }] }, scopeSpans: [{ spans: [jsonSpan] }] }] } });
-    expect(jsonAgain.json()).toMatchObject({ accepted: 0, duplicates: 1 });
+    expect(jsonAgain.json().partialSuccess.rejectedSpans).toBe(0);
+    const stillOne = await api.inject({ method: "GET", url: `/v1/runs/${run.id}/trace`, headers: key });
+    expect(stillOne.json().spans).toHaveLength(1);
   });
 
   it("reconciles estimates against provider actuals", async () => {
@@ -532,7 +542,7 @@ describe("integration and security", () => {
     const second = await api.inject({ method: "POST", url: "/v1/auth/register",
       payload: { email: `other-${tag}@example.com`, password: "long-password-111" } });
     expect(second.statusCode).toBe(403);
-    // The env key keeps full access, so it can mint a member and a key for it.
+    // The env key keeps administrative access, so it can mint a member and a key for it.
     const mk = await api.inject({ method: "POST", url: "/v1/users", headers: key,
       payload: { email: `agent-${tag}@example.com`, password: "long-password-222", role: "member" } });
     expect(mk.statusCode).toBe(201);
@@ -561,8 +571,8 @@ describe("integration and security", () => {
     const ing = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: agentAuth,
       payload: { events: [oneEvent] } });
     expect(ing.statusCode).toBe(200);
-    // Agent key at the approval endpoint: scoped out, not just unauthorized.
-    const dec = await gw.inject({ method: "POST", url: "/v1/approvals/00000000-0000-0000-0000-000000000000/decision",
+    // Agent key at the approval control listener: scoped out, not just unauthorized.
+    const dec = await ctl.inject({ method: "POST", url: "/_control/v1/approvals/00000000-0000-0000-0000-000000000000/decision",
       headers: agentAuth, payload: { approved: true } });
     expect(dec.statusCode).toBe(403);
     // Approver-role key: the mirror image.
@@ -735,7 +745,7 @@ describe("integration and security", () => {
       payload: { server_id: serverId, tool: "echo", arguments: { text: "racy" }, caller: "t" } });
     expect(call.statusCode).toBe(202);
     const approvalId = call.json().approval_id;
-    await gw.inject({ method: "POST", url: `/v1/approvals/${approvalId}/decision`, headers: approver,
+    await ctl.inject({ method: "POST", url: `/_control/v1/approvals/${approvalId}/decision`, headers: approver,
       payload: { approved: true } });
     const before = upstreamHits;
     const payload = { server_id: serverId, tool: "echo", arguments: { text: "racy" }, caller: "t",
@@ -835,7 +845,7 @@ describe("integration and security", () => {
         request_id: `stale-${tag}` } });
     expect(call.statusCode).toBe(202);
     const approvalId = call.json().approval_id;
-    const decided = await gw.inject({ method: "POST", url: `/v1/approvals/${approvalId}/decision`,
+    const decided = await ctl.inject({ method: "POST", url: `/_control/v1/approvals/${approvalId}/decision`,
       headers: approver, payload: { approved: true, reason: "looked fine then" } });
     expect(decided.statusCode).toBe(200);
     // A deny rule lands after the approval was issued. It must win: an
@@ -934,11 +944,11 @@ describe("integration and security", () => {
   it("keeps only a redacted summary when an approval is denied or consumed", async () => {
     const secret = `sk-live-${randomUUID().replace(/-/g, "")}`;
     const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
-      payload: { server_id: serverId, tool: "echo", arguments: { text: secret }, caller: "t",
+      payload: { server_id: serverId, tool: "echo", arguments: { text: secret }, caller: "summ-t",
         request_id: `summ-${tag}` } });
     expect(call.statusCode).toBe(202);
     const deniedId = call.json().approval_id;
-    const dec = await gw.inject({ method: "POST", url: `/v1/approvals/${deniedId}/decision`,
+    const dec = await ctl.inject({ method: "POST", url: `/_control/v1/approvals/${deniedId}/decision`,
       headers: approver, payload: { approved: false, reason: "no" } });
     expect(dec.statusCode).toBe(200);
     const deniedRow = (await pool.query(
@@ -950,17 +960,17 @@ describe("integration and security", () => {
     expect(deniedRow.args_summary).not.toContain(secret);
     // Consumed: the call executes, then the sealed arguments are dropped.
     const call2 = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
-      payload: { server_id: serverId, tool: "echo", arguments: { text: `ok-${tag}` }, caller: "t",
+      payload: { server_id: serverId, tool: "echo", arguments: { text: `ok-${tag}` }, caller: "summ-t",
         request_id: `summ2-${tag}` } });
     expect(call2.statusCode).toBe(202);
     const okId = call2.json().approval_id;
-    await gw.inject({ method: "POST", url: `/v1/approvals/${okId}/decision`, headers: approver,
+    await ctl.inject({ method: "POST", url: `/_control/v1/approvals/${okId}/decision`, headers: approver,
       payload: { approved: true } });
     const midRow = (await pool.query("SELECT args_enc, args FROM approvals WHERE id = $1", [okId])).rows[0];
     expect(midRow.args_enc).toBe(true);
     expect(JSON.stringify(midRow.args)).not.toContain(`ok-${tag}`);
     const retry = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
-      payload: { server_id: serverId, tool: "echo", arguments: { text: `ok-${tag}` }, caller: "t",
+      payload: { server_id: serverId, tool: "echo", arguments: { text: `ok-${tag}` }, caller: "summ-t",
         request_id: `summ2-${tag}`, approval_id: okId } });
     expect(retry.statusCode).toBe(200);
     const goneRow = (await pool.query(
@@ -1348,14 +1358,14 @@ describe("integration and security", () => {
     await publishTestPolicy(pool);
     const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: sweepServerId, tool: "echo", arguments: { text: `sweep-${tag}` },
-        caller: "t", request_id: `sweep-${tag}` } });
+        caller: "sweep-t", request_id: `sweep-${tag}` } });
     expect(call.statusCode).toBe(202);
     const id = call.json().approval_id;
     await pool.query("UPDATE approvals SET expires_at = now() - interval '1 second' WHERE id = $1", [id]);
     // Listing pending runs the sweep: the dead hold leaves the queue.
-    const pending = await gw.inject({ method: "GET", url: "/v1/approvals?status=pending", headers: key });
+    const pending = await ctl.inject({ method: "GET", url: "/_control/v1/approvals?status=pending", headers: approver });
     expect(pending.json().items.find((a: { id: string }) => a.id === id)).toBeUndefined();
-    const expired = await gw.inject({ method: "GET", url: "/v1/approvals?status=expired", headers: key });
+    const expired = await ctl.inject({ method: "GET", url: "/_control/v1/approvals?status=expired", headers: approver });
     const row = expired.json().items.find((a: { id: string }) => a.id === id);
     expect(row).toBeDefined();
     expect(row.args).toEqual({});
@@ -1472,7 +1482,7 @@ describe("integration and security", () => {
     expect(l.json().spent_micro).toBe(900);
   });
 
-  it("withholds pending approval arguments from callers without the approve scope", async () => {
+  it("serves the approval queue only to the approve scope", async () => {
     const wsList = await api.inject({ method: "GET", url: "/v1/workspaces", headers: key });
     const def = wsList.json().items.find((w: { name: string }) => w.name === "default");
     const mu = await api.inject({ method: "POST", url: "/v1/users", headers: key,
@@ -1492,19 +1502,16 @@ describe("integration and security", () => {
     expect(call.statusCode).toBe(202);
     const approvalId = call.json().approval_id;
     // The approver opens the seal for that row...
-    const asApprover = await gw.inject({ method: "GET",
-      url: "/v1/approvals?status=pending&limit=200", headers: approver });
+    const asApprover = await ctl.inject({ method: "GET",
+      url: "/_control/v1/approvals?status=pending&limit=200", headers: approver });
     const forApprover = asApprover.json().items.find((a: { id: string }) => a.id === approvalId);
     expect(forApprover.args.text).toBe("classified-payload");
-    // ...and a read-scoped member of the same workspace, who can see the row,
-    // cannot see inside it.
-    const asMember = await gw.inject({ method: "GET",
-      url: "/v1/approvals?status=pending&limit=200", headers: peeker });
-    expect(asMember.statusCode).toBe(200);
-    const forMember = asMember.json().items.find((a: { id: string }) => a.id === approvalId);
-    expect(forMember).toBeDefined();
-    expect(forMember.args_withheld).toBe(true);
-    expect(JSON.stringify(forMember)).not.toContain("classified-payload");
+    // ...and a read-scoped member of the same workspace is refused at the
+    // control listener outright: the queue is not a read surface.
+    const asMember = await ctl.inject({ method: "GET",
+      url: "/_control/v1/approvals?status=pending&limit=200", headers: peeker });
+    expect(asMember.statusCode).toBe(403);
+    expect(asMember.payload).not.toContain("classified-payload");
   });
 
   it("rejects an unusable OTLP span instead of storing it at the epoch", async () => {
@@ -1523,11 +1530,157 @@ describe("integration and security", () => {
       }] } });
     expect(res.statusCode).toBe(200);
     // The good span lands, the unusable one is reported rather than dropped.
-    expect(res.json().accepted).toBe(1);
-    expect(res.json().rejected).toBe(1);
     expect(res.json().partialSuccess.rejectedSpans).toBe(1);
+    expect(res.json().partialSuccess.errorMessage).toContain("unparseable start time");
     const epoch = await pool.query("SELECT count(*)::int AS n FROM spans WHERE started_at < '2000-01-01'");
     expect(epoch.rows[0].n).toBe(0);
+  });
+
+  it("links a child that arrives before its parent and orphans parents that never arrive", async () => {
+    const { uuidV5, TRACE_NAMESPACE } = await import("../src/otlp.js");
+    const hex = (n: number) => randomUUID().replace(/-/g, "").slice(0, n);
+    const nano = (agoMs: number) => String(BigInt(Date.now() - agoMs) * 1_000_000n);
+    const agentName = `otlp-order-${tag}`;
+    const trace = hex(32);
+    const parent = hex(16);
+    const child = hex(16);
+    const childPost = await api.inject({ method: "POST", url: "/v1/traces", headers: key,
+      payload: { resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: agentName } }] },
+        scopeSpans: [{ spans: [
+          { traceId: trace, spanId: child, parentSpanId: parent, name: "gen_ai.execute_tool",
+            startTimeUnixNano: nano(400), endTimeUnixNano: nano(300) }
+        ] }]
+      }] } });
+    expect(childPost.statusCode).toBe(200);
+    expect(childPost.json().partialSuccess.rejectedSpans).toBe(0);
+    const childRowId = uuidV5(TRACE_NAMESPACE, child);
+    const before = await pool.query("SELECT parent_state FROM spans WHERE id = $1", [childRowId]);
+    expect(before.rows[0].parent_state).toBe("unresolved");
+    // The parent shows up in a later batch: the link is resolved retroactively.
+    const parentPost = await api.inject({ method: "POST", url: "/v1/traces", headers: key,
+      payload: { resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: agentName } }] },
+        scopeSpans: [{ spans: [
+          { traceId: trace, spanId: parent, name: "gen_ai.chat",
+            startTimeUnixNano: nano(500), endTimeUnixNano: nano(0) }
+        ] }]
+      }] } });
+    expect(parentPost.statusCode).toBe(200);
+    const after = await pool.query("SELECT parent_state FROM spans WHERE id = $1", [childRowId]);
+    expect(after.rows[0].parent_state).toBe("resolved");
+    // A parent that never arrives is flagged by the orphan sweep, not guessed at.
+    const lonelyTrace = hex(32);
+    const lonelyChild = hex(16);
+    await api.inject({ method: "POST", url: "/v1/traces", headers: key,
+      payload: { resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: agentName } }] },
+        scopeSpans: [{ spans: [
+          { traceId: lonelyTrace, spanId: lonelyChild, parentSpanId: hex(16),
+            name: "gen_ai.execute_tool", startTimeUnixNano: nano(400), endTimeUnixNano: nano(300) }
+        ] }]
+      }] } });
+    const lonelyId = uuidV5(TRACE_NAMESPACE, lonelyChild);
+    await pool.query("UPDATE spans SET received_at = now() - interval '1 hour' WHERE id = $1", [lonelyId]);
+    const sweep = await api.inject({ method: "POST",
+      url: "/v1/admin/finalize-orphan-spans?older_than_seconds=60", headers: key });
+    expect(sweep.statusCode).toBe(200);
+    expect(sweep.json().orphaned).toBeGreaterThanOrEqual(1);
+    expect(sweep.json().ids).toContain(lonelyId);
+    const orphaned = await pool.query("SELECT parent_state FROM spans WHERE id = $1", [lonelyId]);
+    expect(orphaned.rows[0].parent_state).toBe("orphaned");
+  });
+
+  it("bounds stored attributes, flags clock skew, and refuses spans outside the late window", async () => {
+    const { uuidV5, TRACE_NAMESPACE } = await import("../src/otlp.js");
+    const hex = (n: number) => randomUUID().replace(/-/g, "").slice(0, n);
+    const nano = (agoMs: number) => String(BigInt(Date.now() - agoMs) * 1_000_000n);
+    const agentName = `otlp-limits-${tag}`;
+    const trace = hex(32);
+    const span = hex(16);
+    const longValue = "x".repeat(6000);
+    const attributes = Array.from({ length: 70 }, (_, i) => ({
+      key: `attr.${i}`,
+      value: { stringValue: i === 0 ? longValue : `v${i}` }
+    }));
+    const post = await api.inject({ method: "POST", url: "/v1/traces", headers: key,
+      payload: { resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: agentName } }] },
+        scopeSpans: [{ spans: [
+          // 30 minutes from now, ending 5 minutes before it started: future
+          // start (skew) plus a negative raw duration (clamped to zero).
+          { traceId: trace, spanId: span, name: "gen_ai.request",
+            startTimeUnixNano: nano(-30 * 60_000), endTimeUnixNano: nano(-25 * 60_000),
+            attributes }
+        ] }]
+      }] } });
+    expect(post.statusCode).toBe(200);
+    expect(post.json().partialSuccess.rejectedSpans).toBe(0);
+    const stored = await pool.query(
+      "SELECT attributes, clock_skew, duration_ms FROM spans WHERE id = $1",
+      [uuidV5(TRACE_NAMESPACE, span)]
+    );
+    const attrs = stored.rows[0].attributes as Record<string, string>;
+    expect(Object.keys(attrs)).toHaveLength(64);
+    expect(attrs["attr.0"]).toHaveLength(4096);
+    expect(attrs["attr.64"]).toBeUndefined();
+    expect(stored.rows[0].clock_skew).toBe(true);
+    expect(stored.rows[0].duration_ms).toBe(0);
+    // A start older than the 24h late window is refused, never backfilled.
+    const aged = await api.inject({ method: "POST", url: "/v1/traces", headers: key,
+      payload: { resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: agentName } }] },
+        scopeSpans: [{ spans: [
+          { traceId: hex(32), spanId: hex(16), name: "gen_ai.request",
+            startTimeUnixNano: nano(25 * 60 * 60_000), endTimeUnixNano: nano(25 * 60 * 60_000 - 1000) }
+        ] }]
+      }] } });
+    expect(aged.statusCode).toBe(200);
+    expect(aged.json().partialSuccess.rejectedSpans).toBe(1);
+    expect(aged.json().partialSuccess.errorMessage).toContain("late window");
+  });
+
+  it("enforces the span cap and the per-caller rate limit", async () => {
+    const { resetOtlpRateWindows } = await import("../src/otlp.js");
+    const hex = (n: number) => randomUUID().replace(/-/g, "").slice(0, n);
+    const nano = (agoMs: number) => String(BigInt(Date.now() - agoMs) * 1_000_000n);
+    const batch = (count: number) => ({
+      resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: `otlp-cap-${tag}` } }] },
+        scopeSpans: [{ spans: Array.from({ length: count }, () => ({
+          traceId: hex(32), spanId: hex(16), name: "gen_ai.chat",
+          startTimeUnixNano: nano(500), endTimeUnixNano: nano(0)
+        })) }]
+      }]
+    });
+    const restore = (name: string, prev: string | undefined) => {
+      if (prev === undefined) delete process.env[name];
+      else process.env[name] = prev;
+    };
+    const prevMax = process.env.OTLP_MAX_SPANS;
+    process.env.OTLP_MAX_SPANS = "2";
+    try {
+      const capped = await api.inject({ method: "POST", url: "/v1/traces", headers: key, payload: batch(4) });
+      expect(capped.statusCode).toBe(200);
+      expect(capped.json().partialSuccess.rejectedSpans).toBe(2);
+      expect(capped.json().partialSuccess.errorMessage).toContain("span cap exceeded");
+    } finally {
+      restore("OTLP_MAX_SPANS", prevMax);
+      resetOtlpRateWindows();
+    }
+    const prevRate = process.env.OTLP_RATE_SPANS_PER_MINUTE;
+    process.env.OTLP_RATE_SPANS_PER_MINUTE = "3";
+    resetOtlpRateWindows();
+    try {
+      const first = await api.inject({ method: "POST", url: "/v1/traces", headers: key, payload: batch(2) });
+      expect(first.statusCode).toBe(200);
+      const second = await api.inject({ method: "POST", url: "/v1/traces", headers: key, payload: batch(2) });
+      expect(second.statusCode).toBe(429);
+      expect(second.json().error).toBe("rate_limited");
+    } finally {
+      restore("OTLP_RATE_SPANS_PER_MINUTE", prevRate);
+      resetOtlpRateWindows();
+    }
   });
 
   it("counts a replayed actuals batch as duplicates instead of doubling it", async () => {

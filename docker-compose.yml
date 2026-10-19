@@ -78,7 +78,14 @@ services:
       APPROVAL_ARGS_KEY: ${APPROVAL_ARGS_KEY}
       APPROVAL_ARGS_KEY_PREVIOUS: ${APPROVAL_ARGS_KEY_PREVIOUS:-}
       GATEWAY_PORT: 8091
+      # §9: human approvals live on their own control listener so agent
+      # credentials never reach the queue or decisions.
+      GATEWAY_CONTROL_PORT: 8093
       APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS:-300}
+      APPROVAL_CLAIM_LEASE_SECONDS: ${APPROVAL_CLAIM_LEASE_SECONDS:-30}
+      # Demo upstream (mock-tools) lives on the private `tools` network, so
+      # the reference deployment opts in explicitly. FR-005: production
+      # deployments leave this off and rely on egress controls.
       ALLOW_PRIVATE_UPSTREAMS: "true"
       # §13.3: the gateway records the highest policy version it accepted so a
       # rolled-back pointer fails closed. The volume is writable only by the
@@ -88,6 +95,10 @@ services:
       - gateway_state:/app/gateway-state
     ports:
       - "8091:8091"
+      # The control listener is only meaningfully separated by credential in
+      # the Compose reference (the agent shares agent_edge with the gateway);
+      # production topologies keep this port off the agent network entirely.
+      - "8093:8093"
     healthcheck:
       # The agent waits for this, and tests/security/bypass.mjs treats a
       # healthy gateway on agent_edge as the "gateway can" half of FR-004.

@@ -6,10 +6,10 @@ import {
   Select, StatusBadge
 } from "./components";
 
-const TARGETS = ["runs", "approvals", "webhook_deliveries"];
+const TARGETS = ["runs", "approvals", "webhook_deliveries", "spans"];
 
 export default function RetentionView() {
-  const [form, setForm] = useState({ name: "", target: "runs", older_than_days: "30" });
+  const [form, setForm] = useState({ name: "", target: "runs", older_than_days: "30", max_rows: "" });
   const [error, setError] = useState("");
   const [lastRun, setLastRun] = useState<Record<string, number> | null>(null);
   const queryClient = useQueryClient();
@@ -25,7 +25,7 @@ export default function RetentionView() {
   return (
     <Page
       title="Retention"
-      sub="Age out runs, terminal approvals, and delivery logs. Policies, decisions, audit, and money are never targets."
+      sub="Age out runs, terminal approvals, delivery logs, and whole traces. Policies, decisions, audit, and money are never targets."
       actions={
         <Button variant="primary"
           onClick={() => opsApi.runRetention().then((r) => { setLastRun(r.deleted); reload(); }).catch((e) => setError(String(e)))}>
@@ -47,9 +47,10 @@ export default function RetentionView() {
             setError("");
             try {
               await opsApi.createRetentionRule({
-                name: form.name, target: form.target, older_than_days: Number(form.older_than_days) || 30
+                name: form.name, target: form.target, older_than_days: Number(form.older_than_days) || 30,
+                max_rows: form.max_rows ? Number(form.max_rows) : undefined
               });
-              setForm({ name: "", target: "runs", older_than_days: "30" });
+              setForm({ name: "", target: "runs", older_than_days: "30", max_rows: "" });
               reload();
             } catch (err) {
               setError(err instanceof Error ? err.message : "save failed");
@@ -71,6 +72,12 @@ export default function RetentionView() {
             <Input className="w-24" value={form.older_than_days}
               onChange={(e) => setForm({ ...form, older_than_days: e.target.value })} />
           </Field>
+          {form.target === "spans" && (
+            <Field label="Row cap (spans)">
+              <Input className="w-28" placeholder="100000" value={form.max_rows}
+                onChange={(e) => setForm({ ...form, max_rows: e.target.value })} />
+            </Field>
+          )}
           <Button variant="primary" type="submit">Add rule</Button>
         </form>
       </Card>
@@ -82,7 +89,10 @@ export default function RetentionView() {
           {rules.map((r) => (
             <div key={r.id} className="flex flex-wrap items-center gap-2 px-4 py-2.5 text-sm">
               <span className="font-medium text-ink-900">{r.name}</span>
-              <span className="font-mono text-xs text-ink-500">{r.target} older than {r.older_than_days}d</span>
+              <span className="font-mono text-xs text-ink-500">
+                {r.target} older than {r.older_than_days}d
+                {r.max_rows != null ? ` · cap ${Number(r.max_rows).toLocaleString()} rows` : ""}
+              </span>
               <StatusBadge status={r.enabled ? "success" : "cancelled"} />
               <span className="ml-auto flex gap-1">
                 <Button size="sm" variant="ghost"

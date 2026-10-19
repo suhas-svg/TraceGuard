@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { captureRawEnabled, redactDeep } from "./redact.js";
 
-// OTLP/HTTP JSON receiver for OpenTelemetry GenAI spans. Supports the JSON
-// encoding only (exporters: OTEL_EXPORTER_OTLP_PROTOCOL=http/json). Binary
-// protobuf arrives in a later change, not silently misread.
+// OTLP trace mapping. Both wire encodings (binary protobuf and http/json)
+// normalize into this shape, so the store path is identical for either kind
+// of exporter.
 // Pinned subset of the GenAI conventions: gen_ai.system, gen_ai.request.model,
 // gen_ai.response.model, gen_ai.usage.input_tokens, gen_ai.usage.output_tokens,
 // gen_ai.tool.name, plus exception events. Unknown attributes ride along in
@@ -36,6 +36,7 @@ export interface MappedSpan {
   name: string;
   startedAt: string;
   durationMs: number | null;
+  clockSkew: boolean;
   status: string;
   provider: string | null;
   model: string | null;
@@ -101,9 +102,69 @@ function nanoToIso(nano?: string): string | null {
   return ms === null ? null : new Date(ms).toISOString();
 }
 
+// Ingestion limits (§11.1). Read per request so tests and operators can
+// retune without a restart; each value falls back to its documented default.
+export interface OtlpLimits {
+  maxBodyBytes: number;
+  maxSpans: number;
+  maxAttributes: number;
+  maxAttrString: number;
+  skewThresholdMs: number;
+  lateWindowMs: number;
+  rateSpansPerMinute: number;
+}
+
+export function otlpLimits(env: NodeJS.ProcessEnv = process.env): OtlpLimits {
+  const num = (raw: string | undefined, fallback: number): number => {
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+  return {
+    maxBodyBytes: num(env.OTLP_MAX_BODY_BYTES, 1_048_576),
+    maxSpans: num(env.OTLP_MAX_SPANS, 2000),
+    maxAttributes: num(env.OTLP_MAX_ATTRIBUTES, 64),
+    maxAttrString: num(env.OTLP_MAX_ATTR_STRING, 4096),
+    skewThresholdMs: num(env.OTLP_SKEW_THRESHOLD_MS, 5 * 60_000),
+    lateWindowMs: num(env.OTLP_LATE_WINDOW_MS, 24 * 60 * 60_000),
+    rateSpansPerMinute: num(env.OTLP_RATE_SPANS_PER_MINUTE, 60_000)
+  };
+}
+
+// In-process fixed-window limiter keyed per authenticated caller. One gateway
+// process is the boundary here; a multi-process deploy would move the counter
+// to shared storage.
+const rateWindows = new Map<string, { startMs: number; spans: number }>();
+
+export function otlpRateLimited(
+  key: string,
+  spans: number,
+  perMinute: number,
+  nowMs = Date.now()
+): boolean {
+  const w = rateWindows.get(key);
+  if (!w || nowMs - w.startMs >= 60_000) {
+    rateWindows.set(key, { startMs: nowMs, spans });
+    return spans > perMinute;
+  }
+  w.spans += spans;
+  return w.spans > perMinute;
+}
+
+export function resetOtlpRateWindows(): void {
+  rateWindows.clear();
+}
+
+export interface MapOptions {
+  receivedAtMs?: number;
+  maxAttributes?: number;
+  maxAttrString?: number;
+  skewThresholdMs?: number;
+}
+
 export function mapOtlpSpan(
   span: OtlpSpan,
-  resource: Record<string, unknown>
+  resource: Record<string, unknown>,
+  options: MapOptions = {}
 ): MappedSpan | null {
   if (!span.traceId || !span.spanId) return null;
   const attrs = attrsToObject(span.attributes);
@@ -133,12 +194,43 @@ export function mapOtlpSpan(
 
   const endMs = nanoToMs(span.endTimeUnixNano);
   const startMs = nanoToMs(span.startTimeUnixNano);
+  // Clock discipline: a start after the receive time (beyond the threshold)
+  // or an end before the start means the producer's clock disagrees with
+  // ours. The duration never goes negative; the flag records the mismatch.
+  const receivedAtMs = options.receivedAtMs ?? Date.now();
+  const skewThresholdMs = options.skewThresholdMs ?? 5 * 60_000;
+  let durationMs: number | null = null;
+  let clockSkew = false;
+  if (endMs !== null && startMs !== null) {
+    const raw = endMs - startMs;
+    durationMs = raw < 0 ? 0 : raw;
+    if (raw < 0) clockSkew = true;
+  }
+  if (startMs !== null && startMs > receivedAtMs + skewThresholdMs) clockSkew = true;
+
   const inTok = get("gen_ai.usage.input_tokens");
   const outTok = get("gen_ai.usage.output_tokens");
   const cacheTok = get("gen_ai.usage.cache_read_input_tokens") ?? get("gen_ai.usage.cached_input_tokens");
   const inputTokens = typeof inTok === "number" ? inTok : null;
   const outputTokens = typeof outTok === "number" ? outTok : null;
   const cachedTokens = typeof cacheTok === "number" ? cacheTok : null;
+
+  // Bounded records: exporters can attach unbounded attribute lists, so the
+  // stored span keeps a fixed number of keys and truncates string values.
+  // Redaction runs first, so a truncated remainder can never hold a secret
+  // whose pattern straddled the cut.
+  const redacted = redactDeep(attrs, { captureRaw: captureRawEnabled() }) as Record<string, unknown>;
+  const maxAttributes = options.maxAttributes ?? 64;
+  const maxAttrString = options.maxAttrString ?? 4096;
+  const attributes: Record<string, unknown> = {};
+  let kept = 0;
+  for (const [key, value] of Object.entries(redacted)) {
+    if (kept >= maxAttributes) break;
+    attributes[key] = typeof value === "string" && value.length > maxAttrString
+      ? value.slice(0, maxAttrString)
+      : value;
+    kept++;
+  }
 
   return {
     runId: uuidV5(TRACE_NAMESPACE, span.traceId),
@@ -148,7 +240,8 @@ export function mapOtlpSpan(
     operationType,
     name: typeof toolName === "string" && toolName ? toolName : span.name,
     startedAt: start,
-    durationMs: endMs !== null && startMs !== null ? Math.max(0, endMs - startMs) : null,
+    durationMs,
+    clockSkew,
     status: failed ? "failed" : "success",
     provider: typeof system === "string" ? system : null,
     model:
@@ -162,6 +255,6 @@ export function mapOtlpSpan(
     errorType,
     agentName: (resource["service.name"] as string | undefined) ?? "otel-agent",
     workspaceName: (resource["traceguard.workspace"] as string | undefined) ?? "default",
-    attributes: redactDeep(attrs, { captureRaw: captureRawEnabled() }) as Record<string, unknown>
+    attributes
   };
 }

@@ -20,6 +20,20 @@ export const settings = {
   get gwUrl() {
     return stored("tg_gw_url", import.meta.env.VITE_GATEWAY_URL ?? "http://localhost:8091");
   },
+  // The human approval surface runs on the gateway's separate control
+  // listener. Unless explicitly configured, assume it is the gateway host
+  // on port 8093.
+  get gwControlUrl() {
+    const explicit = stored("tg_gw_control_url", "") || import.meta.env.VITE_GATEWAY_CONTROL_URL;
+    if (explicit) return explicit;
+    try {
+      const u = new URL(this.gwUrl);
+      u.port = "8093";
+      return u.origin;
+    } catch {
+      return "http://localhost:8093";
+    }
+  },
   get approverKey() {
     return stored("tg_approver_key", import.meta.env.VITE_APPROVER_KEY ?? "dev_approver_change_me");
   },
@@ -297,12 +311,12 @@ export function runSuite(suiteId: string, body: Record<string, unknown>) {
 
 // Gateway calls go to the gateway process with the agent key. Approval
 // decisions are the one call that uses the approver key instead.
-async function gw<T>(path: string, init?: RequestInit, approver = false): Promise<T> {
-  const res = await fetch(`${settings.gwUrl}${path}`, {
+async function gwFetch<T>(base: string, path: string, init: RequestInit | undefined, key: string): Promise<T> {
+  const res = await fetch(`${base}${path}`, {
     ...init,
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${approver ? settings.approverKey : settings.key}`,
+      Authorization: `Bearer ${key}`,
       ...(init?.headers ?? {})
     }
   });
@@ -311,6 +325,16 @@ async function gw<T>(path: string, init?: RequestInit, approver = false): Promis
     throw new ApiError(await explain(res), res.status);
   }
   return res.json() as Promise<T>;
+}
+
+function gw<T>(path: string, init?: RequestInit, approver = false): Promise<T> {
+  return gwFetch<T>(settings.gwUrl, path, init, approver ? settings.approverKey : settings.key);
+}
+
+// The approval queue and decisions live on the gateway's control listener,
+// which always authenticates with the approver key.
+function gwc<T>(path: string, init?: RequestInit): Promise<T> {
+  return gwFetch<T>(settings.gwControlUrl, path, init, settings.approverKey);
 }
 
 export interface McpServer {
@@ -381,13 +405,13 @@ export const gwApi = {
     gw<Policy>("/v1/policies", { method: "POST", body: JSON.stringify(p) }),
   updatePolicy: (id: string, p: Record<string, unknown>) =>
     gw<Policy>(`/v1/policies/${id}`, { method: "PUT", body: JSON.stringify(p) }),
-  // The queue is fetched with the approver key: the gateway only opens the
-  // sealed arguments for a caller holding the approve scope.
+  // The queue is fetched from the control listener with the approver key:
+  // the control surface never opens sealed arguments for other scopes.
   approvals: (status?: string) =>
-    gw<{ items: Approval[] }>(`/v1/approvals${status ? `?status=${status}` : ""}`, undefined, true),
+    gwc<{ items: Approval[] }>(`/_control/v1/approvals${status ? `?status=${status}` : ""}`),
   decide: (id: string, approved: boolean, reason: string) =>
-    gw<Approval>(`/v1/approvals/${id}/decision`,
-      { method: "POST", body: JSON.stringify({ approved, reason }) }, true),
+    gwc<Approval>(`/_control/v1/approvals/${id}/decision`,
+      { method: "POST", body: JSON.stringify({ approved, reason }) }),
   call: (body: Record<string, unknown>) =>
     gw<{ result?: unknown; approval_id?: string; status?: string; expires_at?: string }>(
       "/v1/gateway/tools/call", { method: "POST", body: JSON.stringify(body) }),
@@ -428,6 +452,7 @@ export interface RetentionRule {
   name: string;
   target: string;
   older_than_days: number;
+  max_rows: number | string | null;
   enabled: boolean;
 }
 

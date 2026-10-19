@@ -66,11 +66,18 @@ describe("least-privilege database roles", () => {
     }
   });
 
-  it("owns the audit table from a non-login role", async () => {
-    const res = await pool.query<{ owner: string }>(
+  it("owns the audit table and append function from a non-login role", async () => {
+    const table = await pool.query<{ owner: string }>(
       "SELECT pg_get_userbyid(relowner) AS owner FROM pg_class WHERE relname = 'audit_events'"
     );
-    expect(res.rows[0]?.owner).toBe("audit_owner");
+    expect(table.rows[0]?.owner).toBe("audit_owner");
+    // The function is SECURITY DEFINER: whoever owns it is the identity the
+    // append body runs as, so a migration role owning it would silently
+    // restore a superuser execution context for every append.
+    const fn = await pool.query<{ owner: string }>(
+      "SELECT pg_get_userbyid(proowner) AS owner FROM pg_proc WHERE proname = 'append_audit_event'"
+    );
+    expect(fn.rows[0]?.owner).toBe("audit_owner");
   });
 
   it("api_runtime cannot alter signed policy, trust state, audit, or approvals", async () => {
@@ -117,6 +124,24 @@ describe("least-privilege database roles", () => {
       expect(await attempt(c, () => c.query("UPDATE server_tools SET quarantined = quarantined WHERE false"))).toBe("ok");
       expect(await attempt(c, () => c.query("SELECT count(*) FROM policy_versions"))).toBe("ok");
       expect(await attempt(c, () => c.query("SELECT count(*) FROM policy_signing_keys"))).toBe("ok");
+    });
+  });
+
+  it("serializes on active_config through the definer helper without write access", async () => {
+    // §9.2's consume-time row lock needs FOR SHARE, which PostgreSQL checks
+    // against UPDATE privilege — a privilege gateway_runtime deliberately
+    // lacks. Migration 027's SECURITY DEFINER helper is owned by
+    // policy_publisher, and the row lock still lands on the calling
+    // transaction, so serialization holds while the runtime stays read-only.
+    const fn = await pool.query<{ owner: string }>(
+      "SELECT pg_get_userbyid(proowner) AS owner FROM pg_proc WHERE proname = 'lock_active_config_share'"
+    );
+    expect(fn.rows[0]?.owner).toBe("policy_publisher");
+    await asRole("gateway_runtime", async (c) => {
+      expect(await attempt(c, () => c.query(
+        "SELECT lock_active_config_share('00000000-0000-0000-0000-000000000000')"
+      ))).toBe("ok");
+      expect(await attempt(c, () => c.query("UPDATE active_config SET updated_at = now() WHERE false"))).toBe(DENIED);
     });
   });
 

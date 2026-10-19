@@ -11,8 +11,14 @@ variable, which is how the compose file reads them.
 | APPROVER_KEY | gateway | dev_approver_change_me | human approval decisions only |
 | APPROVAL_ARGS_KEY | gateway | (required, no default) | 32 bytes hex sealing pending approval arguments; generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
 | APPROVAL_ARGS_KEY_PREVIOUS | gateway | (optional) | previous key kept during rotation until old rows expire |
-| GATEWAY_PORT | gateway | 8091 | |
+| GATEWAY_PORT | gateway | 8091 | agent-facing listener |
+| GATEWAY_CONTROL_PORT | gateway | 8093 | human approval control listener; agent credentials are rejected there |
 | APPROVAL_TTL_SECONDS | gateway | 300 | pending approvals die after this |
+| APPROVAL_CLAIM_LEASE_SECONDS | gateway | 30 | how long a consume attempt holds the CLAIMED lease before the sweep returns it to APPROVED |
+| APPROVAL_EXECUTION_TIMEOUT_SECONDS | gateway | 300 | how long an EXECUTING row may stay unresolved before the sweep finalizes it as OUTCOME_UNKNOWN |
+| APPROVAL_MAX_PENDING_PER_CALLER | gateway | 10 | spec hard maximum; set lower only |
+| APPROVAL_MAX_PENDING_PER_WORKSPACE | gateway | 100 | spec hard maximum; set lower only |
+| APPROVAL_RATE_PER_MINUTE | gateway | 5 | new approval requests per caller per minute; spec hard maximum, set lower only |
 | ALLOW_PRIVATE_UPSTREAMS | gateway | true | set false in production; true is for local mock upstreams |
 | DASHBOARD_ORIGIN | api | http://localhost:5173 | the one origin allowed to fetch cross-origin |
 | CAPTURE_RAW_ATTRIBUTES | api | false | store raw prompts/responses/tool args; recognized secrets are always redacted |
@@ -31,13 +37,20 @@ variable, which is how the compose file reads them.
 | NODE_ENV | api + gateway | (unset) | `production` refuses to start without `OAUTH_ISSUER` + `OAUTH_AUDIENCE` + a JWKS source, and stops accepting the static `API_KEY`/`APPROVER_KEY` |
 | DATABASE_URL_RETENTION | api | (unset) | connection string for the retention sweep, so approval pruning runs as `retention_job` (§13.4). Unset, the sweep uses `DATABASE_URL` |
 | PORT | api | 8080 | container side; compose maps the host to 8090 |
+| OTLP_MAX_BODY_BYTES | api | 1048576 | `/v1/traces` request body cap; larger bodies are rejected before parsing |
+| OTLP_MAX_SPANS | api | 2000 | spans per request; spans past the cap are refused and reported in partial success |
+| OTLP_MAX_ATTRIBUTES | api | 64 | stored attributes per span; extra keys are dropped |
+| OTLP_MAX_ATTR_STRING | api | 4096 | stored attribute strings are truncated to this length |
+| OTLP_SKEW_THRESHOLD_MS | api | 300000 | starts further ahead of receipt than this are stored with `clock_skew` |
+| OTLP_LATE_WINDOW_MS | api | 86400000 | spans starting older than this are refused, never backfilled |
+| OTLP_RATE_SPANS_PER_MINUTE | api | 60000 | per-caller span rate limit per minute; over it answers 429 |
 
-Ports on a dev machine: API 8090, gateway 8091, mock tools 8092
-(internal network only), web 5173. Four networks keep the boundary real:
-`front` (api, gateway, postgres, web), `tools` (gateway, mock-tools;
-`internal: true`, so the upstream has no route off the host), `agent_edge`
-(gateway, agent) and the agent's lack of everything else. `npm run
-test:security` asserts that from inside the agent container.
+Ports on a dev machine: API 8090, gateway 8091, approval control listener
+8093, mock tools 8092 (internal network only), web 5173. Four networks keep
+the boundary real: `front` (api, gateway, postgres, web), `tools` (gateway,
+mock-tools; `internal: true`, so the upstream has no route off the host),
+`agent_edge` (gateway, agent) and the agent's lack of everything else.
+`npm run test:security` asserts that from inside the agent container.
 
 ## Users and scoped keys
 

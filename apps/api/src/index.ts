@@ -7,8 +7,8 @@ import { registerEvalRoutes } from "./evals.js";
 import { registerWebhookRoutes } from "./webhooks.js";
 import { registerRetentionRoutes } from "./retention.js";
 import { registerReconciliationRoutes } from "./reconciliation.js";
-import { attrsToObject, mapOtlpSpan, type OtlpSpan } from "./otlp.js";
-import { decodeTraceRequest, encodeEmptyTraceResponse } from "./otlp_proto.js";
+import { attrsToObject, mapOtlpSpan, otlpLimits, otlpRateLimited, type OtlpSpan } from "./otlp.js";
+import { decodeTraceRequest, encodeTraceResponse } from "./otlp_proto.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
 import { assertProductionAuth } from "./oauth.js";
 import { audit } from "./audit.js";
@@ -478,9 +478,12 @@ export function buildApp() {
 
   // OTLP/HTTP receiver in both encodings. Exporters default to binary
   // protobuf; http/json also works. Spans in one trace share a run; ids map
-  // deterministically so retries upsert instead of duplicating. JSON replies
-  // with counts, protobuf replies with an empty partialSuccess per spec.
-  app.post("/v1/traces", async (req, reply) => {
+  // deterministically so retries upsert instead of duplicating. The reply is
+  // a collector-spec ExportTraceServiceResponse: partialSuccess reports what
+  // was refused, and an empty/absent one means the batch was fully accepted.
+  const otlpBodyLimit = otlpLimits().maxBodyBytes;
+  app.post("/v1/traces", { bodyLimit: otlpBodyLimit }, async (req, reply) => {
+    const limits = otlpLimits();
     const contentType = String(req.headers["content-type"] ?? "");
     const isProtobuf = contentType.includes("protobuf");
     let resourceSpans: {
@@ -500,21 +503,57 @@ export function buildApp() {
     if (!Array.isArray(resourceSpans) || resourceSpans.length > 50) {
       return reply.code(400).send({ error: "invalid_traces" });
     }
+    // Rate before any database work: a runaway exporter is turned away
+    // cheaply (§11.1). In-process fixed window, keyed per authenticated
+    // caller; see otlp.ts for the single-process caveat.
+    const totalSpans = resourceSpans.reduce(
+      (n, rs) => n + (rs.scopeSpans ?? []).reduce((m, ss) => m + (ss.spans ?? []).length, 0),
+      0
+    );
+    if (otlpRateLimited(req.principal?.userId ?? "static-key", totalSpans, limits.rateSpansPerMinute)) {
+      return reply.code(429).header("retry-after", "60").send({ error: "rate_limited" });
+    }
+
+    const receivedAtMs = Date.now();
+    const insertedIds: string[] = [];
+    let rejected = 0;
+    // Rejections are counted by reason so the partialSuccess message is
+    // actionable instead of a bare number.
+    const reasons = new Map<string, number>();
+    const reject = (reason: string) => {
+      rejected++;
+      reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+    };
+    // Past the span cap spans are refused and reported, never silently cut.
+    let budget = limits.maxSpans;
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      let accepted = 0;
-      let duplicates = 0;
-      let rejected = 0;
       for (const rs of resourceSpans) {
         const resource = attrsToObject(
           (rs.resource?.attributes ?? []) as Parameters<typeof attrsToObject>[0]
         );
-        const spans = (rs.scopeSpans ?? []).flatMap((s) => s.spans ?? []).slice(0, 2000);
+        const spans = (rs.scopeSpans ?? []).flatMap((s) => s.spans ?? []);
         for (const span of spans) {
-          const m = mapOtlpSpan(span, resource);
+          if (budget <= 0) {
+            reject("span cap exceeded");
+            continue;
+          }
+          budget--;
+          const m = mapOtlpSpan(span, resource, {
+            receivedAtMs,
+            maxAttributes: limits.maxAttributes,
+            maxAttrString: limits.maxAttrString,
+            skewThresholdMs: limits.skewThresholdMs
+          });
           if (!m) {
-            rejected++;
+            reject("missing or unparseable start time");
+            continue;
+          }
+          // The 24h late window bounds backfill: an exporter replaying the
+          // distant past is refused rather than rewriting old windows.
+          if (Date.parse(m.startedAt) < receivedAtMs - limits.lateWindowMs) {
+            reject("start time older than the 24h late window");
             continue;
           }
           let workspace = await client.query("SELECT id FROM workspaces WHERE name = $1", [m.workspaceName]);
@@ -552,28 +591,48 @@ export function buildApp() {
             `INSERT INTO spans
                (id, run_id, parent_span_id, event_id, operation_type, name, started_at, ended_at,
                 duration_ms, status, provider, model, input_tokens, output_tokens, cached_tokens,
-                usage_source, error_type, attributes)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                usage_source, error_type, attributes, received_at, ingestion_source, schema_version,
+                clock_skew, parent_state)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+                     'otlp', 'otlp-traces/1', $20, $21)
              ON CONFLICT (event_id) DO NOTHING`,
             [m.spanId, m.runId, m.parentSpanId, m.eventId, m.operationType, m.name,
              m.startedAt, endedAt, m.durationMs, m.status, m.provider, m.model,
-             m.inputTokens, m.outputTokens, m.cachedTokens, m.usageSource, m.errorType, JSON.stringify(m.attributes)]
+             m.inputTokens, m.outputTokens, m.cachedTokens, m.usageSource, m.errorType,
+             JSON.stringify(m.attributes), new Date(receivedAtMs).toISOString(), m.clockSkew,
+             m.parentSpanId ? "unresolved" : "resolved"]
           );
-          if (res.rowCount === 0) duplicates++;
-          else accepted++;
+          // Duplicates land silently: the partial-success reply counts only
+          // rejections, the way the collector contract specifies.
+          if (res.rowCount !== 0) {
+            insertedIds.push(m.spanId);
+          }
         }
       }
+      // Child-before-parent: spans stored earlier that name a span from this
+      // batch as their parent are linked now. Linking flips only the state
+      // flag; a late arrival never rewrites a run's or span's outcome.
+      if (insertedIds.length > 0) {
+        await client.query(
+          `UPDATE spans SET parent_state = 'resolved'
+           WHERE parent_span_id = ANY($1::uuid[]) AND parent_state = 'unresolved'`,
+          [insertedIds]
+        );
+      }
       await client.query("COMMIT");
+      const errorMessage = rejected > 0
+        ? `${rejected} span(s) rejected: ${[...reasons.entries()]
+            .map(([reason, n]) => `${n} ${reason}`)
+            .join("; ")}`.slice(0, 512)
+        : undefined;
       if (isProtobuf) {
-        return reply.type("application/x-protobuf").send(encodeEmptyTraceResponse());
+        return reply.type("application/x-protobuf")
+          .send(encodeTraceResponse({ rejectedSpans: rejected, errorMessage }));
       }
       // A rejected span is reported, not silently dropped: an exporter that
       // gets no signal retries the same bad batch forever while its valid
       // siblings never land.
-      return { partialSuccess: rejected > 0
-        ? { rejectedSpans: rejected,
-            errorMessage: `${rejected} span(s) rejected: missing or unparseable start time` }
-        : {}, accepted, duplicates, rejected };
+      return { partialSuccess: { rejectedSpans: rejected, ...(errorMessage ? { errorMessage } : {}) } };
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
@@ -599,6 +658,24 @@ export function buildApp() {
       resource_type: "run", result: "success",
       metadata: { older_than_seconds: seconds, finalized: res.rows.length } });
     return { finalized: res.rows.length, ids: res.rows.map((r) => r.id) };
+  });
+
+  // Unresolved parents that never arrived are marked ORPHANED, not left
+  // half-linked forever (§11.3). Cron-invoked like the run finalizer, with
+  // the spec's 15 minute default.
+  app.post("/v1/admin/finalize-orphan-spans", async (req) => {
+    const q = req.query as { older_than_seconds?: string };
+    const seconds = Math.min(Math.max(Number(q.older_than_seconds ?? 900), 60), 86400);
+    const res = await pool.query(
+      `UPDATE spans SET parent_state = 'orphaned'
+       WHERE parent_state = 'unresolved' AND received_at < now() - ($1 || ' seconds')::interval
+       RETURNING id`,
+      [String(seconds)]
+    );
+    await audit(pool, { actor_type: "admin", action: "span.finalize_orphans",
+      resource_type: "span", result: "success",
+      metadata: { older_than_seconds: seconds, orphaned: res.rows.length } });
+    return { orphaned: res.rows.length, ids: res.rows.map((r) => r.id) };
   });
 
   return app;

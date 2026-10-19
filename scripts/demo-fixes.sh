@@ -5,8 +5,9 @@
 #
 #   bash scripts/demo-fixes.sh
 #
-# Overrides: BASE_PORT (8090), GW_PORT (8091), MOCK_PORT (8092), WEB_PORT (5173),
-# UPSTREAM_TIMEOUT_MS (3000 here so the hung-upstream check finishes quickly).
+# Overrides: BASE_PORT (8090), GW_PORT (8091), CTL_PORT (8093), MOCK_PORT (8092),
+# WEB_PORT (5173), UPSTREAM_TIMEOUT_MS (3000 here so the hung-upstream check
+# finishes quickly).
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
@@ -16,6 +17,7 @@ set +a
 
 export PORT="${BASE_PORT:-8090}"
 export GATEWAY_PORT="${GW_PORT:-8091}"
+export GATEWAY_CONTROL_PORT="${CTL_PORT:-8093}"
 export MOCK_TOOLS_PORT="${MOCK_PORT:-8092}"
 export API_KEY="${API_KEY:-test_key}"
 export APPROVER_KEY="${APPROVER_KEY:-test_approver}"

@@ -13,8 +13,11 @@
   bundle carries the new pin.
 - Denied calls never contact the upstream server. The security suite asserts
   this with upstream hit counters, not just status codes.
-- Agent credentials cannot decide approvals. The decision endpoint takes a
-  separate key and answers 403 to agent keys.
+- Agent credentials cannot decide approvals. The queue and decision endpoints
+  live on the gateway's separate control listener (`GATEWAY_CONTROL_PORT`,
+  default 8093) rather than the agent-facing port; the approve scope is
+  required there — no `admin` shortcut — and agent, read-scope, and plain
+  admin keys answer 403.
 - The audit log is append-only at the database layer (UPDATE/DELETE rejected
   by trigger), hash-chained, and verifiable through `POST /v1/audit/verify`;
   a detected mutation means a database owner disabled the guard.
@@ -97,11 +100,14 @@ evaluation replay, and gateway-denial span writes.
 ## Retention
 
 Execution data does not live forever. Retention rules name a target
-(`runs`, terminal `approvals`, `webhook_deliveries`), a maximum age in
-days, and an on/off switch. `POST /v1/retention/run` executes every
-enabled rule and reports per-rule deletion counts; call it from cron.
-Policies, decisions, pending approvals, the audit log, and money tables
-are not valid targets, and the API refuses them.
+(`runs`, `spans`, terminal `approvals`, `webhook_deliveries`), a maximum
+age in days, an optional row cap for whole traces, and an on/off switch.
+`POST /v1/retention/run` executes every enabled rule and reports per-rule
+deletion counts; call it from cron. A span target prunes whole traces —
+never single spans — and the seeded `default-span-retention` keeps 7 days
+or 100,000 spans, whichever comes first. Policies, decisions, pending
+approvals, the audit log, and money tables are not valid targets, and the
+API refuses them.
 
 ## Reporting a vulnerability
 

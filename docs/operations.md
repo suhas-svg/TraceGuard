@@ -88,13 +88,42 @@ drives all of them.
 curl -fsS -X POST "$API/v1/admin/finalize-stale-runs?older_than_seconds=3600" \
   -H "Authorization: Bearer $API_KEY"
 
+# Flag child spans whose parent never arrived (children may arrive first).
+curl -fsS -X POST "$API/v1/admin/finalize-orphan-spans?older_than_seconds=900" \
+  -H "Authorization: Bearer $API_KEY"
+
 # Apply every enabled retention rule and report per-rule deletion counts.
 curl -fsS -X POST "$API/v1/retention/run" -H "Authorization: Bearer $API_KEY"
 ```
 
 Suggested schedule: finalize every 15 minutes, retention nightly. Retention
-never targets policies, decisions, pending approvals, the audit log, or the
-money tables — the API refuses those targets.
+can age out whole traces by age and by a span-count cap (the seeded
+`default-span-retention` keeps 7 days or 100,000 spans, whichever comes
+first). Policies, decisions, pending approvals, the audit log, and the
+money tables are never deletion targets — the API refuses them.
+
+## Approval operations
+
+The queue and decisions live on the gateway's control listener
+(`GATEWAY_CONTROL_PORT`, default 8093), never the agent-facing port. Only the
+approver key — or a token carrying the `approve` scope — may list or decide;
+agent and read-scope keys get 403 there, and the `admin` scope does not
+shortcut the surface either, so plain admin keys are refused too. Consuming an
+approval first claims
+the row under `APPROVAL_CLAIM_LEASE_SECONDS` (default 30); the queue-list
+sweep returns an expired claim to `approved` (audited as
+`approval.claim_expired`, which by definition means no execution intent was
+written, so nothing was dispatched). The same sweep expires pending rows past
+their TTL and flips `executing` rows past
+`APPROVAL_EXECUTION_TIMEOUT_SECONDS` (default 300) to `outcome_unknown` —
+rows a human should reconcile against the upstream, because the action may
+have executed and will never be retried automatically.
+
+```bash
+# Watch the queue from the control listener, not the agent port.
+curl -fsS "http://localhost:8093/_control/v1/approvals?status=outcome_unknown&limit=200" \
+  -H "Authorization: Bearer $APPROVER_KEY"
+```
 
 ## Policy publication and signing keys
 

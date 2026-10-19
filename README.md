@@ -20,10 +20,11 @@ against a running stack; see the file header for the commands.
 
 ## Run it
 
-Dev ports: API 8090, gateway 8091, mock tools 8092 (internal only), web 5173.
-The demo agent runs as the `agent` container on `agent_edge`: the gateway is
-the only container it can reach, and `npm run test:security` proves that from
-inside it (upstream, api and postgres must all refuse the agent).
+Dev ports: API 8090, gateway 8091, approval control listener 8093, mock tools
+8092 (internal only), web 5173. The demo agent runs as the `agent` container
+on `agent_edge`: the gateway is the only container it can reach, and
+`npm run test:security` proves that from inside it (upstream, api and postgres
+must all refuse the agent).
 
 1. Copy `.env.example` to `.env` and set `API_KEY` and `APPROVER_KEY`.
 2. `docker compose up --build`
@@ -90,11 +91,14 @@ The dashboard's Policy tab shows the active signed version and its history, and 
   the approval queue, webhook subscriptions with delivery log, retention
   rules with run history, cost variance, and team, key, and workspace
   management.
-- `POST /v1/traces` accepts OpenTelemetry OTLP/HTTP JSON with GenAI
-  conventions, so instrumented frameworks land without a new SDK. Set
-  `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` on the exporter. Spans in one
-  trace share a run, retries upsert by stable ids, and
-  `POST /v1/admin/finalize-stale-runs` closes runs orphaned by crashes.
+- `POST /v1/traces` accepts OpenTelemetry OTLP/HTTP in protobuf
+  (preferred) and JSON with GenAI conventions, so instrumented frameworks
+  land without a new SDK. Spans in one trace share a run, retries upsert by
+  stable ids, child spans that arrive before their parent are linked when
+  the parent shows up, and `POST /v1/admin/finalize-orphan-spans` flags
+  parents that never arrive. Rejections are reported as OTLP partial
+  success — the good spans land and the rest come back with reasons — and
+  a per-caller span rate limit answers 429.
 - Webhooks report denials, approvals, budget breaches, and finished
   evaluations to operator URLs with an HMAC signature. Delivery never
   blocks the decision, every attempt is logged, and failures retry from
@@ -210,9 +214,17 @@ browser scenarios with `npm run test:e2e`, the Kubernetes manifests with
 - A call needing approval returns 202 with an approval id and the gateway
   makes no upstream contact. The client retries with the approval id after a
   human decides with the separate approver key. Approvals are single-use and
-  bound to caller, server, tool, canonical args, and request id. Agent keys
-  get 401 on the decision endpoint. Expired holds flip to expired on the next
-  list, so queues never show dead entries.
+  bound to caller, server, tool, canonical args, request id, and the pinned
+  tool definition. The queue and decisions live on the gateway's control
+  listener (`GATEWAY_CONTROL_PORT`, default 8093): only approver credentials —
+  the approver key or a token carrying the approve scope — may list or decide;
+  agent, read-scope, and admin keys get 403 there (admin does not shortcut the
+  queue), and the agent-facing port no longer serves the route at all.
+  Consuming an approval claims it under a short lease before any dispatch, so
+  a crash between claim and execution returns it to approved, while anything
+  ambiguous after dispatch ends in outcome_unknown and is never auto-retried.
+  Expired holds flip to expired on the next list, so queues never show dead
+  entries.
 - Every decision lands in `policy_decisions` citing the exact policy version,
   and every admin or execution outcome lands in the hash-chained `audit_events`
   table. Policies are immutable versions: an update supersedes, never edits.

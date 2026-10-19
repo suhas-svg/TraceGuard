@@ -96,6 +96,32 @@ function protocolIssue(
   if (!caps || typeof caps !== "object" || Array.isArray(caps)) {
     return `${META_CLIENT_CAPABILITIES} is required`;
   }
+  // §7.2: a method is served only when the client declared the capability it
+  // belongs to. Undeclared capabilities are rejected by default, so a client
+  // that never declared tools cannot list or call them.
+  if (env.method === "tools/list" || env.method === "tools/call") {
+    const toolsCap = (caps as Record<string, unknown>).tools;
+    if (!toolsCap || typeof toolsCap !== "object" || Array.isArray(toolsCap)) {
+      return `${META_CLIENT_CAPABILITIES} must declare the tools capability for ${env.method}`;
+    }
+  }
+  return null;
+}
+
+// §7.2: multi-round-trip input (MRTR) and task flows have no place on this
+// boundary. A result is delivered only when it is a plain completed call;
+// anything input- or task-shaped is refused rather than handed to the agent.
+function unsupportedResultReason(result: unknown): string | null {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return null;
+  const r = result as Record<string, unknown>;
+  if (typeof r.resultType === "string" && r.resultType !== "complete") {
+    return `unsupported resultType "${r.resultType}"`;
+  }
+  if (Array.isArray(r.inputRequests)) return "inputRequests are not supported in v1";
+  if (r.input_required !== undefined || r.requestState !== undefined) {
+    return "multi-round-trip input is not supported in v1";
+  }
+  if (r.task !== undefined) return "task-based results are not supported in v1";
   return null;
 }
 
@@ -189,20 +215,18 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
 
   if (res.statusCode === 200) {
     const result = body.result;
-    if (result && typeof result === "object") {
-      const r = result as Record<string, unknown>;
-      // A tool server must not smuggle unsupported multi-round-trip input
-      // requests through tools/call; do not deliver them to the agent.
-      if (r.resultType === "input_required" || Array.isArray(r.inputRequests)) {
-        await audit(pool, {
-          actor_type: "agent", actor_id: caller, action: "mcp.protocol_rejected",
-          resource_type: "server_tool", resource_id: `${server.id}/${tool}`,
-          result: "rejected", metadata: { reason: "input_required" }
-        });
-        return rpcError(env.id, -32006, "Unsupported result", {
-          error: "UNSUPPORTED_RESULT", detail: "input_required results are not supported in v1"
-        });
-      }
+    // A tool server must not smuggle unsupported multi-round-trip input
+    // requests or task flows through tools/call; do not deliver them.
+    const unsupported = unsupportedResultReason(result);
+    if (unsupported) {
+      await audit(pool, {
+        actor_type: "agent", actor_id: caller, action: "mcp.protocol_rejected",
+        resource_type: "server_tool", resource_id: `${server.id}/${tool}`,
+        result: "rejected", metadata: { reason: unsupported }
+      });
+      return rpcError(env.id, -32006, "Unsupported result", {
+        error: "UNSUPPORTED_RESULT", detail: unsupported
+      });
     }
     return rpcResult(env.id, result);
   }
@@ -292,6 +316,7 @@ export function registerMcpRoutes(app: FastifyInstance): void {
             ORDER BY s.gateway_alias, t.tool_name`,
           [workspaceId]
         );
+        const rules = rulesFromBundle(loaded.policy.bundle);
         return rpcResult(env.id, {
           // The reviewed definition is what clients see: every field the pin
           // covers, so a client cannot observe a description or schema the
@@ -299,8 +324,23 @@ export function registerMcpRoutes(app: FastifyInstance): void {
           tools: rows.rows
             .filter((r) => {
               const listed = manifest.get(r.server_id as string);
-              return listed?.alias === r.gateway_alias &&
-                pins.has(`${r.server_id}|${r.tool_name}|${r.definition_hash}`);
+              if (listed?.alias !== r.gateway_alias) return false;
+              if (!pins.has(`${r.server_id}|${r.tool_name}|${r.definition_hash}`)) return false;
+              // §7.2: only enabled tools are listed. v1 has no per-tool
+              // enable flag, so a tool counts as disabled when an enabled
+              // unconditional deny rule covers it; conditional denies stay
+              // call-time. Tools that require the Tasks flow are not listed
+              // because this profile cannot call them.
+              const scopeDenied = rules.some((rule) =>
+                rule.enabled && rule.effect === "deny" &&
+                (rule.server_id === null || rule.server_id === r.server_id) &&
+                (rule.tool_name === null || rule.tool_name === r.tool_name) &&
+                (rule.conditions?.required?.length ?? 0) === 0 &&
+                Object.keys(rule.conditions?.arguments ?? {}).length === 0);
+              if (scopeDenied) return false;
+              const d = (r.definition ?? {}) as Record<string, unknown>;
+              const execution = d.execution as Record<string, unknown> | undefined;
+              return execution?.taskSupport !== "required";
             })
             .map((r) => {
               const d = (r.definition ?? {}) as Record<string, unknown>;

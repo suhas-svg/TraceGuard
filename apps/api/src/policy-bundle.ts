@@ -51,10 +51,19 @@ function readState(): AcceptedState {
 
 function writeState(state: AcceptedState): void {
   const file = stateFile();
-  mkdirSync(dirname(file), { recursive: true });
-  const tmp = `${file}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state, null, 2));
-  renameSync(tmp, file);
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    const tmp = `${file}.tmp`;
+    // 0600: the anchor records which exact bundle this process last accepted;
+    // nothing but the gateway's runtime user should read or rewrite it.
+    writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch (err) {
+    // The anchor is the rollback defense. A version that cannot be anchored
+    // must not be accepted: doing so would silently disable rollback and
+    // fork detection for this and every later load.
+    throw new Error(`cannot persist the policy anchor at ${file}: ${(err as Error).message}`);
+  }
 }
 
 // In-process memo of what was already persisted, so bursts do not rewrite the
@@ -185,7 +194,11 @@ export async function loadActivePolicy(
   const anchor = `${Number(pv.version)}:${contentHash}`;
   if (persistedAnchors[workspaceId] !== anchor) {
     state[workspaceId] = { version: Number(pv.version), content_hash: contentHash };
-    writeState(state);
+    try {
+      writeState(state);
+    } catch (err) {
+      return { ok: false, reason: (err as Error).message };
+    }
     persistedAnchors[workspaceId] = anchor;
   }
 

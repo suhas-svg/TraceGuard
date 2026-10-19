@@ -4,7 +4,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { buildApp } from "../src/index.js";
-import { buildGateway } from "../src/gateway.js";
+import { buildGateway, buildGatewayControl } from "../src/gateway.js";
 import { pool } from "../src/db.js";
 import { publishTestPolicy } from "./policy-helper.js";
 
@@ -17,6 +17,8 @@ const PROTOCOL = "2026-07-28";
 describe("MCP streamable HTTP gateway", () => {
   const api = buildApp();
   const gw = buildGateway();
+  // Human approvals live on their own listener; agent credentials never work there.
+  const ctl = buildGatewayControl();
   const key = { authorization: "Bearer test_key" };
   const approver = { authorization: "Bearer test_approver" };
   const tag = Date.now().toString(36);
@@ -91,6 +93,7 @@ describe("MCP streamable HTTP gateway", () => {
     httpServer.close();
     await api.close();
     await gw.close();
+    await ctl.close();
     await pool.end();
   });
 
@@ -154,6 +157,21 @@ describe("MCP streamable HTTP gateway", () => {
     expect((res.json() as Record<string, any>).error.code).toBe(-32600);
   });
 
+  it("requires the tools capability in per-request metadata", async () => {
+    for (const capabilities of [{}, { tools: [] }]) {
+      const res = await rpc("tools/list", {
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": PROTOCOL,
+          "io.modelcontextprotocol/clientCapabilities": capabilities
+        }
+      });
+      expect(res.statusCode).toBe(400);
+      const body = res.json() as Record<string, any>;
+      expect(body.error.code).toBe(-32600);
+      expect(body.error.data.error).toContain("tools capability");
+    }
+  });
+
   it("rejects unsupported methods without forwarding anything", async () => {
     const res = await rpc("resources/read", { uri: "file:///etc/passwd", _meta: meta() });
     expect(res.statusCode).toBe(200);
@@ -198,8 +216,8 @@ describe("MCP streamable HTTP gateway", () => {
     expect(approvalId).toBeTruthy();
     expect(hits.hold).toBe(0);
 
-    const decide = await gw.inject({
-      method: "POST", url: `/v1/approvals/${approvalId}/decision`,
+    const decide = await ctl.inject({
+      method: "POST", url: `/_control/v1/approvals/${approvalId}/decision`,
       headers: approver, payload: { approved: true }
     });
     expect(decide.statusCode).toBe(200);
@@ -225,5 +243,152 @@ describe("MCP streamable HTTP gateway", () => {
       payload: { jsonrpc: "2.0", id: 1, method: "server/discover", params: { _meta: meta() } }
     });
     expect(res.statusCode).toBe(401);
+  });
+
+  // §7.2: results that ask the agent for a second round trip have no place on
+  // this boundary. The raw upstream below answers tools/call with each shape
+  // the gateway must refuse, and advertises one tool that needs the Tasks
+  // flow, which must disappear from tools/list entirely.
+  describe("MRTR and task-shaped upstream results", () => {
+    const shapes: Array<{ tool: string; result: Record<string, unknown>; reason: string }> = [
+      {
+        tool: "mrt",
+        result: { resultType: "input_required", inputRequests: [{ method: "elicitation/create" }] },
+        reason: 'unsupported resultType "input_required"'
+      },
+      {
+        tool: "askmore",
+        result: { inputRequests: [{ method: "sampling/createMessage", params: {} }] },
+        reason: "inputRequests are not supported in v1"
+      },
+      {
+        tool: "resume",
+        result: { input_required: true, requestState: "opaque" },
+        reason: "multi-round-trip input is not supported in v1"
+      },
+      {
+        tool: "longrun",
+        result: { task: { taskId: "task-1", status: "working" } },
+        reason: "task-based results are not supported in v1"
+      }
+    ];
+    const rawHits: Record<string, number> = {};
+    let rawHttp: ReturnType<typeof createServer>;
+    let rawServerId = "";
+    let rawAlias = "";
+
+    beforeAll(async () => {
+      // A hand-rolled JSON-RPC endpoint: the SDK server would refuse to emit
+      // these result shapes, and the gateway must be tested against a peer
+      // that really sends them.
+      rawHttp = createServer(async (req, res) => {
+        if (req.method !== "POST") {
+          res.writeHead(405).end();
+          return;
+        }
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const msg = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, any>;
+        if (msg.id === undefined) {
+          res.writeHead(202).end();
+          return;
+        }
+        res.setHeader("content-type", "application/json");
+        if (msg.method === "initialize") {
+          res.end(JSON.stringify({
+            jsonrpc: "2.0", id: msg.id,
+            result: {
+              protocolVersion: msg.params?.protocolVersion,
+              capabilities: { tools: {} },
+              serverInfo: { name: "raw-tools", version: "0.1.0" }
+            }
+          }));
+          return;
+        }
+        if (msg.method === "tools/list") {
+          res.end(JSON.stringify({
+            jsonrpc: "2.0", id: msg.id,
+            result: {
+              tools: [
+                ...shapes.map((s) => ({
+                  name: s.tool, description: `${s.tool} upstream`, inputSchema: { type: "object" }
+                })),
+                {
+                  name: "workflow", description: "needs the tasks flow",
+                  inputSchema: { type: "object" }, execution: { taskSupport: "required" }
+                }
+              ]
+            }
+          }));
+          return;
+        }
+        if (msg.method === "tools/call") {
+          const name = msg.params?.name as string;
+          rawHits[name] = (rawHits[name] ?? 0) + 1;
+          const shape = shapes.find((s) => s.tool === name);
+          res.end(JSON.stringify({
+            jsonrpc: "2.0", id: msg.id, result: shape ? shape.result : { content: [] }
+          }));
+          return;
+        }
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "not found" } }));
+      });
+      await new Promise<void>((resolve) => rawHttp.listen(0, "127.0.0.1", resolve));
+      const port = (rawHttp.address() as { port: number }).port;
+
+      const reg = await gw.inject({
+        method: "POST", url: "/v1/servers", headers: key,
+        payload: { name: `raw-${tag}`, base_url: `http://127.0.0.1:${port}/mcp` }
+      });
+      expect(reg.statusCode).toBe(201);
+      rawServerId = reg.json().id as string;
+      rawAlias = reg.json().gateway_alias as string;
+
+      const disc = await gw.inject({ method: "POST", url: `/v1/servers/${rawServerId}/discover`, headers: key });
+      expect(disc.statusCode).toBe(200);
+
+      for (const name of [...shapes.map((s) => s.tool), "workflow"]) {
+        const r = await gw.inject({
+          method: "POST", url: "/v1/policies", headers: key,
+          payload: { name: `raw-${name}-${tag}`, server_id: rawServerId, tool_name: name, effect: "allow" }
+        });
+        expect([200, 201]).toContain(r.statusCode);
+      }
+      await publishTestPolicy(pool);
+    });
+
+    afterAll(async () => {
+      rawHttp.close();
+    });
+
+    it("drops a Tasks-flow tool from tools/list", async () => {
+      const res = await rpc("tools/list", { _meta: meta() });
+      const names = (res.json() as Record<string, any>).result.tools.map((t: { name: string }) => t.name);
+      expect(names).not.toContain(`${rawAlias}__workflow`);
+      expect(names).toContain(`${rawAlias}__mrt`);
+    });
+
+    it("refuses MRTR and task-shaped results and records each rejection", async () => {
+      for (const shape of shapes) {
+        const name = `${rawAlias}__${shape.tool}`;
+        const res = await rpc("tools/call", { name, arguments: {}, _meta: meta() }, { name });
+        const body = res.json() as Record<string, any>;
+        expect(body.error.code, shape.tool).toBe(-32006);
+        expect(body.error.data.error).toBe("UNSUPPORTED_RESULT");
+        expect(body.error.data.detail, shape.tool).toBe(shape.reason);
+        // The refusal happens after the upstream answered: the action ran,
+        // and the gateway does not pretend otherwise by dropping the call.
+        expect(rawHits[shape.tool], shape.tool).toBe(1);
+      }
+      const audited = await pool.query(
+        `SELECT metadata FROM audit_events
+          WHERE action = 'mcp.protocol_rejected' AND resource_id LIKE $1
+          ORDER BY timestamp`,
+        [`${rawServerId}/%`]
+      );
+      expect(audited.rowCount).toBe(shapes.length);
+      expect((audited.rows as Array<{ metadata: { reason: string } }>).map((r) => r.metadata.reason).sort())
+        .toEqual(shapes.map((s) => s.reason).sort());
+    });
   });
 });
