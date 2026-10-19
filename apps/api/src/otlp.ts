@@ -64,6 +64,29 @@ export function uuidV5(namespace: string, name: string): string {
 
 export const TRACE_NAMESPACE = "6ba7b811-9dad-11d1-80b4-00c04fd430c8";
 
+// §11.4: dedupe on trace/span ids and source identity. The same raw ids
+// replayed from another workspace or ingestion path describe a different
+// span, so the derived event id must not collide across sources — while a
+// retry of the same span through the same path still upserts one row.
+export function spanEventId(
+  source: string,
+  workspace: string,
+  traceId: string,
+  spanId: string
+): string {
+  return uuidV5(TRACE_NAMESPACE, `${source}:${workspace}:${traceId}:${spanId}`);
+}
+
+// §11.4: identical raw ids from different workspaces are different runs and
+// spans. Row identity carries the workspace so two tenants replaying the same
+// trace ids never collide on the primary key.
+export function traceRunId(workspace: string, traceId: string): string {
+  return uuidV5(TRACE_NAMESPACE, `${workspace}:${traceId}`);
+}
+export function spanRowId(workspace: string, spanId: string): string {
+  return uuidV5(TRACE_NAMESPACE, `${workspace}:${spanId}`);
+}
+
 export function attrValue(v: OtlpKeyValue["value"]): unknown {
   if (!v) return null;
   if (v.stringValue !== undefined) return v.stringValue;
@@ -232,11 +255,14 @@ export function mapOtlpSpan(
     kept++;
   }
 
+  const workspaceName = (resource["traceguard.workspace"] as string | undefined) ?? "default";
   return {
-    runId: uuidV5(TRACE_NAMESPACE, span.traceId),
-    spanId: uuidV5(TRACE_NAMESPACE, span.spanId),
-    parentSpanId: span.parentSpanId ? uuidV5(TRACE_NAMESPACE, span.parentSpanId) : null,
-    eventId: uuidV5(TRACE_NAMESPACE, `${span.traceId}:${span.spanId}`),
+    runId: traceRunId(workspaceName, span.traceId),
+    spanId: spanRowId(workspaceName, span.spanId),
+    parentSpanId: span.parentSpanId ? spanRowId(workspaceName, span.parentSpanId) : null,
+    // §11.4: the event id carries the source identity so the same raw ids
+    // replayed from another workspace do not masquerade as duplicates.
+    eventId: spanEventId("otlp", workspaceName, span.traceId, span.spanId),
     operationType,
     name: typeof toolName === "string" && toolName ? toolName : span.name,
     startedAt: start,
@@ -254,7 +280,7 @@ export function mapOtlpSpan(
     usageSource: inputTokens === null && outputTokens === null ? "unavailable" : "provider_reported",
     errorType,
     agentName: (resource["service.name"] as string | undefined) ?? "otel-agent",
-    workspaceName: (resource["traceguard.workspace"] as string | undefined) ?? "default",
+    workspaceName,
     attributes
   };
 }

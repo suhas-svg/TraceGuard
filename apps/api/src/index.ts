@@ -5,7 +5,7 @@ import { ingestBodySchema } from "@traceguard/schemas";
 import { registerBudgetRoutes } from "./budgets.js";
 import { registerEvalRoutes } from "./evals.js";
 import { registerWebhookRoutes } from "./webhooks.js";
-import { registerRetentionRoutes } from "./retention.js";
+import { ensureDefaultSpanRetention, registerRetentionRoutes } from "./retention.js";
 import { registerReconciliationRoutes } from "./reconciliation.js";
 import { attrsToObject, mapOtlpSpan, otlpLimits, otlpRateLimited, type OtlpSpan } from "./otlp.js";
 import { decodeTraceRequest, encodeTraceResponse } from "./otlp_proto.js";
@@ -96,7 +96,9 @@ export function buildApp() {
               "INSERT INTO workspaces (name) VALUES ($1) RETURNING id",
               [name]
             );
-            workspaceId = created.rows[0].id;
+            const newWorkspaceId = created.rows[0].id as string;
+            workspaceId = newWorkspaceId;
+            await ensureDefaultSpanRetention(client, newWorkspaceId);
           }
         }
         if (typeof workspaceId !== "string") {
@@ -134,16 +136,28 @@ export function buildApp() {
           [e.run_id, workspaceId, agentId, e.timestamp]
         );
 
-        if (e.event_type === "run.completed") {
-          await client.query(
-            "UPDATE runs SET status = 'success', ended_at = $2 WHERE id = $1",
-            [e.run_id, e.timestamp]
+        if (e.event_type === "run.completed" || e.event_type === "run.failed") {
+          const target = e.event_type === "run.completed" ? "success" : "failed";
+          // §11.4: a finalized run is never rewritten by a late event. A
+          // replay of the same outcome stays silent; a conflicting late
+          // event is recorded as an explicit correction instead.
+          const applied = await client.query(
+            `UPDATE runs SET status = $2, ended_at = $3,
+               error_type = CASE WHEN $2 = 'failed' THEN $4 ELSE error_type END
+             WHERE id = $1 AND status = 'running'`,
+            [e.run_id, target, e.timestamp, e.error_type ?? "unknown"]
           );
-        } else if (e.event_type === "run.failed") {
-          await client.query(
-            "UPDATE runs SET status = 'failed', ended_at = $2, error_type = $3 WHERE id = $1",
-            [e.run_id, e.timestamp, e.error_type ?? "unknown"]
-          );
+          if (applied.rowCount === 0) {
+            const current = await client.query("SELECT status FROM runs WHERE id = $1", [e.run_id]);
+            const previous = current.rows[0]?.status as string | undefined;
+            if (previous && previous !== target) {
+              await audit(client, {
+                actor_type: "system", action: "run.status_correction",
+                resource_type: "run", resource_id: e.run_id, result: "rejected",
+                metadata: { event_type: e.event_type, previous_status: previous, attempted_status: target }
+              });
+            }
+          }
         }
 
         // Span upsert is idempotent on event_id: retries never duplicate.
@@ -563,6 +577,7 @@ export function buildApp() {
               return reply.code(403).send({ error: "workspace_forbidden", workspace: m.workspaceName });
             }
             workspace = await client.query("INSERT INTO workspaces (name) VALUES ($1) RETURNING id", [m.workspaceName]);
+            await ensureDefaultSpanRetention(client, workspace.rows[0].id);
           }
           if (!workspaceAllowed(req.principal, workspace.rows[0].id)) {
             await client.query("ROLLBACK");
@@ -587,6 +602,14 @@ export function buildApp() {
             m.durationMs != null
               ? new Date(new Date(m.startedAt).getTime() + m.durationMs).toISOString()
               : null;
+          // §11.4 parent ordering: resolved means the parent row is already
+          // stored. A child arriving first waits as unresolved — the
+          // end-of-batch link below settles it, or the orphan sweep does.
+          let parentState = "resolved";
+          if (m.parentSpanId) {
+            const parent = await client.query("SELECT 1 FROM spans WHERE id = $1", [m.parentSpanId]);
+            parentState = parent.rows[0] ? "resolved" : "unresolved";
+          }
           const res = await client.query(
             `INSERT INTO spans
                (id, run_id, parent_span_id, event_id, operation_type, name, started_at, ended_at,
@@ -600,7 +623,7 @@ export function buildApp() {
              m.startedAt, endedAt, m.durationMs, m.status, m.provider, m.model,
              m.inputTokens, m.outputTokens, m.cachedTokens, m.usageSource, m.errorType,
              JSON.stringify(m.attributes), new Date(receivedAtMs).toISOString(), m.clockSkew,
-             m.parentSpanId ? "unresolved" : "resolved"]
+             parentState]
           );
           // Duplicates land silently: the partial-success reply counts only
           // rejections, the way the collector contract specifies.
@@ -611,11 +634,13 @@ export function buildApp() {
       }
       // Child-before-parent: spans stored earlier that name a span from this
       // batch as their parent are linked now. Linking flips only the state
-      // flag; a late arrival never rewrites a run's or span's outcome.
+      // flag; a late arrival never rewrites a run's or span's outcome. An
+      // orphaned child is revived too — a parent inside the 24h late window
+      // disproves the orphan verdict rather than being ignored.
       if (insertedIds.length > 0) {
         await client.query(
           `UPDATE spans SET parent_state = 'resolved'
-           WHERE parent_span_id = ANY($1::uuid[]) AND parent_state = 'unresolved'`,
+           WHERE parent_span_id = ANY($1::uuid[]) AND parent_state IN ('unresolved', 'orphaned')`,
           [insertedIds]
         );
       }
@@ -631,8 +656,10 @@ export function buildApp() {
       }
       // A rejected span is reported, not silently dropped: an exporter that
       // gets no signal retries the same bad batch forever while its valid
-      // siblings never land.
-      return { partialSuccess: { rejectedSpans: rejected, ...(errorMessage ? { errorMessage } : {}) } };
+      // siblings never land. Full acceptance answers with an empty document —
+      // a zero-valued partialSuccess is not part of the collector contract.
+      if (rejected === 0) return {};
+      return { partialSuccess: { rejectedSpans: rejected, errorMessage } };
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
@@ -641,13 +668,15 @@ export function buildApp() {
     }
   });
 
-  // Runs orphaned by crashed SDKs never send a completion event. Call this
-  // periodically (cron, not a scheduler in the app) to close them visibly.
+  // Runs orphaned by crashed SDKs never send a completion event. §11.3 gives
+  // the window: a run that never finalizes within 15 minutes is ORPHANED —
+  // not failed, because failure is a claim about the work that nobody made.
+  // Call this periodically (cron, not a scheduler in the app).
   app.post("/v1/admin/finalize-stale-runs", async (req) => {
     const q = req.query as { older_than_seconds?: string };
-    const seconds = Math.min(Math.max(Number(q.older_than_seconds ?? 3600), 60), 86400);
+    const seconds = Math.min(Math.max(Number(q.older_than_seconds ?? 900), 60), 86400);
     const res = await pool.query(
-      `UPDATE runs SET status = 'failed', ended_at = now(), error_type = 'stale_timeout'
+      `UPDATE runs SET status = 'orphaned', ended_at = now(), error_type = 'stale_timeout'
        WHERE status = 'running' AND started_at < now() - ($1 || ' seconds')::interval
        RETURNING id`,
       [String(seconds)]

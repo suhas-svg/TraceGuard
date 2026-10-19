@@ -94,6 +94,10 @@ function PolicyForm({
             placeholder='{"required":["path"],"arguments":{"path":{"path_within":"/data"}}}'
             value={form.conditions} onChange={(e) => set("conditions", e.target.value)} />
         </Field>
+        <p className="text-xs text-ink-500">
+          The gateway decides these conditions itself. path_within is advisory unless the
+          upstream enforces it; schema, regex, enum, and max_length are enforced here.
+        </p>
         {error && <Alert>{error}</Alert>}
         <div>
           <Button variant="primary" type="submit">
@@ -146,10 +150,28 @@ function ServerForm({ onDone, onError }: { onDone: () => void; onError: (m: stri
   );
 }
 
+type ServerToolRow = {
+  tool_name: string;
+  quarantined: boolean;
+  quarantine_reason?: string | null;
+  definition?: Record<string, unknown> | null;
+  previous_definition?: Record<string, unknown> | null;
+  definition_hash?: string | null;
+  previous_hash?: string | null;
+};
+
+// FR-017: a quarantined tool shows its reviewer what changed — the previous
+// hash beside the new one, and which definition fields differ.
+const DIFF_FIELDS = ["title", "description", "inputSchema", "outputSchema", "annotations", "icons", "execution", "_meta"] as const;
+function changedFields(prev: Record<string, unknown>, next: Record<string, unknown>): string[] {
+  return DIFF_FIELDS.filter((f) => JSON.stringify(prev[f]) !== JSON.stringify(next[f]));
+}
+const shortHash = (h?: string | null) => (h ? `${h.slice(0, 12)}…` : "?");
+
 // Discovered tools with a quarantine toggle: a changed definition hash flips
 // a tool off until a human puts it back, and that lives here too.
 function ServerTools({ server, onError }: { server: McpServer; onError: (m: string) => void }) {
-  const [tools, setTools] = useState<{ tool_name: string; quarantined: boolean }[] | null>(null);
+  const [tools, setTools] = useState<ServerToolRow[] | null>(null);
   const [busy, setBusy] = useState("");
   const refresh = () =>
     gwApi.discover(server.id)
@@ -162,7 +184,7 @@ function ServerTools({ server, onError }: { server: McpServer; onError: (m: stri
       ) : (
         <ul className="grid gap-1.5 text-xs">
           {tools.map((t) => (
-            <li key={t.tool_name} className="flex items-center gap-2">
+            <li key={t.tool_name} className="flex flex-wrap items-center gap-2">
               <span className="font-mono text-ink-800">{t.tool_name}</span>
               <Badge tone={t.quarantined ? "bad" : "ok"}>{t.quarantined ? "quarantined" : "active"}</Badge>
               <Button
@@ -179,6 +201,16 @@ function ServerTools({ server, onError }: { server: McpServer; onError: (m: stri
               >
                 {t.quarantined ? "Re-approve" : "Quarantine"}
               </Button>
+              {t.quarantined && t.previous_definition && t.definition && (
+                <div className="w-full text-[11px] text-ink-500">
+                  <span className="font-mono">{shortHash(t.previous_hash)}</span> →{" "}
+                  <span className="font-mono">{shortHash(t.definition_hash)}</span>
+                  {changedFields(t.previous_definition, t.definition).length > 0 && (
+                    <> · changed: {changedFields(t.previous_definition, t.definition).join(", ")}</>
+                  )}
+                  {t.quarantine_reason && <> · {t.quarantine_reason}</>}
+                </div>
+              )}
             </li>
           ))}
           {tools.length === 0 && <li className="text-ink-500">No tools discovered.</li>}

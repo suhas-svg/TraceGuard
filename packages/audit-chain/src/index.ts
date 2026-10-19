@@ -1,9 +1,23 @@
 import { createHash } from "node:crypto";
+import { canonicalize } from "@traceguard/canonical-json";
 
 // The audit chain has exactly one implementation. The API, the gateway and
 // the operator-side policy publisher all append through these functions, and
 // the verifier recomputes from the same formula — a second copy of the hash
 // is how a chain silently stops being a chain.
+//
+// Two hash formats exist side by side:
+//   hash_version 1 — the historical pipe-joined formula. Kept byte-identical
+//     so already-written events keep verifying.
+//   hash_version 2 — SHA-256 over the RFC 8785 (JCS) canonical JSON of the
+//     event fields plus previous_hash (§10.1). New appends use v2 and carry
+//     workspace attribution, policy-version attribution and a per-workspace
+//     sequence.
+//
+// The per-workspace sequence is allocated by the database append function
+// inside the chain lock, *after* the appender has computed the hash, so it is
+// deliberately not part of the v2 hash input; chain integrity rests on the
+// previous_hash linkage and the sequence exists for ordering/audit.
 //
 // Append-only is tamper-evident, not tamper-proof: a database owner can
 // rewrite the table. Only an externally stored checkpoint anchors history
@@ -23,11 +37,20 @@ export interface AuditEntry {
   resource_id?: string;
   result: string;
   metadata?: Record<string, unknown>;
+  // v2 attribution. The database allocates the sequence itself; these are
+  // what the writer knows at append time.
+  workspace_id?: string | null;
+  policy_version_id?: string | null;
+  matched_rule_ids?: string[] | null;
 }
+
+export const HASH_VERSION_LEGACY = 1;
+export const HASH_VERSION_CANONICAL = 2;
 
 // Stable stringify: the same object always serializes the same way regardless
 // of key order. Kept byte-identical to the historical implementation, because
-// changing it would make every already-written event fail verification.
+// changing it would make every already-written event fail verification. It
+// also formats the metadata *column* so stored jsonb is deterministic.
 export function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
@@ -40,10 +63,12 @@ export function stableStringify(value: unknown): string {
 // Advisory-lock key for the audit chain. One appender at a time: without it,
 // two concurrent writers read the same tail hash and append sibling rows, and
 // a legitimate fork is indistinguishable from tampering. The database
-// function append_audit_event (migration 023) takes this lock now — it must
-// keep matching this number.
+// function append_audit_event (migration 023, extended by migration 028)
+// takes this lock now — it must keep matching this number.
 export const CHAIN_LOCK = 852100000001;
 
+// Historical hash format (hash_version 1). Do not change: every event
+// written before the canonical format moved to v2 was hashed with this.
 export function auditHash(prevHash: string, timestamp: string, entry: AuditEntry): string {
   const meta = stableStringify(entry.metadata ?? {});
   return createHash("sha256")
@@ -54,14 +79,67 @@ export function auditHash(prevHash: string, timestamp: string, entry: AuditEntry
     .digest("hex");
 }
 
+// The exact field set that the canonical (v2) hash covers. Exported so tests
+// can lock the bytes; the database function stores the same columns.
+export interface CanonicalEventFields {
+  timestamp: string;
+  workspace_id: string | null;
+  actor_type: string;
+  actor_id: string;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  result: string;
+  policy_version_id: string | null;
+  matched_rule_ids: string[] | null;
+  metadata: Record<string, unknown>;
+  previous_hash: string;
+}
+
+export function canonicalEventFields(
+  prevHash: string, timestamp: string, entry: AuditEntry
+): CanonicalEventFields {
+  return {
+    timestamp,
+    workspace_id: entry.workspace_id ?? null,
+    actor_type: entry.actor_type,
+    actor_id: entry.actor_id ?? "",
+    action: entry.action,
+    resource_type: entry.resource_type,
+    resource_id: entry.resource_id ?? "",
+    result: entry.result,
+    policy_version_id: entry.policy_version_id ?? null,
+    matched_rule_ids: entry.matched_rule_ids ?? null,
+    metadata: entry.metadata ?? {},
+    previous_hash: prevHash
+  };
+}
+
+// §10.1: SHA-256 over the RFC 8785 canonical JSON of the event fields plus
+// previous_hash. One byte sequence, or two implementations disagree.
+export function auditHashV2(prevHash: string, timestamp: string, entry: AuditEntry): string {
+  return createHash("sha256")
+    .update(canonicalize(canonicalEventFields(prevHash, timestamp, entry)))
+    .digest("hex");
+}
+
+// Version dispatcher used by the verifier: rows carry their format.
+export function auditHashFor(
+  version: number | null | undefined, prevHash: string, timestamp: string, entry: AuditEntry
+): string {
+  return (version ?? HASH_VERSION_LEGACY) >= HASH_VERSION_CANONICAL
+    ? auditHashV2(prevHash, timestamp, entry)
+    : auditHash(prevHash, timestamp, entry);
+}
+
 // Appends one event inside the caller's transaction, through the
-// append_audit_event database function (migration 023). The function
-// serializes writers and refuses an append that does not link to the current
-// head; the hash formula stays here, where the verifier can share it. A head
-// that moved between our read and the call is a retry, not a fork — and the
-// function returns false instead of raising precisely so the retry does not
-// abort the caller's transaction (the approval execution-intent path appends
-// in one).
+// append_audit_event database function (migration 023, extended by 028). The
+// function serializes writers, allocates the per-workspace sequence and
+// refuses an append that does not link to the current head; the hash formula
+// stays here, where the verifier can share it. A head that moved between our
+// read and the call is a retry, not a fork — and the function returns false
+// instead of raising precisely so the retry does not abort the caller's
+// transaction (the approval execution-intent path appends in one).
 export async function appendAuditEvent(client: SqlClient, entry: AuditEntry): Promise<void> {
   for (let attempt = 0; attempt < 8; attempt++) {
     const prev = await client.query(
@@ -69,12 +147,15 @@ export async function appendAuditEvent(client: SqlClient, entry: AuditEntry): Pr
     );
     const prevHash = (prev.rows[0] as { hash?: string } | undefined)?.hash ?? "";
     const timestamp = new Date().toISOString();
-    const hash = auditHash(prevHash, timestamp, entry);
+    const hash = auditHashV2(prevHash, timestamp, entry);
     const result = await client.query(
-      `SELECT append_audit_event($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10) AS appended`,
+      `SELECT append_audit_event($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11::uuid,$12,$13::uuid,$14::jsonb) AS appended`,
       [timestamp, entry.actor_type, entry.actor_id ?? "", entry.action,
        entry.resource_type, entry.resource_id ?? "", entry.result,
-       stableStringify(entry.metadata ?? {}), prevHash, hash]
+       stableStringify(entry.metadata ?? {}), prevHash, hash,
+       entry.workspace_id ?? null, HASH_VERSION_CANONICAL,
+       entry.policy_version_id ?? null,
+       entry.matched_rule_ids ? JSON.stringify(entry.matched_rule_ids) : null]
     );
     if ((result.rows[0] as { appended?: boolean } | undefined)?.appended) return;
   }
@@ -93,6 +174,12 @@ export interface AuditRow {
   metadata: Record<string, unknown> | null;
   prev_hash: string;
   hash: string;
+  // Present from migration 028. Absent in rows selected by older callers.
+  workspace_id?: string | null;
+  seq?: string | number | null;
+  hash_version?: number | null;
+  policy_version_id?: string | null;
+  matched_rule_ids?: string[] | null;
 }
 
 export interface ChainProblem {
@@ -107,22 +194,27 @@ export interface ChainVerification {
 }
 
 // Recomputes every event hash and checks every link. Rows must be the full
-// chain ordered by (timestamp, id) — the order the appender cites. A segment
-// that starts mid-chain cannot be verified without an external checkpoint
-// anchor, and this function will flag its first row; that is deliberate.
+// chain ordered by (timestamp, id) — the order the appender cites. Each row
+// is verified with the formula its hash_version names, so a chain that spans
+// the v1→v2 transition still verifies end to end. A segment that starts
+// mid-chain cannot be verified without an external checkpoint anchor, and
+// this function will flag its first row; that is deliberate.
 export function verifyAuditChain(rows: AuditRow[]): ChainVerification {
   const problems: ChainProblem[] = [];
   let prevHash = "";
   for (const row of rows) {
     const timestamp = new Date(row.timestamp).toISOString();
-    const recomputed = auditHash(row.prev_hash, timestamp, {
+    const recomputed = auditHashFor(row.hash_version ?? HASH_VERSION_LEGACY, row.prev_hash, timestamp, {
       actor_type: row.actor_type,
       actor_id: row.actor_id,
       action: row.action,
       resource_type: row.resource_type,
       resource_id: row.resource_id,
       result: row.result,
-      metadata: row.metadata ?? {}
+      metadata: row.metadata ?? {},
+      workspace_id: row.workspace_id ?? null,
+      policy_version_id: row.policy_version_id ?? null,
+      matched_rule_ids: Array.isArray(row.matched_rule_ids) ? row.matched_rule_ids : null
     });
     if (row.prev_hash !== prevHash) {
       problems.push({ id: row.id, problem: "chain link broken (prev_hash does not match the previous event)" });

@@ -10,6 +10,12 @@ import { publishTestPolicy } from "./policy-helper.js";
 
 const PROTOCOL = "2026-07-28";
 
+// Injected response bodies are JSON; individual tests read result/error fields
+// directly, so a shared alias keeps the casts honest and the rule quiet in one
+// place.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type JsonBody = Record<string, any>;
+
 // Narrow suite for the agent-facing MCP surface (§7.2/§9.5): discovery,
 // namespaced tool listing with cache metadata, header/body binding, the three
 // supported methods, rejection of everything else, and the approval retry
@@ -124,7 +130,7 @@ describe("MCP streamable HTTP gateway", () => {
   it("server/discover advertises only the tools capability", async () => {
     const res = await rpc("server/discover", { _meta: meta() });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as Record<string, any>;
+    const body = res.json() as JsonBody;
     expect(body.result.protocolVersion).toBe(PROTOCOL);
     expect(body.result.capabilities).toEqual({ tools: { listChanged: false } });
     expect(body.result.capabilities.resources).toBeUndefined();
@@ -134,7 +140,7 @@ describe("MCP streamable HTTP gateway", () => {
   it("tools/list returns only pinned, unquarantined tools under namespaced names", async () => {
     const res = await rpc("tools/list", { _meta: meta() });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as Record<string, any>;
+    const body = res.json() as JsonBody;
     const names = body.result.tools.map((t: { name: string }) => t.name);
     expect(names).toContain(`${alias}__echo`);
     expect(names).not.toContain("echo");
@@ -146,7 +152,7 @@ describe("MCP streamable HTTP gateway", () => {
   it("rejects a header that disagrees with the JSON-RPC body", async () => {
     const res = await rpc("tools/list", { _meta: meta() }, { headers: { "mcp-method": "tools/call" } });
     expect(res.statusCode).toBe(400);
-    const body = res.json() as Record<string, any>;
+    const body = res.json() as JsonBody;
     expect(body.error.code).toBe(-32600);
     expect(body.error.data.error).toContain("Mcp-Method");
   });
@@ -154,7 +160,7 @@ describe("MCP streamable HTTP gateway", () => {
   it("requires per-request protocol metadata", async () => {
     const res = await rpc("tools/list", {});
     expect(res.statusCode).toBe(400);
-    expect((res.json() as Record<string, any>).error.code).toBe(-32600);
+    expect((res.json() as JsonBody).error.code).toBe(-32600);
   });
 
   it("requires the tools capability in per-request metadata", async () => {
@@ -166,7 +172,7 @@ describe("MCP streamable HTTP gateway", () => {
         }
       });
       expect(res.statusCode).toBe(400);
-      const body = res.json() as Record<string, any>;
+      const body = res.json() as JsonBody;
       expect(body.error.code).toBe(-32600);
       expect(body.error.data.error).toContain("tools capability");
     }
@@ -175,7 +181,7 @@ describe("MCP streamable HTTP gateway", () => {
   it("rejects unsupported methods without forwarding anything", async () => {
     const res = await rpc("resources/read", { uri: "file:///etc/passwd", _meta: meta() });
     expect(res.statusCode).toBe(200);
-    expect((res.json() as Record<string, any>).error.code).toBe(-32601);
+    expect((res.json() as JsonBody).error.code).toBe(-32601);
     expect(hits.echo).toBe(0);
   });
 
@@ -183,7 +189,7 @@ describe("MCP streamable HTTP gateway", () => {
     const name = `${alias}__echo`;
     const res = await rpc("tools/call", { name, arguments: { text: "hi" }, _meta: meta() }, { name });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as Record<string, any>;
+    const body = res.json() as JsonBody;
     expect(body.result.content[0].text).toBe("echo:hi");
     expect(hits.echo).toBe(1);
   });
@@ -192,15 +198,15 @@ describe("MCP streamable HTTP gateway", () => {
     const name = `${alias}__wipe`;
     const before = hits.wipe;
     const res = await rpc("tools/call", { name, arguments: {}, _meta: meta() }, { name });
-    expect((res.json() as Record<string, any>).error.code).toBe(-32001);
+    expect((res.json() as JsonBody).error.code).toBe(-32001);
     expect(hits.wipe).toBe(before);
   });
 
   it("refuses an approval-needing call without the shim's logical request id", async () => {
     const name = `${alias}__hold`;
     const res = await rpc("tools/call", { name, arguments: { text: "x" }, _meta: meta() }, { name });
-    expect((res.json() as Record<string, any>).error.code).toBe(-32005);
-    expect((res.json() as Record<string, any>).error.data.error).toBe("APPROVAL_CLIENT_REQUIRED");
+    expect((res.json() as JsonBody).error.code).toBe(-32005);
+    expect((res.json() as JsonBody).error.data.error).toBe("APPROVAL_CLIENT_REQUIRED");
     expect(hits.hold).toBe(0);
   });
 
@@ -208,7 +214,7 @@ describe("MCP streamable HTTP gateway", () => {
     const name = `${alias}__hold`;
     const logical = `logical-${tag}-hold`;
     const first = await rpc("tools/call", { name, arguments: { text: "x" }, _meta: meta(logical) }, { name });
-    const firstBody = first.json() as Record<string, any>;
+    const firstBody = first.json() as JsonBody;
     expect(firstBody.error.code).toBe(-32002);
     expect(firstBody.error.data.error).toBe("APPROVAL_PENDING");
     expect(firstBody.error.data.logical_request_id).toBe(logical);
@@ -224,11 +230,11 @@ describe("MCP streamable HTTP gateway", () => {
 
     const retry = await rpc("tools/call", { name, arguments: { text: "x" }, _meta: meta(logical) }, { name });
     expect(retry.statusCode).toBe(200);
-    expect((retry.json() as Record<string, any>).result.content[0].text).toBe("held:x");
+    expect((retry.json() as JsonBody).result.content[0].text).toBe("held:x");
     expect(hits.hold).toBe(1);
 
     const replay = await rpc("tools/call", { name, arguments: { text: "x" }, _meta: meta(logical) }, { name });
-    expect((replay.json() as Record<string, any>).error.code).toBe(-32004);
+    expect((replay.json() as JsonBody).error.code).toBe(-32004);
     expect(hits.hold).toBe(1);
   });
 
@@ -288,7 +294,7 @@ describe("MCP streamable HTTP gateway", () => {
         }
         const chunks: Buffer[] = [];
         for await (const chunk of req) chunks.push(chunk as Buffer);
-        const msg = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, any>;
+        const msg = JSON.parse(Buffer.concat(chunks).toString("utf8")) as JsonBody;
         if (msg.id === undefined) {
           res.writeHead(202).end();
           return;
@@ -363,7 +369,7 @@ describe("MCP streamable HTTP gateway", () => {
 
     it("drops a Tasks-flow tool from tools/list", async () => {
       const res = await rpc("tools/list", { _meta: meta() });
-      const names = (res.json() as Record<string, any>).result.tools.map((t: { name: string }) => t.name);
+      const names = (res.json() as JsonBody).result.tools.map((t: { name: string }) => t.name);
       expect(names).not.toContain(`${rawAlias}__workflow`);
       expect(names).toContain(`${rawAlias}__mrt`);
     });
@@ -372,7 +378,7 @@ describe("MCP streamable HTTP gateway", () => {
       for (const shape of shapes) {
         const name = `${rawAlias}__${shape.tool}`;
         const res = await rpc("tools/call", { name, arguments: {}, _meta: meta() }, { name });
-        const body = res.json() as Record<string, any>;
+        const body = res.json() as JsonBody;
         expect(body.error.code, shape.tool).toBe(-32006);
         expect(body.error.data.error).toBe("UNSUPPORTED_RESULT");
         expect(body.error.data.detail, shape.tool).toBe(shape.reason);

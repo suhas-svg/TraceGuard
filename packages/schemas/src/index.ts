@@ -59,6 +59,13 @@ export const PROTOCOL_PROFILE = "mcp-2026-07-28";
 // Bounded repetition over such a group ((a|b){1,3}, (ab+){2}) stays allowed,
 // because the bound caps the work.
 const UNSAFE_REGEX = /\\[1-9]|\([^()]*[|+*}][^()]*\)(?:\+|\*|\{\d+,\})/;
+
+// Exposed for the runtime schema checker (FR-010): a JSON Schema constraint
+// may carry `pattern`, and a catastrophic pattern inside one must be refused
+// by the same rule that governs policy regex constraints.
+export function unsafeRegexPattern(pattern: string): boolean {
+  return UNSAFE_REGEX.test(pattern);
+}
 const regexSchema = z
   .string()
   .min(1)
@@ -78,6 +85,9 @@ const regexSchema = z
 
 export const fieldConstraintSchema = z.object({
   path_within: z.string().min(1).max(4096).optional(),
+  // §8.4 / FR-010: a full JSON Schema the argument must satisfy, in addition
+  // to the fixed operators above. Checked for safe shapes at bundle load.
+  schema: z.record(z.unknown()).optional(),
   regex: regexSchema.optional(),
   enum: z.array(z.unknown()).max(256).optional(),
   max_length: z.number().int().min(0).max(1_000_000).optional()

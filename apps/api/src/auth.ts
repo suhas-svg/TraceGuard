@@ -2,6 +2,7 @@ import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypt
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { pool } from "./db.js";
 import { oauthConfigFromEnv, resourceMetadataUrl, verifyAccessToken } from "./oauth.js";
+import { audit } from "./audit.js";
 
 // Scoped credentials. Roles map to scope sets; keys carry a subset of their
 // owner's role scopes. Only the approver role (and an OAuth token the trusted
@@ -222,6 +223,13 @@ export async function authHook(req: FastifyRequest, reply: FastifyReply): Promis
     if (oauth) {
       reply.header("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl(oauth)}"`);
     }
+    if (req.url.startsWith("/_control/")) {
+      // §10.3: failed access to the approval control surface is audited — an
+      // unauthenticated probe is exactly the signal an operator wants.
+      await audit(pool, { actor_type: "anonymous", action: "control.access_denied",
+        resource_type: "route", resource_id: req.url, result: "rejected",
+        metadata: { method: req.method, required_scope: scope } }).catch(() => undefined);
+    }
     return reply.code(401).send({ error: "unauthorized" }) as unknown as void;
   }
   // The approval control surface takes the approve scope itself; "admin"
@@ -229,6 +237,12 @@ export async function authHook(req: FastifyRequest, reply: FastifyReply): Promis
   // approver and agent automation can never approve itself (§9.1).
   const adminShortcut = !req.url.startsWith("/_control/");
   if (!principal.scopes.includes(scope) && !(adminShortcut && principal.scopes.includes("admin"))) {
+    if (req.url.startsWith("/_control/")) {
+      await audit(pool, { actor_type: "system", action: "control.access_denied",
+        resource_type: "route", resource_id: req.url, result: "rejected",
+        metadata: { method: req.method, required_scope: scope,
+          actor: principal.userId ?? principal.kind } }).catch(() => undefined);
+    }
     return forbidden(reply, scope) as unknown as void;
   }
   req.principal = principal;

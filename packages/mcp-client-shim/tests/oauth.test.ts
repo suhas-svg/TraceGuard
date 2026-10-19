@@ -32,6 +32,8 @@ let poisonFirst = false;
 let advertiseResource = "";
 let advertiseIssuer = "";
 let metadataIssuer = "";
+let servePathAppended = false;
+let tokenIssuer = "";
 
 function body(req: IncomingMessage): Promise<string> {
   return new Promise((resolve) => {
@@ -53,6 +55,13 @@ beforeAll(async () => {
     const authorization = req.headers.authorization as string | undefined;
     requests.push({ url, authorization, body: payload });
 
+    if (servePathAppended && req.url === "/.well-known/oauth-protected-resource/mcp") {
+      return json(res, 200, {
+        resource: advertiseResource,
+        authorization_servers: [advertiseIssuer],
+        scopes_supported: ["gateway"]
+      });
+    }
     if (req.url === "/.well-known/oauth-protected-resource") {
       return json(res, 200, {
         resource: advertiseResource,
@@ -71,7 +80,10 @@ beforeAll(async () => {
       tokenRequests += 1;
       const token = `tok-${++counter}`;
       (poisonFirst && tokenRequests === 1 ? stale : valid).add(token);
-      return json(res, 200, { access_token: token, token_type: "Bearer", expires_in: 300 });
+      return json(res, 200, {
+        access_token: token, token_type: "Bearer", expires_in: 300,
+        ...(tokenIssuer ? { iss: tokenIssuer } : {})
+      });
     }
     if (req.url === "/mcp") {
       mcpCalls.push({ url, authorization, body: payload });
@@ -234,6 +246,39 @@ describe("OAuth client half", () => {
     expect(mcpCalls[1].authorization).toBe("Bearer tok-2");
     expect(tokenRequests).toBe(2);
     poisonFirst = false;
+  });
+
+  it("prefers the path-appended protected-resource metadata (RFC 9728)", async () => {
+    requests = [];
+    valid.clear();
+    servePathAppended = true;
+    try {
+      const c = new CertifiedClient({
+        url: `${base}/mcp`,
+        oauth: { resource: RESOURCE, clientId: "agent-1" },
+        retryIntervalMs: 10
+      });
+      await c.callTool("read_file", {});
+      expect(requests[0]?.url).toBe(`${base}/.well-known/oauth-protected-resource/mcp`);
+    } finally {
+      servePathAppended = false;
+    }
+  });
+
+  it("refuses a token response whose iss names another issuer (RFC 9207)", async () => {
+    valid.clear();
+    tokenIssuer = "http://somewhere-else.test";
+    try {
+      const c = new CertifiedClient({
+        url: `${base}/mcp`,
+        oauth: { resource: RESOURCE, clientId: "agent-1" },
+        retryIntervalMs: 10
+      });
+      await expect(c.callTool("read_file", {})).rejects.toThrow(/minted the token for issuer/);
+      await expect(c.callTool("read_file", {})).rejects.toBeInstanceOf(OAuthClientError);
+    } finally {
+      tokenIssuer = "";
+    }
   });
 
   it("requires exactly one credential", () => {

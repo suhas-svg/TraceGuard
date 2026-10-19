@@ -323,6 +323,11 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         [budget.id, parsed.data.max_cost_micro, expiresAt]
       );
       await client.query("COMMIT");
+      // §10.3: the reservation is a money-moving event; the chain gets it.
+      await audit(pool, { actor_type: "agent", action: "budget.reserved",
+        resource_type: "budget", resource_id: r.rows[0].budget_id, result: "reserved",
+        metadata: { reservation_id: r.rows[0].id, amount_micro: parsed.data.max_cost_micro,
+          expires_at: r.rows[0].expires_at } });
       return { ok: true, reservation_id: r.rows[0].id, expires_at: r.rows[0].expires_at,
         warning: over ? "budget limit reached, warn-only budget" : undefined,
         remaining_micro: Number(updated.rows[0].limit_micro) - Number(updated.rows[0].spent_micro) - Number(updated.rows[0].reserved_micro) };
@@ -377,6 +382,11 @@ export function registerBudgetRoutes(app: FastifyInstance) {
       );
       await client.query("UPDATE budget_reservations SET status='settled' WHERE id=$1", [res.id]);
       await client.query("COMMIT");
+      // §10.3: settlement closes the money loop; record what it settled at.
+      await audit(pool, { actor_type: "agent", action: "budget.settled",
+        resource_type: "budget", resource_id: res.budget_id, result: "settled",
+        metadata: { reservation_id: res.id, settled_micro: actual,
+          basis: parsed.data.actual_cost_micro == null ? "reserved_max" : "measured" } });
       return { ok: true, actual_cost_micro: actual };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => undefined);
