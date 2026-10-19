@@ -408,4 +408,18 @@ describe("MCP streamable HTTP gateway", () => {
         .toEqual(shapes.map((s) => s.reason).sort());
     });
   });
+
+  it("serves MCP only over HTTP and refuses a stdio-shaped upstream", async () => {
+    // §7.1/FR-026: the gateway is an HTTP boundary. There is no transport
+    // selector to abuse, and a registration that names a stdio command is
+    // rejected at the URL gate rather than spawned.
+    const stdio = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `stdio-${tag}`, base_url: "stdio://localhost/mcp" } });
+    expect(stdio.statusCode).toBe(400);
+    expect(stdio.json().error).toBe("unsafe_upstream");
+    for (const method of ["GET", "PUT", "DELETE"] as const) {
+      const res = await gw.inject({ method, url: "/mcp", headers: key });
+      expect([404, 405], method).toContain(res.statusCode);
+    }
+  });
 });
