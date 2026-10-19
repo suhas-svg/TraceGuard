@@ -131,7 +131,7 @@ export default function CostsView() {
   return (
     <Page
       title="Costs: estimated vs billed"
-      sub="Indigo is our estimate, green is the provider invoice. Import actuals to compare."
+      sub="Indigo is our estimate, green is the provider invoice. Import actuals to compare. Estimates are best-effort from reported tokens and configured prices; unknown usage never counts as zero."
     >
       {error && <Alert>{error}</Alert>}
       <Card className="mb-5 max-w-2xl p-4">

@@ -1,10 +1,39 @@
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { canonicalize } from "@traceguard/canonical-json";
 import {
-  auditHash, auditHashFor, auditHashV2, canonicalEventFields, stableStringify,
-  verifyAuditChain, HASH_VERSION_CANONICAL, type AuditRow
+  auditHash, auditHashFor, auditHashV2, canonicalEventFields, checkpointKeyId,
+  signCheckpoint, stableStringify, verifyAuditChain, verifyCheckpoint,
+  HASH_VERSION_CANONICAL, type AuditRow, type CheckpointPayload
 } from "../src/index.js";
+
+describe("checkpoint signing", () => {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const privatePem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const publicPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+  const payload: CheckpointPayload = {
+    v: 1,
+    created_at: "2026-10-17T10:00:00.000Z",
+    up_to_timestamp: "2026-10-17T10:00:01.000Z",
+    up_to_hash: "ab".repeat(32),
+    event_count: 2
+  };
+
+  it("signs a checkpoint that verifies with the matching public key", () => {
+    const signed = signCheckpoint(payload, privatePem);
+    expect(signed.key_id).toBe(checkpointKeyId(publicPem));
+    expect(verifyCheckpoint(payload, signed.signature, publicPem)).toBe(true);
+  });
+
+  it("refuses a tampered payload, a foreign key, and a public PEM as a signing key", () => {
+    const signed = signCheckpoint(payload, privatePem);
+    expect(verifyCheckpoint({ ...payload, event_count: 3 }, signed.signature, publicPem)).toBe(false);
+    const other = generateKeyPairSync("ed25519");
+    const otherPublic = other.publicKey.export({ type: "spki", format: "pem" }).toString();
+    expect(verifyCheckpoint(payload, signed.signature, otherPublic)).toBe(false);
+    expect(() => signCheckpoint(payload, otherPublic)).toThrow();
+  });
+});
 
 // The chain's value is entirely in recomputation: everything here modifies an
 // event and demands the verifier notice.

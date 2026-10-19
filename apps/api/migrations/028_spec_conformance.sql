@@ -27,7 +27,8 @@ DROP FUNCTION IF EXISTS append_audit_event(
   timestamptz, text, text, text, text, text, text, jsonb, text, text
 );
 
-CREATE FUNCTION append_audit_event(
+-- Idempotent on re-run: db-roles re-applies every migration on each boot.
+CREATE OR REPLACE FUNCTION append_audit_event(
   p_timestamp timestamptz,
   p_actor_type text, p_actor_id text, p_action text,
   p_resource_type text, p_resource_id text, p_result text,

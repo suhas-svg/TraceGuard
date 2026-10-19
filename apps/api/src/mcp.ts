@@ -125,6 +125,36 @@ function unsupportedResultReason(result: unknown): string | null {
   return null;
 }
 
+// §7.2/FR-003: a tools/call result must keep the revision's result shape. A
+// peer that answers with something else is refused the same way MRTR and task
+// flows are — the agent never receives a malformed result as data.
+function malformedResultReason(result: unknown): string | null {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return "tool result is not an object";
+  }
+  const r = result as Record<string, unknown>;
+  if (r.content !== undefined) {
+    if (!Array.isArray(r.content)) return "tool result content is not an array";
+    for (const block of r.content) {
+      if (!block || typeof block !== "object" || Array.isArray(block)) {
+        return "tool result content block is not an object";
+      }
+      if (typeof (block as Record<string, unknown>).type !== "string") {
+        return "tool result content block has no type";
+      }
+    }
+  }
+  if (r.isError !== undefined && typeof r.isError !== "boolean") {
+    return "tool result isError is not a boolean";
+  }
+  if (r.structuredContent !== undefined) {
+    if (!r.structuredContent || typeof r.structuredContent !== "object" || Array.isArray(r.structuredContent)) {
+      return "tool result structuredContent is not an object";
+    }
+  }
+  return null;
+}
+
 async function callTool(app: FastifyInstance, req: { headers: Record<string, string | string[] | undefined>; principal?: Principal; }, env: RpcEnvelope) {
   const name = env.params.name;
   if (typeof name !== "string" || !name) {
@@ -217,15 +247,15 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
     const result = body.result;
     // A tool server must not smuggle unsupported multi-round-trip input
     // requests or task flows through tools/call; do not deliver them.
-    const unsupported = unsupportedResultReason(result);
-    if (unsupported) {
+    const problem = unsupportedResultReason(result) ?? malformedResultReason(result);
+    if (problem) {
       await audit(pool, {
         actor_type: "agent", actor_id: caller, action: "mcp.protocol_rejected",
         resource_type: "server_tool", resource_id: `${server.id}/${tool}`,
-        result: "rejected", metadata: { reason: unsupported }
+        result: "rejected", metadata: { reason: problem }
       });
       return rpcError(env.id, -32006, "Unsupported result", {
-        error: "UNSUPPORTED_RESULT", detail: unsupported
+        error: "UNSUPPORTED_RESULT", detail: problem
       });
     }
     return rpcResult(env.id, result);

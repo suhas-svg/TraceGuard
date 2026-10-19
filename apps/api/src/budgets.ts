@@ -24,7 +24,7 @@ async function sweepExpiredHolds(
 ): Promise<number> {
   const r = await client.query(
     `WITH expired AS (
-       UPDATE budget_reservations SET status='released', released_at=now()
+       UPDATE budget_reservations SET status='released', released_at=now(), settle_reason='timeout'
         WHERE budget_id=$1 AND status='held' AND expires_at < now()
         RETURNING amount_micro
      )
@@ -35,6 +35,25 @@ async function sweepExpiredHolds(
     [budgetId]
   );
   return Number(r.rows[0]?.freed ?? 0);
+}
+
+// §12.3: the per-budget reclaim above runs lazily, only when that budget is
+// touched again. A crashed caller's hold on an otherwise idle budget would
+// sit there forever; this sweep recovers every budget with an expired hold.
+export async function sweepAllExpiredHolds(
+  db: Pool | PoolClient
+): Promise<{ freed_micro: number; budgets: number }> {
+  const ids = await db.query(
+    "SELECT DISTINCT budget_id FROM budget_reservations WHERE status='held' AND expires_at < now()"
+  );
+  let freed = 0;
+  let budgets = 0;
+  for (const row of ids.rows) {
+    const got = await sweepExpiredHolds(db, String(row.budget_id));
+    if (got > 0) budgets += 1;
+    freed += got;
+  }
+  return { freed_micro: freed, budgets };
 }
 
 // Spend inside the budget's reporting period. Returns null for 'lifetime',
@@ -92,9 +111,10 @@ export function registerBudgetRoutes(app: FastifyInstance) {
   const pricingSchema = z.object({
     provider: z.string().min(1).max(64),
     model: z.string().min(1).max(128),
-    input_price_per_million: z.number().int().min(0),
-    output_price_per_million: z.number().int().min(0),
-    cached_input_price_per_million: z.number().int().min(0).default(0),
+    // §12.2: prices are NUMERIC — sub-micro rates are representable.
+    input_price_per_million: z.number().min(0),
+    output_price_per_million: z.number().min(0),
+    cached_input_price_per_million: z.number().min(0).default(0),
     currency: z.string().max(8).default("USD")
   });
 
@@ -133,7 +153,11 @@ export function registerBudgetRoutes(app: FastifyInstance) {
       `SELECT * FROM pricing ${where.length ? "WHERE " + where.join(" AND ") : ""}
        ORDER BY effective_from DESC LIMIT 100`, params
     );
-    return { items: res.rows };
+    // §12.2: NUMERIC columns travel as strings; the API reports numbers.
+    return { items: res.rows.map((r) => ({ ...r,
+      input_price_per_million: Number(r.input_price_per_million),
+      output_price_per_million: Number(r.output_price_per_million),
+      cached_input_price_per_million: Number(r.cached_input_price_per_million) })) };
   });
 
   const budgetSchema = z.object({
@@ -380,14 +404,19 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         "INSERT INTO budget_ledger (budget_id, amount_micro, reservation_id) VALUES ($1,$2,$3)",
         [res.budget_id, actual, res.id]
       );
-      await client.query("UPDATE budget_reservations SET status='settled' WHERE id=$1", [res.id]);
+      await client.query(
+        "UPDATE budget_reservations SET status='settled', settle_reason=$2 WHERE id=$1",
+        [res.id, parsed.data.actual_cost_micro == null ? "usage_unavailable" : "usage_known"]
+      );
       await client.query("COMMIT");
       // §10.3: settlement closes the money loop; record what it settled at.
       await audit(pool, { actor_type: "agent", action: "budget.settled",
         resource_type: "budget", resource_id: res.budget_id, result: "settled",
         metadata: { reservation_id: res.id, settled_micro: actual,
-          basis: parsed.data.actual_cost_micro == null ? "reserved_max" : "measured" } });
-      return { ok: true, actual_cost_micro: actual };
+          basis: parsed.data.actual_cost_micro == null ? "reserved_max" : "measured",
+          settle_reason: parsed.data.actual_cost_micro == null ? "usage_unavailable" : "usage_known" } });
+      return { ok: true, actual_cost_micro: actual,
+        settle_reason: parsed.data.actual_cost_micro == null ? "usage_unavailable" : "usage_known" };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw err;

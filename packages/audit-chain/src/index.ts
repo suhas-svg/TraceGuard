@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, sign, verify, type KeyObject } from "node:crypto";
 import { canonicalize } from "@traceguard/canonical-json";
 
 // The audit chain has exactly one implementation. The API, the gateway and
@@ -225,4 +225,66 @@ export function verifyAuditChain(rows: AuditRow[]): ChainVerification {
     prevHash = row.hash;
   }
   return { ok: problems.length === 0, checked: rows.length, problems };
+}
+
+// ---------------------------------------------------------------------------
+// Signed checkpoints (FR-019).
+//
+// Append-only is tamper-evident, not tamper-proof: the party holding the
+// database can rewrite the whole table and recompute the hashes. A checkpoint
+// signed with a key that never lives in the database or in the containers
+// anchors the history externally. The verifier treats a chain whose first
+// link is broken but covered by a valid checkpoint as anchored — a pruned
+// prefix — never as corruption.
+
+/** What a signed checkpoint commits to: the head event at signing time. */
+export interface CheckpointPayload {
+  v: 1;
+  created_at: string;
+  up_to_timestamp: string;
+  up_to_hash: string;
+  event_count: number;
+}
+
+export interface CheckpointSignature {
+  signature: string;
+  key_id: string;
+}
+
+function checkpointBytes(payload: CheckpointPayload): Buffer {
+  return Buffer.from(canonicalize(payload as unknown as Record<string, unknown>), "utf8");
+}
+
+function asCheckpointPrivateKey(pem: string): KeyObject {
+  const key = createPrivateKey(pem);
+  if (key.asymmetricKeyType !== "ed25519") {
+    throw new Error("checkpoint keys must be ed25519");
+  }
+  return key;
+}
+
+/** Stable id for a checkpoint key: the digest of its SPKI PEM. */
+export function checkpointKeyId(publicKeyPem: string): string {
+  return createHash("sha256").update(publicKeyPem.trim()).digest("hex");
+}
+
+export function signCheckpoint(payload: CheckpointPayload, privateKeyPem: string): CheckpointSignature {
+  const key = asCheckpointPrivateKey(privateKeyPem);
+  const signature = sign(null, checkpointBytes(payload), key).toString("base64");
+  const publicPem = createPublicKey(key).export({ type: "spki", format: "pem" }).toString();
+  return { signature, key_id: checkpointKeyId(publicPem) };
+}
+
+export function verifyCheckpoint(
+  payload: CheckpointPayload,
+  signature: string,
+  publicKeyPem: string
+): boolean {
+  try {
+    const key = createPublicKey(publicKeyPem);
+    if (key.asymmetricKeyType !== "ed25519") return false;
+    return verify(null, checkpointBytes(payload), key, Buffer.from(signature, "base64"));
+  } catch {
+    return false;
+  }
 }

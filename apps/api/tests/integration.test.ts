@@ -1697,6 +1697,56 @@ describe("integration and security", () => {
     expect(Number(rules.rows[0].max_rows)).toBe(100000);
   });
 
+  it("anchors a pruned audit chain with a signed checkpoint", async () => {
+    const { generateKeyPairSync } = await import("node:crypto");
+    const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+    const privatePem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    const publicPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+    const prevKey = process.env.AUDIT_CHECKPOINT_KEY;
+    const prevPub = process.env.AUDIT_CHECKPOINT_PUBLIC_KEY;
+    process.env.AUDIT_CHECKPOINT_KEY = privatePem;
+    process.env.AUDIT_CHECKPOINT_PUBLIC_KEY = publicPem;
+    try {
+      const created = await gw.inject({ method: "POST", url: "/v1/audit/checkpoints", headers: key, payload: {} });
+      expect(created.statusCode).toBe(201);
+      const checkpoint = created.json();
+      expect(checkpoint.payload.event_count).toBeGreaterThanOrEqual(1);
+      expect(checkpoint.key_id).toBeTruthy();
+      // A checkpoint row whose signature does not verify is refused, and the
+      // refusal lands in the chain.
+      const bogus = await pool.query(
+        `INSERT INTO audit_checkpoints (up_to_timestamp, up_to_hash, event_count, signature, key_id, payload)
+         VALUES (now(), 'deadbeef', 0, 'not-a-signature', 'unknown', '{}'::jsonb) RETURNING id`);
+      const rejected = await gw.inject({ method: "POST", url: "/v1/audit/prune", headers: key,
+        payload: { checkpoint_id: bogus.rows[0].id } });
+      expect(rejected.statusCode).toBe(403);
+      expect(rejected.json().error).toBe("checkpoint_signature_invalid");
+      const rejectedAudit = await pool.query(
+        "SELECT count(*)::int AS n FROM audit_events WHERE action = 'audit.segment.prune_rejected'");
+      expect(rejectedAudit.rows[0].n).toBeGreaterThanOrEqual(1);
+      // The real checkpoint authorizes the prune; the covered prefix leaves.
+      const pruned = await gw.inject({ method: "POST", url: "/v1/audit/prune", headers: key,
+        payload: { checkpoint_id: checkpoint.id } });
+      expect(pruned.statusCode).toBe(200);
+      expect(pruned.json().pruned).toBeGreaterThanOrEqual(1);
+      const segment = await pool.query(
+        "SELECT count(*)::int AS n FROM audit_events WHERE action = 'audit.segment.pruned'");
+      expect(segment.rows[0].n).toBe(1);
+      // The verified chain now anchors at the checkpoint instead of
+      // reporting a broken first link.
+      const verify = await gw.inject({ method: "POST", url: "/v1/audit/verify", headers: key });
+      expect(verify.statusCode).toBe(200);
+      expect(verify.json().ok).toBe(true);
+      expect(verify.json().anchored).toMatchObject({
+        checkpoint_id: checkpoint.id, event_count: checkpoint.payload.event_count });
+    } finally {
+      if (prevKey === undefined) delete process.env.AUDIT_CHECKPOINT_KEY;
+      else process.env.AUDIT_CHECKPOINT_KEY = prevKey;
+      if (prevPub === undefined) delete process.env.AUDIT_CHECKPOINT_PUBLIC_KEY;
+      else process.env.AUDIT_CHECKPOINT_PUBLIC_KEY = prevPub;
+    }
+  });
+
   it("bounds stored attributes, flags clock skew, and refuses spans outside the late window", async () => {
     const { spanRowId } = await import("../src/otlp.js");
     const hex = (n: number) => randomUUID().replace(/-/g, "").slice(0, n);

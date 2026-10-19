@@ -53,10 +53,13 @@ async function applyRule(
       return r.rowCount ?? 0;
     }
     case "approvals": {
-      // Terminal rows only. Pending approvals decide real calls and stay.
+      // §13.4: retention never deletes live work. Pending approvals decide
+      // real calls, approved ones are about to execute, and claimed or
+      // executing rows may still be in flight — only terminal rows age out.
       const r = await client.query(
-        `DELETE FROM approvals WHERE workspace_id = $1 AND status <> 'pending'
-         AND requested_at < ${cutoff}`, [rule.workspace_id]
+        `DELETE FROM approvals WHERE workspace_id = $1
+           AND status NOT IN ('pending', 'approved', 'claimed', 'executing')
+           AND requested_at < ${cutoff}`, [rule.workspace_id]
       );
       return r.rowCount ?? 0;
     }

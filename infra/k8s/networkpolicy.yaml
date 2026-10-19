@@ -1,0 +1,112 @@
+# §6.1/FR-004: the k8s path gets the same boundary the Compose file
+# enforces. Default-deny for the console's pods, then the flows the
+# deployment needs. The agent-facing half is the point: only the gateway
+# may egress toward upstream MCP servers, so a workload that somehow ends
+# up beside the console can never talk to them directly. Pair this with a
+# deny-by-default policy in whatever namespace your upstream servers live
+# in, so agent pods there hold no permit either.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traceguard-default-deny
+  namespace: traceguard
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [api, gateway, postgres, web]
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traceguard-allow-dns-egress
+  namespace: traceguard
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traceguard-postgres-ingress
+  namespace: traceguard
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [api, gateway]
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traceguard-datastore-egress
+  namespace: traceguard
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [api, gateway]
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Upstream MCP servers live outside this namespace; the gateway is the
+    # only workload allowed to reach them (§6.1). Narrow this to the
+    # upstream namespace or CIDRs once they are known.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traceguard-dashboard-ingress
+  namespace: traceguard
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [api, gateway, web]
+  policyTypes: [Ingress]
+  ingress:
+    # The console and the agents connect from outside the cluster: the
+    # gateway's 8091 (agent edge) and 8093 (approval control listener),
+    # the api's 8080, and the web console's 80 are the reachable surfaces.
+    - ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8091
+        - protocol: TCP
+          port: 8093

@@ -19,9 +19,15 @@ server and an allow policy against the mock upstream to time a real proxied call
 rather than something easier to measure. If the mock upstream is not running, the
 gateway row reports itself as skipped.
 
+The §14 thresholds are also a gate: `scripts/bench.mjs` prints a PASS/FAIL
+verdict per NFR at the end of each run and exits non-zero when any p95 misses
+its budget. It is not a CI job because it needs a live stack and a warm
+database; run it against the deployment you are about to quote.
+
 ## A run of it
 
-Measured 2026-10-17 on a Windows 11 dev box: Docker Desktop Postgres, Node 22,
+Measured 2026-10-17 on a Windows 11 dev box — Intel Core i7-8750H (6 cores /
+12 threads), 16 GB RAM — running Node 22 with Docker Desktop Postgres,
 2215 runs and 726 spans with usage in the database, 50 sequential requests per
 path, warmed database.
 
@@ -37,9 +43,9 @@ Against the §14 engineering targets:
 
 | Target | Budget | Measured | Verdict |
 |---|---|---|---|
-| Typical dashboard queries | p95 < 500ms | 37ms | inside |
-| Ingestion-to-dashboard visibility | p95 < 3s | 93ms | inside |
-| Gateway policy overhead | p95 < 100ms | 15ms over 110 decisions | inside |
+| NFR-003 Typical dashboard queries | p95 < 500ms | 37ms | inside |
+| NFR-002 Ingestion-to-dashboard visibility | p95 < 3s | 93ms | inside |
+| NFR-001 Gateway policy overhead | p95 < 100ms | 15ms over 110 decisions | inside |
 
 The gateway figure is measured, not inferred. The gateway records how long each
 policy decision took in `policy_decisions.overhead_ms`, read before the call is

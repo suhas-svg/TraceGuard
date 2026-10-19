@@ -15,6 +15,8 @@ variable, which is how the compose file reads them.
 | GATEWAY_CONTROL_PORT | gateway | 8093 | human approval control listener; agent credentials are rejected there |
 | APPROVAL_TTL_SECONDS | gateway | 300 | pending approvals die after this |
 | APPROVAL_CLAIM_LEASE_SECONDS | gateway | 30 | how long a consume attempt holds the CLAIMED lease before the sweep returns it to APPROVED |
+| AUDIT_CHECKPOINT_KEY | gateway | — | ed25519 PEM private key enabling POST /v1/audit/checkpoints; unset answers 503 |
+| AUDIT_CHECKPOINT_PUBLIC_KEY | gateway | — | ed25519 PEM public key the prune route and the verifier use to validate checkpoints; unset answers 503 on prune and skips anchoring on verify |
 | APPROVAL_EXECUTION_TIMEOUT_SECONDS | gateway | 300 | how long an EXECUTING row may stay unresolved before the sweep finalizes it as OUTCOME_UNKNOWN |
 | APPROVAL_MAX_PENDING_PER_CALLER | gateway | 10 | spec hard maximum; set lower only |
 | APPROVAL_MAX_PENDING_PER_WORKSPACE | gateway | 100 | spec hard maximum; set lower only |

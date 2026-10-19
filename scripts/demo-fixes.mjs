@@ -9,6 +9,8 @@
 // mock tools on 8092, web preview on 5173, and Playwright's chromium.
 // scripts/demo-fixes.sh starts all four.
 
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { Pool } from "pg";
 import { chromium } from "@playwright/test";
@@ -152,8 +154,29 @@ head(4, "Approvals: the queue is control-listener only, plaintext for the approv
     name: `demo-approve-${tag}`, priority: 500, server_id: srv.data.id,
     tool_name: tool, effect: "require_approval"
   });
+  // §13.3: the gateway enforces only signed content, so the demo publishes a
+  // real bundle through the operator-side publisher; the private key stays on
+  // this host. Drafts first (server, pin, rule), then sign.
+  const keyDir = process.env.POLICY_KEY_DIR ?? "demo-policy-keys";
+  const publisher = (args) => {
+    // Plain node + the tsx CLI: npx.cmd cannot be spawned without a shell on
+    // Windows, and this keeps the demo dependency-free on every platform.
+    const r = spawnSync(process.execPath,
+      ["node_modules/tsx/dist/cli.mjs", "tools/policy-publisher/src/index.ts", ...args],
+      { env: { ...process.env }, encoding: "utf8" });
+    if (r.status !== 0) {
+      throw new Error(
+        `policy-publisher ${args[0]} failed: ` +
+        (r.error ? String(r.error) : r.stderr || r.stdout));
+    }
+    return r.stdout;
+  };
+  if (!existsSync(`${keyDir}/signing-key.pem`)) publisher(["keygen", "--out", keyDir]);
+  publisher(["trust", "--workspace", "default",
+    "--public-key", `${keyDir}/signing-key.pub.pem`, "--rotate"]);
+  publisher(["publish", "--workspace", "default", "--key", `${keyDir}/signing-key.pem`]);
   const callOut = await gw("POST", "/v1/gateway/tools/call", {
-    server_id: srv.data.id, tool, arguments: { text: secretText },
+    server_id: srv.data.id, tool, arguments: { path: secretText },
     caller: "demo", request_id: `demo-${tag}`
   });
   const approvalId = callOut.data.approval_id;
@@ -179,8 +202,8 @@ head(4, "Approvals: the queue is control-listener only, plaintext for the approv
     `as member -> ${asMember.status}; secret string present in payload: ` +
       `${JSON.stringify(asMember.data).includes(secretText)}`);
   check("the approver opens the same row on the control listener",
-    rowApprover?.args?.text === secretText,
-    `as approver: args.text = ${JSON.stringify(rowApprover?.args?.text)}`);
+    rowApprover?.args?.path === secretText,
+    `as approver: args.path = ${JSON.stringify(rowApprover?.args?.path)}`);
   check("the agent-facing listener no longer serves the queue",
     onAgentPort.status === 404,
     `GET http://localhost:8091/v1/approvals -> ${onAgentPort.status}`);
@@ -324,9 +347,9 @@ head(9, "OTLP: a span with no usable start time is rejected and reported");
       WHERE a.name = $1
       ORDER BY s.started_at DESC LIMIT 1`, [`demo-otlp-${tag}`]))[0];
   check("the good span lands, the unusable one is counted as rejected",
-    res.data.accepted === 1 && res.data.rejected === 1,
-    `accepted=${res.data.accepted} rejected=${res.data.rejected} ` +
-      `partialSuccess=${JSON.stringify(res.data.partialSuccess)}`);
+    res.data.partialSuccess?.rejectedSpans === 1,
+    `rejectedSpans=${res.data.partialSuccess?.rejectedSpans} ` +
+      `errorMessage=${JSON.stringify(res.data.partialSuccess?.errorMessage)}`);
   check("nothing is stored at the epoch", epoch.n === 0,
     `spans with started_at before 2000 -> ${epoch.n}`);
   check("a double usage value is kept as a number", Number(stored?.input_tokens) === 1234,
@@ -355,8 +378,12 @@ head(11, "Gateway: a hanging upstream is aborted at UPSTREAM_TIMEOUT_MS");
   // is not a test: this network refuses it in milliseconds, so nothing is
   // proven about the timeout.
   const blackhole = createServer(() => { /* deliberately never responds */ });
-  await new Promise((resolve) => blackhole.listen(0, "127.0.0.1", resolve));
-  const blackholeUrl = `http://127.0.0.1:${blackhole.address().port}/mcp`;
+  // The gateway container does the dialing, so the socket must be reachable
+  // from its network: bind everywhere and dial the host alias when this
+  // script runs on the host, outside the compose network.
+  const hangHost = process.env.HANG_HOST ?? "host.docker.internal";
+  await new Promise((resolve) => blackhole.listen(0, "0.0.0.0", resolve));
+  const blackholeUrl = `http://${hangHost}:${blackhole.address().port}/mcp`;
   const budget = Number(process.env.UPSTREAM_TIMEOUT_MS ?? 60000);
   try {
     const srv = await gw("POST", "/v1/servers", { name: `demo-hang-${tag}`, base_url: blackholeUrl });
