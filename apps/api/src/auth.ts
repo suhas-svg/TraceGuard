@@ -4,12 +4,18 @@ import { pool } from "./db.js";
 import { oauthConfigFromEnv, resourceMetadataUrl, verifyAccessToken } from "./oauth.js";
 
 // Scoped credentials. Roles map to scope sets; keys carry a subset of their
-// owner's role scopes. The old environment keys keep working with full
-// access, so single-user installs change nothing.
+// owner's role scopes. Only the approver role (and an OAuth token the trusted
+// issuer stamps with "approve") can decide approvals: the admin role
+// administers but does not approve, so automation that holds the admin key
+// still cannot reach the approval surface (§9.1).
 export const ALL_SCOPES = ["admin", "ingest", "gateway", "approve", "read"];
 
+// The static env keys and the admin role keep full administrative scope;
+// "approve" is deliberately absent.
+export const ADMIN_SCOPES = ["admin", "ingest", "gateway", "read"];
+
 export const ROLE_SCOPES: Record<string, string[]> = {
-  admin: ALL_SCOPES,
+  admin: ADMIN_SCOPES,
   member: ["read", "ingest", "gateway"],
   approver: ["read", "approve"]
 };
@@ -35,7 +41,7 @@ const WRITE_ALLOW: [string, string][] = [
   ["/v1/traces", "ingest"],
   ["/v1/gateway/tools/call", "gateway"],
   ["/mcp", "gateway"],
-  ["/v1/approvals/", "approve"]
+  ["/_control/v1/approvals/", "approve"]
 ];
 const ROUTES: [string, string][] = [
   ["/v1/auth/login", "public"],
@@ -47,8 +53,10 @@ const ROUTES: [string, string][] = [
   ["/v1/traces", "ingest"],
   ["/v1/gateway/tools/call", "gateway"],
   ["/mcp", "gateway"],
-  ["/v1/approvals/", "approve"],
-  ["/v1/approvals", "read"],
+  // The approval control surface is human-only and lives on its own
+  // listener; even listing the queue requires the approver's scope.
+  ["/_control/v1/approvals/", "approve"],
+  ["/_control/v1/approvals", "approve"],
   ["/v1/overview", "read"],
   ["/v1/agents", "read"],
   ["/v1/runs", "read"],
@@ -120,7 +128,7 @@ export async function resolvePrincipal(authHeader: string): Promise<Principal | 
   // deployment even if their environment variables are still set.
   const staticKeysAllowed = !(oauth && process.env.NODE_ENV === "production");
   if (staticKeysAllowed && process.env.API_KEY && token === process.env.API_KEY) {
-    return { kind: "env", userId: null, scopes: ALL_SCOPES, workspaces: "all" };
+    return { kind: "env", userId: null, scopes: ADMIN_SCOPES, workspaces: "all" };
   }
   if (staticKeysAllowed && process.env.APPROVER_KEY && token === process.env.APPROVER_KEY) {
     return { kind: "env", userId: null, scopes: ["approve", "read"], workspaces: "all" };
@@ -203,7 +211,7 @@ declare module "fastify" {
 }
 
 export async function authHook(req: FastifyRequest, reply: FastifyReply): Promise<void> {
-  if (!req.url.startsWith("/v1/") && !req.url.startsWith("/mcp")) return;
+  if (!req.url.startsWith("/v1/") && !req.url.startsWith("/mcp") && !req.url.startsWith("/_control/")) return;
   const scope = requiredScope(req.url, req.method);
   if (scope === "public") return;
   const principal = await resolvePrincipal(req.headers.authorization ?? "");
@@ -216,7 +224,11 @@ export async function authHook(req: FastifyRequest, reply: FastifyReply): Promis
     }
     return reply.code(401).send({ error: "unauthorized" }) as unknown as void;
   }
-  if (!principal.scopes.includes(scope) && !principal.scopes.includes("admin")) {
+  // The approval control surface takes the approve scope itself; "admin"
+  // does not shortcut it, so a plain admin key cannot decide in place of the
+  // approver and agent automation can never approve itself (§9.1).
+  const adminShortcut = !req.url.startsWith("/_control/");
+  if (!principal.scopes.includes(scope) && !(adminShortcut && principal.scopes.includes("admin"))) {
     return forbidden(reply, scope) as unknown as void;
   }
   req.principal = principal;

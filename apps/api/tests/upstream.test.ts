@@ -52,6 +52,20 @@ describe("tool definition pin", () => {
       .toMatch(/external \$ref/);
   });
 
+  it("rejects the other external reference keywords and absolute $id", () => {
+    expect(definitionIssue({ name: "x", inputSchema: { $dynamicRef: "https://evil.example/s.json" } }))
+      .toMatch(/external \$dynamicRef/);
+    expect(definitionIssue({ name: "x", inputSchema: { properties: { a: { $recursiveRef: "https://evil.example/s.json" } } } }))
+      .toMatch(/external \$recursiveRef/);
+    // Local references stay legal; only resolution targets outside the schema do not.
+    expect(definitionIssue({ name: "x", inputSchema: { $dynamicRef: "#meta" } })).toBeNull();
+    expect(definitionIssue({ name: "x", inputSchema: { $id: "https://evil.example/s.json" } }))
+      .toMatch(/absolute \$id/);
+    expect(definitionIssue({ name: "x", inputSchema: { $id: "//evil.example/s.json" } }))
+      .toMatch(/absolute \$id/);
+    expect(definitionIssue({ name: "x", inputSchema: { $id: "#/$defs/a" } })).toBeNull();
+  });
+
   it("bounds schema depth and node count", () => {
     const deep: Record<string, unknown> = {};
     let cursor = deep;
@@ -82,6 +96,37 @@ describe("upstream URL validation", () => {
   it("leaves public hosts alone", () => {
     for (const host of ["example.com", "8.8.8.8", "172.32.0.1", "192.169.0.1", "2001:4860:4860::8888"]) {
       expect(isPrivateHost(host), host).toBe(false);
+    }
+  });
+
+  it("flags documentation, benchmark, and reserved ranges", () => {
+    for (const host of ["192.0.0.9", "192.0.2.5", "198.18.0.1", "198.19.255.1", "203.0.113.7", "240.0.0.1"]) {
+      expect(isPrivateHost(host), host).toBe(true);
+    }
+    for (const host of ["192.0.1.1", "198.20.0.1", "203.0.114.1"]) {
+      expect(isPrivateHost(host), host).toBe(false);
+    }
+  });
+
+  it("fails closed on numeric hosts that are not valid dotted quads", () => {
+    // The WHATWG parser refuses 127.0.0.256 outright, but isPrivateHost is
+    // also fed raw strings (DNS answers), so it treats any numeric-looking
+    // host it cannot parse as private rather than public.
+    expect(checkUpstreamUrl("http://127.0.0.256/mcp").ok).toBe(false);
+    expect(isPrivateHost("127.0.0.256")).toBe(true);
+  });
+
+  it("classifies shorthand loopback forms through normalization", () => {
+    // 0x7f000001 and 2130706433 are loopback in every form the kernel dials;
+    // the gate must see the normalized address, not a benign-looking string.
+    const prev = process.env.ALLOW_PRIVATE_UPSTREAMS;
+    delete process.env.ALLOW_PRIVATE_UPSTREAMS;
+    try {
+      const res = checkUpstreamUrl("http://0x7f000001/mcp");
+      expect(res.ok).toBe(false);
+      expect(res.reason).toContain("private");
+    } finally {
+      process.env.ALLOW_PRIVATE_UPSTREAMS = prev ?? "true";
     }
   });
 

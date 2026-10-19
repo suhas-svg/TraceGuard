@@ -66,11 +66,18 @@ describe("least-privilege database roles", () => {
     }
   });
 
-  it("owns the audit table from a non-login role", async () => {
-    const res = await pool.query<{ owner: string }>(
+  it("owns the audit table and append function from a non-login role", async () => {
+    const table = await pool.query<{ owner: string }>(
       "SELECT pg_get_userbyid(relowner) AS owner FROM pg_class WHERE relname = 'audit_events'"
     );
-    expect(res.rows[0]?.owner).toBe("audit_owner");
+    expect(table.rows[0]?.owner).toBe("audit_owner");
+    // The function is SECURITY DEFINER: whoever owns it is the identity the
+    // append body runs as, so a migration role owning it would silently
+    // restore a superuser execution context for every append.
+    const fn = await pool.query<{ owner: string }>(
+      "SELECT pg_get_userbyid(proowner) AS owner FROM pg_proc WHERE proname = 'append_audit_event'"
+    );
+    expect(fn.rows[0]?.owner).toBe("audit_owner");
   });
 
   it("api_runtime cannot alter signed policy, trust state, audit, or approvals", async () => {

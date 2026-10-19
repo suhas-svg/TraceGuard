@@ -20,8 +20,11 @@ approver approve, deny, or run an approved call.
 
 Preconditions:
 
-- Baseline met; gateway up (:8091) and the dashboard's approver key matches the gateway
-  (`dev_approver_change_me` by default).
+- Baseline met; gateway up (:8091) with its approval control listener up (:8093,
+  same process) and the dashboard's approver key matches the gateway
+  (`dev_approver_change_me` by default). The dashboard reads the queue from
+  the control listener, so a proxy/port map that hides 8093 breaks Approvals
+  while the rest of the dashboard works.
 - A fresh pending approval exists. The reliable recipe (proven 2026-10-16, updated for
   signed policy): bring up the compose mock upstream (`docker compose up -d mock-tools` —
   it is on the internal `tools` network, so the gateway reaches it as
@@ -62,7 +65,7 @@ Preconditions:
   approval right before driving; an expired card cannot be decided (the gateway answers 410
   and flips it to `expired`).
 - The reason is per-card: set it on the same card div that owns the `Approve` button.
-- Decisions use the approver key, not the API key — a 401 here is a key mismatch, not a bug.
+- Decisions need the approver key (or a token carrying the approve scope); the API/admin key is refused with 403 — the boundary working, not a bug.
 - An approval is single-use: `Run now` consumes it; replaying gets `410`. Never decide
   the same approval twice in one run.
 - Expiry: past `expires_at` the gateway refuses execution regardless of approval.

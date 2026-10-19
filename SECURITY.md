@@ -1,4 +1,14 @@
-# Reporting security issues
+# Security policy
+
+## Supported versions
+
+The project is pre-1.0. Only the tip of `main` (the most recent commit or
+the most recent tagged pre-release, when tags exist) is supported with
+security fixes. Older commits, forks, and locally modified deployments
+are not supported; if you run a modified build, reproduce the issue on an
+unmodified checkout before reporting it.
+
+## Reporting security issues
 
 Do not file a public issue for a suspected vulnerability. Email the
 repository owner instead, with:

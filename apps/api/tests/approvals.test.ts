@@ -4,7 +4,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { buildApp } from "../src/index.js";
-import { buildGateway } from "../src/gateway.js";
+import { buildGateway, buildGatewayControl } from "../src/gateway.js";
 import { pool } from "../src/db.js";
 import { publishTestPolicy } from "./policy-helper.js";
 
@@ -14,6 +14,8 @@ import { publishTestPolicy } from "./policy-helper.js";
 describe("approval state machine v2", () => {
   const api = buildApp();
   const gw = buildGateway();
+  // The human approval surface: queue + decisions, on its own listener.
+  const ctl = buildGatewayControl();
   const key = { authorization: "Bearer test_key" };
   const approver = { authorization: "Bearer test_approver" };
   const tag = Date.now().toString(36);
@@ -33,6 +35,13 @@ describe("approval state machine v2", () => {
   // A protocol-level tool error is an unambiguous response, not success.
   mock.registerTool("err", { description: "tool error", inputSchema: {} },
     async () => ({ content: [{ type: "text", text: "upstream refused" }], isError: true }));
+  // Slow but successful: lets a sweep finalize the row while the upstream is
+  // still working, for the late-response guard.
+  mock.registerTool("slow", { description: "slow", inputSchema: { text: z.string() } },
+    async ({ text }) => {
+      await new Promise((r) => setTimeout(r, 3000));
+      return { content: [{ type: "text", text: `slow:${text}` }] };
+    });
 
   return mock;
   };
@@ -68,6 +77,7 @@ describe("approval state machine v2", () => {
     httpServer.close();
     await api.close();
     await gw.close();
+    await ctl.close();
     await pool.end();
   });
 
@@ -76,7 +86,7 @@ describe("approval state machine v2", () => {
       payload: { server_id: serverId, tool, arguments: args, caller } });
 
   const decide = (id: string, approved = true) =>
-    gw.inject({ method: "POST", url: `/v1/approvals/${id}/decision`, headers: approver,
+    ctl.inject({ method: "POST", url: `/_control/v1/approvals/${id}/decision`, headers: approver,
       payload: { approved } });
 
   it("refuses more than N new approvals per caller per minute", async () => {
@@ -164,9 +174,98 @@ describe("approval state machine v2", () => {
       `UPDATE approvals SET status='executing', execution_started_at=now() - interval '1 hour'
         WHERE id = $1`, [id]
     );
-    const listed = await gw.inject({ method: "GET", url: "/v1/approvals?status=outcome_unknown", headers: key });
+    const listed = await ctl.inject({ method: "GET", url: "/_control/v1/approvals?status=outcome_unknown", headers: approver });
     const row = listed.json().items.find((a: { id: string }) => a.id === id);
     expect(row).toBeDefined();
     expect(row.outcome_summary).toContain("may have executed");
+  });
+
+  it("returns the same approval for a repeated request id and refuses a conflicting reuse", async () => {
+    const caller = `dedupe-${tag}`;
+    const requestId = `dedupe-${tag}-1`;
+    const first = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: "same" }, caller, request_id: requestId } });
+    expect(first.statusCode).toBe(202);
+    const repeated = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: "same" }, caller, request_id: requestId } });
+    expect(repeated.statusCode).toBe(202);
+    expect(repeated.json().approval_id).toBe(first.json().approval_id);
+    const conflicting = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: "different" }, caller, request_id: requestId } });
+    expect(conflicting.statusCode).toBe(409);
+    expect(conflicting.json().error).toBe("request_id_conflict");
+  });
+
+  it("returns an expired claim lease to APPROVED and the sealed request still consumes", async () => {
+    const caller = `lease-${tag}`;
+    const held = await call(caller, "echo", { text: "lease" });
+    expect(held.statusCode).toBe(202);
+    const id = held.json().approval_id as string;
+    // Simulate a crash after the CAS claim but before the execution intent:
+    // the row is claimed with an already-expired lease and no intent audit.
+    await pool.query(
+      `UPDATE approvals SET status='claimed', claim_id=gen_random_uuid(),
+         claim_lease_expires_at=now() - interval '1 second' WHERE id = $1`, [id]);
+    const listed = await ctl.inject({ method: "GET", url: "/_control/v1/approvals?status=approved", headers: approver });
+    expect(listed.json().items.find((a: { id: string }) => a.id === id)).toBeDefined();
+    const after = (await pool.query("SELECT status, claim_id FROM approvals WHERE id = $1", [id])).rows[0];
+    expect(after.status).toBe("approved");
+    expect(after.claim_id).toBeNull();
+    const audit = (await pool.query(
+      "SELECT count(*)::int AS n FROM audit_events WHERE action = 'approval.claim_expired' AND resource_id = $1", [id])).rows[0];
+    expect(audit.n).toBe(1);
+    const retry = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: serverId, tool: "echo", arguments: { text: "lease" }, caller, approval_id: id } });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json().result.content[0].text).toBe("echo:lease");
+  });
+
+  it("keeps a late upstream response out of a finalized row and audits it", async () => {
+    const caller = `late-${tag}`;
+    const held = await call(caller, "slow", { text: "later" });
+    expect(held.statusCode).toBe(202);
+    const id = held.json().approval_id as string;
+    expect((await decide(id)).statusCode).toBe(200);
+
+    const previous = process.env.APPROVAL_EXECUTION_TIMEOUT_SECONDS;
+    process.env.APPROVAL_EXECUTION_TIMEOUT_SECONDS = "1";
+    try {
+      const retryPromise = gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+        payload: { server_id: serverId, tool: "slow", arguments: { text: "later" }, caller, approval_id: id } });
+      // Let the row enter EXECUTING, then sweep it while the upstream still works.
+      await new Promise((r) => setTimeout(r, 1500));
+      await ctl.inject({ method: "GET", url: "/_control/v1/approvals?status=outcome_unknown", headers: approver });
+      const during = (await pool.query("SELECT status FROM approvals WHERE id = $1", [id])).rows[0];
+      expect(during.status).toBe("outcome_unknown");
+      const retry = await retryPromise;
+      // The caller still receives the response that actually arrived...
+      expect(retry.statusCode).toBe(200);
+      expect(retry.json().result.content[0].text).toBe("slow:later");
+    } finally {
+      if (previous === undefined) delete process.env.APPROVAL_EXECUTION_TIMEOUT_SECONDS;
+      else process.env.APPROVAL_EXECUTION_TIMEOUT_SECONDS = previous;
+    }
+    // ...but the finalized row is not rewritten, and the late arrival is audited.
+    const after = (await pool.query("SELECT status FROM approvals WHERE id = $1", [id])).rows[0];
+    expect(after.status).toBe("outcome_unknown");
+    const audit = (await pool.query(
+      "SELECT count(*)::int AS n FROM audit_events WHERE action = 'approval.response_late' AND resource_id = $1", [id])).rows[0];
+    expect(audit.n).toBe(1);
+  });
+
+  it("serves approvals only on the control listener, never the agent port", async () => {
+    const gone = await gw.inject({ method: "GET", url: "/v1/approvals", headers: key });
+    expect(gone.statusCode).toBe(404);
+    const goneWrite = await gw.inject({ method: "POST", url: "/v1/approvals/00000000-0000-0000-0000-000000000000/decision",
+      headers: approver, payload: { approved: true } });
+    // The approver key is scoped out by the default admin requirement before
+    // routing; either way the agent-facing app does not serve the decision route.
+    expect(goneWrite.statusCode).toBe(403);
+    const anonymous = await ctl.inject({ method: "GET", url: "/_control/v1/approvals" });
+    expect(anonymous.statusCode).toBe(401);
+    // The admin/API key holds no approve scope, and admin does not shortcut
+    // the control surface: only approver credentials may list or decide.
+    const adminAtCtl = await ctl.inject({ method: "GET", url: "/_control/v1/approvals", headers: key });
+    expect(adminAtCtl.statusCode).toBe(403);
   });
 });

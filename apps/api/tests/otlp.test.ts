@@ -80,4 +80,40 @@ describe("otlp mapping", () => {
     expect(m.usageSource).toBe("unavailable");
     expect(m.agentName).toBe("otel-agent");
   });
+
+  it("flags clock skew and never records a negative duration", () => {
+    const start = 1760371200000000000n;
+    const future = mapOtlpSpan(
+      { ...base,
+        startTimeUnixNano: String(start + 10n * 60n * 1_000_000_000n),
+        endTimeUnixNano: String(start + 11n * 60n * 1_000_000_000n) },
+      resource,
+      { receivedAtMs: Number(start / 1_000_000n), skewThresholdMs: 5 * 60_000 }
+    )!;
+    expect(future.clockSkew).toBe(true);
+    const backwards = mapOtlpSpan(
+      { ...base,
+        startTimeUnixNano: String(start),
+        endTimeUnixNano: String(start - 1_000_000n) },
+      resource
+    )!;
+    expect(backwards.durationMs).toBe(0);
+    expect(backwards.clockSkew).toBe(true);
+  });
+
+  it("caps stored attributes and truncates long strings", () => {
+    const many = Array.from({ length: 80 }, (_, i) => ({
+      key: `k${i}`,
+      value: { stringValue: i === 0 ? "y".repeat(5000) : `v${i}` }
+    }));
+    const m = mapOtlpSpan({ ...base, attributes: many }, resource)!;
+    const keys = Object.keys(m.attributes);
+    expect(keys).toHaveLength(64);
+    expect((m.attributes.k0 as string).length).toBe(4096);
+    expect(m.attributes.k64).toBeUndefined();
+    const custom = mapOtlpSpan({ ...base, attributes: many }, resource,
+      { maxAttributes: 2, maxAttrString: 10 })!;
+    expect(Object.keys(custom.attributes)).toHaveLength(2);
+    expect(custom.attributes.k0).toBe("y".repeat(10));
+  });
 });

@@ -15,6 +15,10 @@ COPY apps/api ./apps/api
 # apps/api imports these workspaces, so their dist/ must exist before its
 # build; the order below is their dependency order.
 RUN npm run build --workspace=@traceguard/schemas --workspace=@traceguard/canonical-json --workspace=@traceguard/policy-signing --workspace=@traceguard/audit-chain --workspace=@traceguard/api
+# §13.3: the gateway's rollback anchor lives in GATEWAY_STATE_DIR. Create the
+# mount point owned by the runtime user so a fresh named volume inherits the
+# ownership instead of being root-owned and unwritable.
+RUN mkdir -p /app/gateway-state && chown node:node /app/gateway-state
 # Non-root: an RCE in a span parser or the MCP client should not land as uid 0.
 USER node
 EXPOSE 8080

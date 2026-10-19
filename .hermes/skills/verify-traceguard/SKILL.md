@@ -24,7 +24,8 @@ Repo-local skills need the project trusted once: `hermes skills trust` in the re
 Everything runs from the repo root (`E:\Desktop\Traceguard`, Windows, Git Bash shell —
 POSIX syntax works in `terminal`; use `C:/...` paths for native tools).
 
-1. **Docker stack** (postgres :5432, api :8090, gateway :8091):
+1. **Docker stack** (postgres :5432, api :8090, gateway :8091, approval
+   control listener :8093):
 
    ```sh
    docker compose up -d --build postgres api gateway
@@ -75,10 +76,11 @@ One read-only gate — run this whenever anything looks off:
 curl -s -o /dev/null -w "api:%{http_code} " http://localhost:8090/healthz; \
 curl -s -o /dev/null -w "ready:%{http_code} " http://localhost:8090/readyz; \
 curl -s -o /dev/null -w "gw:%{http_code} " http://localhost:8091/healthz; \
+curl -s -o /dev/null -w "ctl:%{http_code} " http://localhost:8093/healthz; \
 curl -s -o /dev/null -w "web:%{http_code}\n" http://localhost:5173/
 ```
 
-Expected: `api:200 ready:200 gw:200 web:200`. `ready` non-200 means postgres is down or
+Expected: `api:200 ready:200 gw:200 ctl:200 web:200`. `ready` non-200 means postgres is down or
 migrations were not applied. A 401 anywhere means the wrong key is configured — the
 dashboard defaults (`dev_key_change_me`, `dev_approver_change_me`) match the compose
 defaults, so only localStorage overrides break this.

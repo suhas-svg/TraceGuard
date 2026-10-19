@@ -7,7 +7,10 @@ spec:
   selector:
     app: gateway
   ports:
-    - port: 8091
+    - name: agent
+      port: 8091
+    - name: control
+      port: 8093
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -38,6 +41,9 @@ spec:
           args: ["node", "apps/api/dist/gateway.js"]
           ports:
             - containerPort: 8091
+            # §9: human approvals are served on a separate listener so
+            # NetworkPolicy can keep it off the agent network entirely.
+            - containerPort: 8093
           env:
             - name: GATEWAY_DB_PASSWORD
               valueFrom: { secretKeyRef: { name: traceguard-secrets, key: GATEWAY_DB_PASSWORD } }
@@ -56,8 +62,12 @@ spec:
               valueFrom: { secretKeyRef: { name: traceguard-secrets, key: APPROVAL_ARGS_KEY_PREVIOUS, optional: true } }
             - name: GATEWAY_PORT
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: GATEWAY_PORT } }
+            - name: GATEWAY_CONTROL_PORT
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: GATEWAY_CONTROL_PORT } }
             - name: APPROVAL_TTL_SECONDS
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: APPROVAL_TTL_SECONDS } }
+            - name: APPROVAL_CLAIM_LEASE_SECONDS
+              valueFrom: { configMapKeyRef: { name: traceguard-config, key: APPROVAL_CLAIM_LEASE_SECONDS, optional: true } }
             - name: ALLOW_PRIVATE_UPSTREAMS
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: ALLOW_PRIVATE_UPSTREAMS } }
             - name: DASHBOARD_ORIGIN

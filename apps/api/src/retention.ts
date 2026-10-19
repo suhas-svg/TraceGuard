@@ -8,7 +8,7 @@ import { audit } from "./audit.js";
 // touches policies, decisions, pending approvals, the audit log, or money.
 // Like the stale-run finalizer, an operator cron calls the run endpoint;
 // the app holds no scheduler.
-const targets = ["runs", "approvals", "webhook_deliveries"] as const;
+const targets = ["runs", "approvals", "webhook_deliveries", "spans"] as const;
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
   const found = await client.query("SELECT id FROM workspaces WHERE name = 'default'");
@@ -19,7 +19,13 @@ async function defaultWorkspaceId(client: PoolClient): Promise<string> {
 
 async function applyRule(
   client: PoolClient,
-  rule: { id: string; workspace_id: string; target: string; older_than_days: number }
+  rule: {
+    id: string;
+    workspace_id: string;
+    target: string;
+    older_than_days: number;
+    max_rows?: number | string | null;
+  }
 ): Promise<number> {
   const cutoff = `now() - (${rule.older_than_days} || ' days')::interval`;
   switch (rule.target) {
@@ -46,6 +52,40 @@ async function applyRule(
       );
       return r.rowCount ?? 0;
     }
+    case "spans": {
+      // Traces leave whole: a run and its spans go together so no graph ever
+      // dangles. The age cutoff runs first (§11.4), then the optional row cap
+      // takes oldest runs until the workspace fits under it. Both stay far
+      // from approvals, decisions, and the audit log.
+      const aged = await client.query(
+        `DELETE FROM runs WHERE workspace_id = $1 AND started_at < ${cutoff}`, [rule.workspace_id]
+      );
+      let deleted = aged.rowCount ?? 0;
+      const maxRows = rule.max_rows == null ? null : Number(rule.max_rows);
+      if (maxRows !== null && Number.isFinite(maxRows) && maxRows > 0) {
+        // Bounded sweep: a run usually owns several spans, so a thousand
+        // deletions clears a workspace far past the spec's 100k default; a
+        // still-over-cap workspace is finished on the next scheduled run.
+        for (let i = 0; i < 1000; i++) {
+          const counts = await client.query(
+            `SELECT count(*)::bigint AS n FROM spans s
+             JOIN runs r ON r.id = s.run_id WHERE r.workspace_id = $1`,
+            [rule.workspace_id]
+          );
+          if (BigInt(String(counts.rows[0].n)) <= BigInt(maxRows)) break;
+          const oldest = await client.query(
+            `SELECT r.id FROM runs r WHERE r.workspace_id = $1
+               AND EXISTS (SELECT 1 FROM spans s WHERE s.run_id = r.id)
+             ORDER BY r.started_at ASC, r.id ASC LIMIT 1`,
+            [rule.workspace_id]
+          );
+          if (!oldest.rows[0]) break;
+          await client.query("DELETE FROM runs WHERE id = $1", [oldest.rows[0].id]);
+          deleted++;
+        }
+      }
+      return deleted;
+    }
     default:
       return 0;
   }
@@ -56,6 +96,7 @@ export function registerRetentionRoutes(app: FastifyInstance) {
     name: z.string().min(1).max(128),
     target: z.enum(targets),
     older_than_days: z.number().int().min(1).max(3650),
+    max_rows: z.number().int().min(1).max(1_000_000_000).nullable().optional(),
     enabled: z.boolean().default(true)
   });
 
@@ -68,13 +109,14 @@ export function registerRetentionRoutes(app: FastifyInstance) {
       const r = parsed.data;
       try {
         const res = await client.query(
-          `INSERT INTO retention_rules (workspace_id, name, target, older_than_days, enabled)
-           VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-          [workspaceId, r.name, r.target, r.older_than_days, r.enabled]
+          `INSERT INTO retention_rules (workspace_id, name, target, older_than_days, max_rows, enabled)
+           VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+          [workspaceId, r.name, r.target, r.older_than_days, r.max_rows ?? null, r.enabled]
         );
         await audit(pool, { actor_type: "admin", action: "retention.rule_create",
           resource_type: "retention_rule", resource_id: res.rows[0].id, result: "success",
-          metadata: { name: r.name, target: r.target, older_than_days: r.older_than_days } });
+          metadata: { name: r.name, target: r.target, older_than_days: r.older_than_days,
+            max_rows: r.max_rows ?? null } });
         return reply.code(201).send(res.rows[0]);
       } catch (err: unknown) {
         if ((err as { code?: string }).code === "23505") {
@@ -96,6 +138,7 @@ export function registerRetentionRoutes(app: FastifyInstance) {
     const { id } = req.params as { id: string };
     const parsed = z.object({
       older_than_days: z.number().int().min(1).max(3650).optional(),
+      max_rows: z.number().int().min(1).max(1_000_000_000).nullable().optional(),
       enabled: z.boolean().optional()
     }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_rule" });
@@ -104,6 +147,10 @@ export function registerRetentionRoutes(app: FastifyInstance) {
     if (parsed.data.older_than_days !== undefined) {
       params.push(parsed.data.older_than_days);
       sets.push(`older_than_days = $${params.length}`);
+    }
+    if (parsed.data.max_rows !== undefined) {
+      params.push(parsed.data.max_rows);
+      sets.push(`max_rows = $${params.length}`);
     }
     if (parsed.data.enabled !== undefined) {
       params.push(parsed.data.enabled);

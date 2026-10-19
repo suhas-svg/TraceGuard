@@ -1,4 +1,4 @@
-import Fastify from "fastify";
+import Fastify, { type FastifyInstance } from "fastify";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { PoolClient } from "pg";
@@ -25,6 +25,9 @@ import { captureRawEnabled, redactDeep, summarizeArgs } from "./redact.js";
 const API_KEY = process.env.API_KEY ?? "";
 const APPROVER_KEY = process.env.APPROVER_KEY ?? "";
 const PORT = Number(process.env.GATEWAY_PORT ?? 8091);
+// §9: the human approval surface listens separately from the agent-facing
+// gateway. The dashboard talks to this port; agent credentials never do.
+const CONTROL_PORT = Number(process.env.GATEWAY_CONTROL_PORT ?? 8093);
 // §9.4: default 15 minutes, hard maximum 60 minutes. Deployments may lower the
 // default; nothing may raise the cap without a spec change.
 const APPROVAL_TTL_SECONDS = Math.min(Math.max(Number(process.env.APPROVAL_TTL_SECONDS ?? 900), 60), 3600);
@@ -830,6 +833,14 @@ export function buildGateway() {
         // again, so a deny, a dropped pin, or a quarantined tool added after
         // the approval invalidates it and nothing is dispatched. Prior human
         // approval never overrides a current deny.
+        // §9.2: the consume transaction serializes on the active-config row.
+        // The publisher's activation writes that row, so holding a share lock
+        // here means the signed policy this transaction re-validates cannot
+        // be swapped out from under it before the execution intent commits.
+        await client.query(
+          "SELECT 1 FROM active_config WHERE workspace_id = $1 FOR SHARE",
+          [server.workspace_id]
+        );
         const freshLoad = await loadActivePolicy(client, server.workspace_id);
         if (!freshLoad.ok) {
           // Fail closed without consuming: the approval stays approved and a
@@ -902,54 +913,94 @@ export function buildGateway() {
           await client.query("COMMIT");
           return reply.code(403).send({ error: "policy_invalidated", reason: recheck.reason });
         }
-        // Claim (compare-and-swap) and execution intent. The committed
-        // EXECUTING row is the linearization point: concurrent retries lose
-        // the CAS, and a crash before this COMMIT leaves the approval
-        // APPROVED because nothing was dispatched by construction.
+        // Claim (compare-and-swap) with a short lease, committed separately
+        // from the execution intent (§9.2): a crash after this COMMIT but
+        // before the intent leaves a durable CLAIMED row. No dispatch can
+        // have happened, so the recovery sweep returns it to APPROVED once
+        // the lease expires. Concurrent retries lose the CAS.
+        const claimId = randomUUID();
         const claimed = await client.query(
-          `UPDATE approvals SET status='executing', claim_id=$2, execution_started_at=now(),
-             args='{}'::jsonb, args_enc=false, args_summary=$3
+          `UPDATE approvals SET status='claimed', claim_id=$2,
+             claim_lease_expires_at=now() + ($3::int * interval '1 second')
             WHERE id=$1 AND status='approved' RETURNING id`,
-          [approval.id, randomUUID(), summarizeArgs(stored, { captureRaw: captureRawEnabled() })]
+          [approval.id, claimId, approvalEnv("APPROVAL_CLAIM_LEASE_SECONDS", 30)]
         );
         if (!claimed.rows[0]) {
           await client.query("ROLLBACK");
           return reply.code(409).send({ error: "approval_in_progress" });
         }
+        await client.query("COMMIT");
+
+        // Execution intent, committed before anything may leave for the
+        // upstream (§9.2 rule 6): the EXECUTING row together with this audit
+        // event is the linearization point. Losing the CAS here means the
+        // lease expired and recovery already released the claim.
+        await client.query("BEGIN");
+        const intent = await client.query(
+          `UPDATE approvals SET status='executing', execution_started_at=now(),
+             args='{}'::jsonb, args_enc=false, args_summary=$3
+            WHERE id=$1 AND status='claimed' AND claim_id=$2 RETURNING id`,
+          [approval.id, claimId, summarizeArgs(stored, { captureRaw: captureRawEnabled() })]
+        );
+        if (!intent.rows[0]) {
+          await client.query("ROLLBACK");
+          return reply.code(409).send({ error: "approval_claim_lost" });
+        }
         await audit(client, { actor_type: "agent", actor_id: caller, action: "approval.execution_intent",
           resource_type: "approval", resource_id: approval.id, result: "executing",
-          metadata: { server_id, tool } });
+          metadata: { server_id, tool, claim_id: claimId } });
         await client.query("COMMIT");
         // Only now may anything leave for the upstream (§9.2 rule 6).
         let result: unknown;
         try {
           result = await forward(client, server, tool, stored,
-            caller, { approval_id: approval.id, policy_version_id: freshPolicy.policy_version_id, overheadMs: overheadMs() });
+            caller, { approval_id: approval.id, policy_version_id: freshPolicy.policy_version_id,
+              // The decision trail keeps the fresh consume-time verdict's
+              // rule attribution, not just the version it ran under.
+              policy_id: recheck.rule?.id ?? null, policy_version: recheck.rule?.version ?? null,
+              matched: recheck.matched, overheadMs: overheadMs() });
         } catch (err) {
           // The gateway cannot prove the upstream did not act: burn the
-          // approval into a visible ambiguity, never auto-retry.
-          await pool.query(
+          // approval into a visible ambiguity, never auto-retry. If the
+          // recovery sweep already finalized it, that verdict stands — the
+          // ambiguity is real and the sweep recorded it.
+          const burned = await pool.query(
             `UPDATE approvals SET status='outcome_unknown', terminal_at=now(),
-               outcome_summary=$2 WHERE id=$1`,
+               outcome_summary=$2 WHERE id=$1 AND status='executing'`,
             [approval.id, "The upstream action may have executed."]
           );
-          await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.outcome_unknown",
-            resource_type: "approval", resource_id: approval.id, result: "unknown",
-            metadata: { detail: err instanceof Error ? err.message : String(err) } });
+          if (burned.rowCount) {
+            await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.outcome_unknown",
+              resource_type: "approval", resource_id: approval.id, result: "unknown",
+              metadata: { detail: err instanceof Error ? err.message : String(err) } });
+          }
           return reply.code(502).send({ error: "outcome_unknown", approval_id: approval.id,
             note: "The upstream action may have executed." });
         }
         const upstreamError = !!result && typeof result === "object" &&
           (result as { isError?: unknown }).isError === true;
         const bounded = redactDeep({ result });
-        await pool.query(
+        const outcomeHash = sha256Hex(stableStringify(bounded));
+        const finalized = await pool.query(
           `UPDATE approvals SET status='response_received', response_is_error=$2,
-             terminal_at=now(), outcome_summary=$3, outcome_hash=$4 WHERE id=$1`,
-          [approval.id, upstreamError, boundedSummary(result), sha256Hex(stableStringify(bounded))]
+             terminal_at=now(), outcome_summary=$3, outcome_hash=$4
+            WHERE id=$1 AND status='executing'`,
+          [approval.id, upstreamError, boundedSummary(result), outcomeHash]
         );
-        await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.response_received",
-          resource_type: "approval", resource_id: approval.id,
-          result: upstreamError ? "error" : "success" });
+        if (finalized.rowCount) {
+          await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.response_received",
+            resource_type: "approval", resource_id: approval.id,
+            result: upstreamError ? "error" : "success" });
+        } else {
+          // The recovery sweep finalized this approval while the upstream was
+          // still in flight. The response is evidence, not a reset: the
+          // approval stays OUTCOME_UNKNOWN until reconciliation closes it.
+          await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.response_late",
+            resource_type: "approval", resource_id: approval.id,
+            result: upstreamError ? "error" : "success",
+            metadata: { outcome_hash: outcomeHash,
+              note: "arrived after the approval was finalized as outcome_unknown" } });
+        }
         return { result, approval_id: approval.id };
       }
 
@@ -968,12 +1019,14 @@ export function buildGateway() {
           "SELECT count(*)::int AS n FROM approvals WHERE caller = $1 AND workspace_id = $2 AND requested_at > now() - interval '60 seconds'",
           [caller, server.workspace_id]
         );
-        if (pendingCaller.rows[0].n >= approvalEnv("APPROVAL_MAX_PENDING_PER_CALLER", 10) ||
-            pendingWs.rows[0].n >= approvalEnv("APPROVAL_MAX_PENDING_PER_WORKSPACE", 100)) {
+        // Approval caps are spec hard maxima: operators may lower them via
+        // environment, never raise them past the boundary (10 / 100 / 5).
+        if (pendingCaller.rows[0].n >= Math.min(approvalEnv("APPROVAL_MAX_PENDING_PER_CALLER", 10), 10) ||
+            pendingWs.rows[0].n >= Math.min(approvalEnv("APPROVAL_MAX_PENDING_PER_WORKSPACE", 100), 100)) {
           return reply.code(429).send({ error: "approval_limit",
             pending_caller: pendingCaller.rows[0].n, pending_workspace: pendingWs.rows[0].n });
         }
-        if (recent.rows[0].n >= approvalEnv("APPROVAL_RATE_PER_MINUTE", 5)) {
+        if (recent.rows[0].n >= Math.min(approvalEnv("APPROVAL_RATE_PER_MINUTE", 5), 5)) {
           return reply.code(429).send({ error: "approval_rate_limited", retry_after_seconds: 60 });
         }
         const requestId = parsed.data.request_id ?? `req-${randomUUID()}`;
@@ -988,7 +1041,26 @@ export function buildGateway() {
           [requestId, server.workspace_id, caller, server_id, tool, hash,
            JSON.stringify({ sealed }), true, caller, expiresAt]
         );
-        const row = ap.rows[0] ?? (await client.query("SELECT id, request_id, status, expires_at FROM approvals WHERE request_id=$1", [requestId])).rows[0];
+        type ApprovalRow = { id: string; request_id: string; status: string; expires_at: string };
+        let row: ApprovalRow | undefined = ap.rows[0] as ApprovalRow | undefined;
+        if (!row) {
+          // Dedupe replays of one logical call by request id (§9.4): the same
+          // id must present the same binding. A reused id with different
+          // arguments — or from a different caller — is a conflict, not a
+          // cache hit, and is recorded as one.
+          const prior = await client.query(
+            "SELECT id, request_id, status, expires_at, args_hash FROM approvals WHERE request_id=$1",
+            [requestId]
+          );
+          const found = prior.rows[0];
+          if (!found || !hashesEqual(String(found.args_hash), hash)) {
+            await audit(pool, { actor_type: "agent", actor_id: caller, action: "approval.request_conflict",
+              resource_type: "approval", resource_id: found?.id ?? null, result: "deny",
+              metadata: { server_id, tool } });
+            return reply.code(409).send({ error: "request_id_conflict" });
+          }
+          row = found as ApprovalRow;
+        }
         await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: callArgsHash, decision: "need_approval",
           policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null,
@@ -1016,147 +1088,12 @@ export function buildGateway() {
     }
   });
 
-  app.get("/v1/approvals", async (req, reply) => {
-    reply.header("Cache-Control", "no-store");
-    const q = req.query as { status?: string; limit?: string };
-    const limit = Math.min(Math.max(Number(q.limit ?? 50), 1), 200);
-    // Lazy recovery sweep, driven by DB time (§9.2 rules 2, 7, 9): pending
-    // past TTL expires; executing without a terminal outcome past the recovery
-    // window becomes OUTCOME_UNKNOWN. Claimed-without-executing cannot
-    // persist: claim and execution intent commit in one transaction.
-    const stale = await pool.query(
-      "SELECT * FROM approvals WHERE status = 'pending' AND expires_at < now()"
-    );
-    for (const row of stale.rows) {
-      await pool.query(
-        `UPDATE approvals SET status='expired', terminal_at=now(), args='{}'::jsonb,
-           args_enc=false, args_summary=$2 WHERE id=$1 AND status='pending'`,
-        [row.id, safeSummary(row)]
-      );
-      await audit(pool, { actor_type: "system", action: "approval.expired",
-        resource_type: "approval", resource_id: row.id, result: "expired" });
-    }
-    const stuck = await pool.query(
-      `SELECT id FROM approvals
-        WHERE status = 'executing'
-          AND execution_started_at < now() - ($1::int * interval '1 second')`,
-      [approvalEnv("APPROVAL_EXECUTION_TIMEOUT_SECONDS", 300)]
-    );
-    for (const row of stuck.rows) {
-      await pool.query(
-        `UPDATE approvals SET status='outcome_unknown', terminal_at=now(),
-           outcome_summary=$2 WHERE id=$1 AND status='executing'`,
-        [row.id, "The upstream action may have executed."]
-      );
-      await audit(pool, { actor_type: "system", action: "approval.outcome_unknown",
-        resource_type: "approval", resource_id: row.id, result: "unknown",
-        metadata: { reason: "recovery timeout" } });
-    }
-    const params: unknown[] = [];
-    const where: string[] = [];
-    if (q.status) {
-      params.push(q.status);
-      where.push(`status = $${params.length}`);
-    }
-    // Approvers open plaintext here, so the list itself must already be
-    // confined to their workspaces.
-    const ascope = scopeClause(req.principal, params, "workspace_id");
-    if (ascope) where.push(ascope);
-    params.push(limit);
-    const res = await pool.query(
-      `SELECT * FROM approvals ${where.length ? "WHERE " + where.join(" AND ") : ""}
-       ORDER BY requested_at DESC LIMIT $${params.length}`, params
-    );
-    // Approvers open plaintext here, and only approvers. This route needs
-    // just 'read', which members and agent keys hold, so a caller without the
-    // approve scope gets the row with the arguments withheld rather than the
-    // seal's contents.
-    const mayOpenSeal = !!req.principal &&
-      (req.principal.scopes.includes("approve") || req.principal.scopes.includes("admin"));
-    const items = res.rows.map((row) => {
-      if (!row.args_enc) return row;
-      if (!mayOpenSeal) return { ...row, args: {}, args_withheld: true };
-      try {
-        return { ...row, args: storedArgs(row) };
-      } catch {
-        return { ...row, args: {}, decrypt_error: true };
-      }
-    });
-    return { items };
-  });
+  // The human approval queue and its decision endpoint are served on the
+  // dedicated control listener (§9: registerApprovalControlRoutes below), so
+  // no route on the agent-facing listener can reach them.
 
-  app.post("/v1/approvals/:id/decision", async (req, reply) => {
-    reply.header("Cache-Control", "no-store");
-    const { id } = req.params as { id: string };
-    const parsed = z.object({ approved: z.boolean(), reason: z.string().max(512).default("") }).safeParse(req.body);
-    if (!parsed.success) return reply.code(400).send({ error: "invalid_decision" });
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      // Locked for the rest of the decision: the expiry check and the status
-      // transition cannot be interleaved with a concurrent decide or consume.
-      const ap = await client.query("SELECT * FROM approvals WHERE id = $1 FOR UPDATE", [id]);
-      if (!ap.rows[0]) {
-        await client.query("ROLLBACK");
-        return reply.code(404).send({ error: "approval_not_found" });
-      }
-      const approval = ap.rows[0];
-      if (approval.status !== "pending") {
-        await client.query("ROLLBACK");
-        return reply.code(409).send({ error: "approval_not_pending", status: approval.status });
-      }
-      // Approvals from other workspaces read as missing here too.
-      if (!workspaceAllowed(req.principal, approval.workspace_id)) {
-        await client.query("ROLLBACK");
-        return reply.code(404).send({ error: "approval_not_found" });
-      }
-      if (new Date(approval.expires_at).getTime() < Date.now()) {
-        const expired = await client.query(
-          `UPDATE approvals SET status='expired', args='{}'::jsonb, args_enc=false, args_summary=$2
-            WHERE id=$1 AND status='pending' RETURNING id`,
-          [id, safeSummary(approval)]
-        );
-        await client.query("COMMIT");
-        if (!expired.rows[0]) {
-          return reply.code(409).send({ error: "approval_decided_elsewhere" });
-        }
-        return reply.code(410).send({ error: "approval_expired" });
-      }
-      // Single decision wins: only one row can leave pending state. Denying
-      // drops the sealed arguments immediately, keeping only the redacted
-      // summary and hash; approving keeps them until the retry consumes them.
-      // decided_by records the principal, not a constant: an approval trail
-      // that cannot name the human who decided it answers nothing.
-      const actor = req.principal?.userId ??
-        (req.principal?.kind === "env" ? "env_key" : "unknown");
-      const updated = await client.query(
-        `UPDATE approvals SET status=$2, decided_by=$6, decided_at=now(), decision_reason=$3,
-           args = CASE WHEN $4::boolean THEN '{}'::jsonb ELSE args END,
-           args_enc = CASE WHEN $4::boolean THEN false ELSE args_enc END,
-           args_summary = CASE WHEN $4::boolean THEN $5 ELSE args_summary END
-         WHERE id=$1 AND status='pending' RETURNING *`,
-        [id, parsed.data.approved ? "approved" : "rejected", parsed.data.reason,
-         !parsed.data.approved, parsed.data.approved ? null : safeSummary(approval), actor]
-      );
-      if (!updated.rows[0]) {
-        await client.query("ROLLBACK");
-        return reply.code(409).send({ error: "approval_decided_elsewhere" });
-      }
-      await client.query("COMMIT");
-      await audit(pool, { actor_type: "approver", actor_id: actor, action: "approval.decide",
-        resource_type: "approval", resource_id: id,
-        result: parsed.data.approved ? "approved" : "rejected",
-        metadata: { reason: parsed.data.reason } });
-      void notify(approval.workspace_id, "approval.decided",
-        { approval_id: id, result: parsed.data.approved ? "approved" : "denied" });
-      return updated.rows[0];
-    } catch (err) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw err;
-    } finally {
-      client.release();
-    }
-  });
+
+
 
   app.get("/v1/decisions", async (req) => {
     const q = req.query as { server_id?: string; tool?: string; limit?: string };
@@ -1253,7 +1190,186 @@ export function buildGateway() {
   return app;
 }
 
+// §9: the human approval surface. It lists the queue (driving the lazy
+// recovery sweep) and records approve/reject decisions. It is registered
+// only on the control listener, and the auth table gates every route behind
+// 'approve' scope — which agent keys never carry — so agent credentials
+// cannot reach an approval, no matter which caller tries.
+export function registerApprovalControlRoutes(app: FastifyInstance): void {
+  app.get("/_control/v1/approvals", async (req, reply) => {
+    reply.header("Cache-Control", "no-store");
+    const q = req.query as { status?: string; limit?: string };
+    const limit = Math.min(Math.max(Number(q.limit ?? 50), 1), 200);
+    // Lazy recovery sweep, driven by DB time (§9.2 rules 2, 7, 8, 9): pending
+    // past TTL expires; a CLAIMED row whose lease expired without an
+    // execution intent returns to APPROVED — nothing was dispatched, so the
+    // approval is still safely consumable; executing without a terminal
+    // outcome past the recovery window becomes OUTCOME_UNKNOWN.
+    const stale = await pool.query(
+      "SELECT * FROM approvals WHERE status = 'pending' AND expires_at < now()"
+    );
+    for (const row of stale.rows) {
+      await pool.query(
+        `UPDATE approvals SET status='expired', terminal_at=now(), args='{}'::jsonb,
+           args_enc=false, args_summary=$2 WHERE id=$1 AND status='pending'`,
+        [row.id, safeSummary(row)]
+      );
+      await audit(pool, { actor_type: "system", action: "approval.expired",
+        resource_type: "approval", resource_id: row.id, result: "expired" });
+    }
+    const staleClaims = await pool.query(
+      `SELECT id FROM approvals
+        WHERE status = 'claimed' AND claim_lease_expires_at < now()`
+    );
+    for (const row of staleClaims.rows) {
+      await pool.query(
+        `UPDATE approvals SET status='approved', claim_id=NULL, claim_lease_expires_at=NULL
+          WHERE id=$1 AND status='claimed' AND claim_lease_expires_at < now()`,
+        [row.id]
+      );
+      await audit(pool, { actor_type: "system", action: "approval.claim_expired",
+        resource_type: "approval", resource_id: row.id, result: "approved",
+        metadata: { reason: "claim lease expired without an execution intent" } });
+    }
+    const stuck = await pool.query(
+      `SELECT id FROM approvals
+        WHERE status = 'executing'
+          AND execution_started_at < now() - ($1::int * interval '1 second')`,
+      [approvalEnv("APPROVAL_EXECUTION_TIMEOUT_SECONDS", 300)]
+    );
+    for (const row of stuck.rows) {
+      await pool.query(
+        `UPDATE approvals SET status='outcome_unknown', terminal_at=now(),
+           outcome_summary=$2 WHERE id=$1 AND status='executing'`,
+        [row.id, "The upstream action may have executed."]
+      );
+      await audit(pool, { actor_type: "system", action: "approval.outcome_unknown",
+        resource_type: "approval", resource_id: row.id, result: "unknown",
+        metadata: { reason: "recovery timeout" } });
+    }
+    const params: unknown[] = [];
+    const where: string[] = [];
+    if (q.status) {
+      params.push(q.status);
+      where.push(`status = $${params.length}`);
+    }
+    // The control surface requires approve scope (auth table), so rows only
+    // reach approvers; the workspace filter still bounds what they see.
+    const ascope = scopeClause(req.principal, params, "workspace_id");
+    if (ascope) where.push(ascope);
+    params.push(limit);
+    const res = await pool.query(
+      `SELECT * FROM approvals ${where.length ? "WHERE " + where.join(" AND ") : ""}
+       ORDER BY requested_at DESC LIMIT $${params.length}`, params
+    );
+    // Approvers may open the seal; anything else with access gets the row
+    // with the arguments withheld rather than the seal's contents.
+    const mayOpenSeal = !!req.principal &&
+      (req.principal.scopes.includes("approve") || req.principal.scopes.includes("admin"));
+    const items = res.rows.map((row) => {
+      if (!row.args_enc) return row;
+      if (!mayOpenSeal) return { ...row, args: {}, args_withheld: true };
+      try {
+        return { ...row, args: storedArgs(row) };
+      } catch {
+        return { ...row, args: {}, decrypt_error: true };
+      }
+    });
+    return { items };
+  });
+
+  app.post("/_control/v1/approvals/:id/decision", async (req, reply) => {
+    reply.header("Cache-Control", "no-store");
+    const { id } = req.params as { id: string };
+    const parsed = z.object({ approved: z.boolean(), reason: z.string().max(512).default("") }).safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_decision" });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Locked for the rest of the decision: the expiry check and the status
+      // transition cannot be interleaved with a concurrent decide or consume.
+      const ap = await client.query("SELECT * FROM approvals WHERE id = $1 FOR UPDATE", [id]);
+      if (!ap.rows[0]) {
+        await client.query("ROLLBACK");
+        return reply.code(404).send({ error: "approval_not_found" });
+      }
+      const approval = ap.rows[0];
+      if (approval.status !== "pending") {
+        await client.query("ROLLBACK");
+        return reply.code(409).send({ error: "approval_not_pending", status: approval.status });
+      }
+      // Approvals from other workspaces read as missing here too.
+      if (!workspaceAllowed(req.principal, approval.workspace_id)) {
+        await client.query("ROLLBACK");
+        return reply.code(404).send({ error: "approval_not_found" });
+      }
+      if (new Date(approval.expires_at).getTime() < Date.now()) {
+        const expired = await client.query(
+          `UPDATE approvals SET status='expired', args='{}'::jsonb, args_enc=false, args_summary=$2
+            WHERE id=$1 AND status='pending' RETURNING id`,
+          [id, safeSummary(approval)]
+        );
+        await client.query("COMMIT");
+        if (!expired.rows[0]) {
+          return reply.code(409).send({ error: "approval_decided_elsewhere" });
+        }
+        return reply.code(410).send({ error: "approval_expired" });
+      }
+      // Single decision wins: only one row can leave pending state. Denying
+      // drops the sealed arguments immediately, keeping only the redacted
+      // summary and hash; approving keeps them until the retry consumes them.
+      // decided_by records the principal, not a constant: an approval trail
+      // that cannot name the human who decided it answers nothing.
+      const actor = req.principal?.userId ??
+        (req.principal?.kind === "env" ? "env_key" : "unknown");
+      const updated = await client.query(
+        `UPDATE approvals SET status=$2, decided_by=$6, decided_at=now(), decision_reason=$3,
+           args = CASE WHEN $4::boolean THEN '{}'::jsonb ELSE args END,
+           args_enc = CASE WHEN $4::boolean THEN false ELSE args_enc END,
+           args_summary = CASE WHEN $4::boolean THEN $5 ELSE args_summary END
+         WHERE id=$1 AND status='pending' RETURNING *`,
+        [id, parsed.data.approved ? "approved" : "rejected", parsed.data.reason,
+         !parsed.data.approved, parsed.data.approved ? null : safeSummary(approval), actor]
+      );
+      if (!updated.rows[0]) {
+        await client.query("ROLLBACK");
+        return reply.code(409).send({ error: "approval_decided_elsewhere" });
+      }
+      await client.query("COMMIT");
+      await audit(pool, { actor_type: "approver", actor_id: actor, action: "approval.decide",
+        resource_type: "approval", resource_id: id,
+        result: parsed.data.approved ? "approved" : "rejected",
+        metadata: { reason: parsed.data.reason } });
+      void notify(approval.workspace_id, "approval.decided",
+        { approval_id: id, result: parsed.data.approved ? "approved" : "denied" });
+      return updated.rows[0];
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  });
+}
+
+// The control listener: same CORS and scoped auth as the gateway, but only
+// the human approval surface. Nothing agent-facing is reachable here.
+export function buildGatewayControl() {
+  const app = Fastify({ logger: true, genReqId: () => randomUUID() });
+  app.get("/healthz", async () => ({ ok: true }));
+  app.addHook("onRequest", async (req, reply) => {
+    reply.header("Access-Control-Allow-Origin", DASHBOARD_ORIGIN);
+    reply.header("Access-Control-Allow-Headers", "authorization, content-type");
+    reply.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    if (req.method === "OPTIONS") return reply.code(204).send();
+    await authHook(req, reply);
+  });
+  registerApprovalControlRoutes(app);
+  return app;
+}
+
 const isMain = process.argv[1]?.endsWith("gateway.js") || process.argv[1]?.endsWith("gateway.ts");
 if (isMain) {
   buildGateway().listen({ port: PORT, host: "0.0.0.0" });
+  buildGatewayControl().listen({ port: CONTROL_PORT, host: "0.0.0.0" });
 }

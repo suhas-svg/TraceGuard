@@ -62,8 +62,9 @@ curl -s -X POST $CALL -H "$AUTH" -H "$JSON" \
 # Held for approval (202, no upstream contact):
 curl -s -X POST $CALL -H "$AUTH" -H "$JSON" \
   -d '{"server_id":"<server-id>","tool":"read_file","arguments":{"path":"/approval-needed.txt"},"caller":"demo","request_id":"demo-1"}'
-# A second operator decides with the separate approver key:
-curl -s -X POST http://localhost:8091/v1/approvals/<approval-id>/decision \
+# A second operator decides with the separate approver key on the human
+# control listener (agent credentials are rejected there):
+curl -s -X POST http://localhost:8093/_control/v1/approvals/<approval-id>/decision \
   -H "authorization: Bearer $APPROVER_KEY" -H "content-type: application/json" \
   -d '{"approved":true}'
 # Then the caller retries with approval_id; the approval is single-use and

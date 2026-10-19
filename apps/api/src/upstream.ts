@@ -37,14 +37,16 @@ export function definitionHash(tool: DiscoveredTool): string {
   return createHash("sha256").update(canonicalize(pinnedDefinition(tool))).digest("hex");
 }
 
-// $ref values that do not start with "#" point outside the document; fetching
-// or dereferencing them would make hashing depend on network content, so they
-// are rejected outright. Depth, node and reference counts are bounded so a
-// hostile definition cannot make the gateway's work unbounded.
+// Reference keywords ($ref/$dynamicRef/$recursiveRef) that do not start with
+// "#" point outside the document, and an absolute $id re-bases the document;
+// either would make hashing depend on remote content, so they are rejected
+// outright. Depth, node and reference counts are bounded so a hostile
+// definition cannot make the gateway's work unbounded.
 const MAX_SCHEMA_DEPTH = 64;
 const MAX_SCHEMA_NODES = 4096;
 const MAX_SCHEMA_REFS = 512;
 const MAX_DEFINITION_BYTES = 256 * 1024;
+const REF_KEYS = new Set(["$ref", "$dynamicRef", "$recursiveRef"]);
 
 export function schemaSafetyIssue(schema: unknown): string | null {
   let nodes = 0;
@@ -62,11 +64,17 @@ export function schemaSafetyIssue(schema: unknown): string | null {
       return null;
     }
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (key === "$ref") {
+      if (REF_KEYS.has(key)) {
         if (++refs > MAX_SCHEMA_REFS) return "schema has too many $ref values";
         if (typeof item !== "string" || !item.startsWith("#")) {
-          return "external $ref values are not allowed";
+          return `external ${key} values are not allowed`;
         }
+      }
+      if (
+        key === "$id" && typeof item === "string" &&
+        (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(item) || item.startsWith("//"))
+      ) {
+        return "absolute $id values are not allowed";
       }
       const issue = walk(item, depth + 1);
       if (issue) return issue;
@@ -94,6 +102,17 @@ export function definitionIssue(tool: DiscoveredTool): string | null {
 // addresses never, and private hosts only when the operator opts in for
 // local development. Discover and call re-run the resolved variant so a
 // rebinding name cannot dodge the registration gate.
+// Strict dotted quad: every octet 0-255, no shorthand. The URL parser
+// normalizes the numeric forms it understands ("127.1", "2130706433") into
+// quads before we ever see them, so anything still numeric-looking here is
+// either a real quad or a form (127.0.0.256) that must not be resolved.
+function strictIpv4(host: string): number[] | null {
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return null;
+  const octets = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
+  return octets.some((n) => n > 255) ? null : octets;
+}
+
 export function isPrivateHost(host: string): boolean {
   const h = (host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host).toLowerCase();
   if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".internal")) return true;
@@ -108,19 +127,24 @@ export function isPrivateHost(host: string): boolean {
     const lo = parseInt(hexMapped[2], 16);
     return isPrivateHost(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
   }
-  const v4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (v4) {
-    const octets = [Number(v4[1]), Number(v4[2]), Number(v4[3]), Number(v4[4])];
-    if (octets.some((n) => n > 255)) return false;
-    const [a, b] = octets;
+  const octets = strictIpv4(h);
+  if (octets) {
+    const [a, b, c] = octets;
     return (
-      a === 0 || a === 10 || a === 127 ||
+      a === 0 || a === 10 || a === 127 || a >= 240 ||
       (a === 169 && b === 254) ||
       (a === 172 && b >= 16 && b <= 31) ||
       (a === 192 && b === 168) ||
-      (a === 100 && b >= 64 && b <= 127)
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 192 && b === 0 && (c === 0 || c === 2)) || // IETF assignments, TEST-NET-1
+      (a === 198 && (b === 18 || b === 19)) || // benchmarking
+      (a === 203 && b === 0 && c === 113) // TEST-NET-3
     );
   }
+  // A numeric-looking host that is not a valid quad: some resolvers still
+  // resolve these forms, so treat them as private rather than public.
+  // checkUpstreamUrl refuses them outright before this matters.
+  if (/^[0-9.]+$/.test(h)) return true;
   return false;
 }
 
@@ -138,6 +162,12 @@ export function checkUpstreamUrl(raw: string): { ok: boolean; reason?: string } 
     return { ok: false, reason: "credentials in the URL are not allowed" };
   }
   const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  // Fail closed on numeric hosts the URL parser did not normalize into a
+  // valid quad: "127.0.0.256" would otherwise skip both the private-range
+  // classifier and the DNS revalidation below and go straight to the socket.
+  if (/^[0-9.]+$/.test(host) && !strictIpv4(host)) {
+    return { ok: false, reason: "numeric host is not a valid IP address" };
+  }
   // The metadata service is never a legitimate upstream; deny it outright
   // so a misconfigured environment cannot reach cloud credentials.
   if (host === "169.254.169.254") {
@@ -159,7 +189,7 @@ export async function checkUpstreamUrlResolved(raw: string): Promise<{ ok: boole
   if (!sync.ok) return sync;
   if (process.env.ALLOW_PRIVATE_UPSTREAMS === "true") return { ok: true };
   const host = new URL(raw).hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(":")) return { ok: true };
+  if (strictIpv4(host) || host.includes(":")) return { ok: true };
   const { lookup } = await import("node:dns/promises");
   let addresses: { address: string }[];
   try {

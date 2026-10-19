@@ -5,8 +5,9 @@
 //
 //   node scripts/demo-fixes.mjs
 //
-// Needs: API on 8090, gateway on 8091, mock tools on 8092, web preview on 5173,
-// and Playwright's chromium. scripts/demo-fixes.sh starts all four.
+// Needs: API on 8090, gateway on 8091, approval control listener on 8093,
+// mock tools on 8092, web preview on 5173, and Playwright's chromium.
+// scripts/demo-fixes.sh starts all four.
 
 import { createServer } from "node:http";
 import { Pool } from "pg";
@@ -14,6 +15,7 @@ import { chromium } from "@playwright/test";
 
 const API = (process.env.API ?? "http://localhost:8090").replace(/\/$/, "");
 const GW = (process.env.GW ?? "http://localhost:8091").replace(/\/$/, "");
+const GWC = (process.env.GWC ?? "http://localhost:8093").replace(/\/$/, "");
 const WEB = (process.env.WEB ?? "http://localhost:5173").replace(/\/$/, "");
 const MOCK = process.env.MOCK ?? "http://127.0.0.1:8092/mcp";
 const KEY = process.env.KEY ?? process.env.API_KEY ?? "test_key";
@@ -52,6 +54,7 @@ async function call(base, method, path, body, key = KEY) {
 }
 const api = (...a) => call(API, ...a);
 const gw = (...a) => call(GW, ...a);
+const gwc = (...a) => call(GWC, ...a);
 
 // ── 1. Budgets: an abandoned hold no longer wedges the budget forever ───────
 head(1, "Budget: a hold abandoned by a dead caller is reclaimed");
@@ -138,8 +141,8 @@ head(3, "Budget: a monthly budget ignores last month's spend, a lifetime one doe
     `same ledger row, same request -> ${l.status} ${l.data.error} spent_micro=${l.data.spent_micro}`);
 }
 
-// ── 4. Approvals: plaintext only for the approve scope ────────────────────
-head(4, "Approvals: the sealed arguments are withheld from a read-scope caller");
+// ── 4. Approvals: the queue lives on the human control listener ───────────
+head(4, "Approvals: the queue is control-listener only, plaintext for the approve scope alone");
 {
   const secretText = `classified-${tag}`;
   const srv = await gw("POST", "/v1/servers", { name: `demo-${tag}`, base_url: MOCK });
@@ -166,19 +169,22 @@ head(4, "Approvals: the sealed arguments are withheld from a read-scope caller")
   await api("POST", `/v1/users/${u.data.id}/memberships`, { workspace_id: def.id });
   const k = await api("POST", `/v1/users/${u.data.id}/keys`, { name: "peeker", scopes: ["read"] });
 
-  const asMember = await gw("GET", "/v1/approvals?status=pending&limit=200", undefined, k.data.key);
-  const rowMember = asMember.data.items.find((a) => a.id === approvalId);
-  const asApprover = await gw("GET", "/v1/approvals?status=pending&limit=200", undefined, APPROVER);
+  const asMember = await gwc("GET", "/_control/v1/approvals?status=pending&limit=200", undefined, k.data.key);
+  const asApprover = await gwc("GET", "/_control/v1/approvals?status=pending&limit=200", undefined, APPROVER);
   const rowApprover = asApprover.data.items.find((a) => a.id === approvalId);
+  const onAgentPort = await gw("GET", "/v1/approvals?status=pending&limit=200");
 
-  check("the member sees the queue row but not inside it",
-    rowMember?.args_withheld === true &&
-      !JSON.stringify(rowMember).includes(secretText),
-    `args_withheld=${rowMember?.args_withheld}, secret string present in payload: ` +
-      `${JSON.stringify(rowMember).includes(secretText)}`);
-  check("the approver opens the same row", rowApprover?.args?.text === secretText,
+  check("the control listener rejects the read-scope member outright",
+    asMember.status === 403 && !JSON.stringify(asMember.data).includes(secretText),
+    `as member -> ${asMember.status}; secret string present in payload: ` +
+      `${JSON.stringify(asMember.data).includes(secretText)}`);
+  check("the approver opens the same row on the control listener",
+    rowApprover?.args?.text === secretText,
     `as approver: args.text = ${JSON.stringify(rowApprover?.args?.text)}`);
-  note("the dashboard now fetches this queue with the approver key for the same reason");
+  check("the agent-facing listener no longer serves the queue",
+    onAgentPort.status === 404,
+    `GET http://localhost:8091/v1/approvals -> ${onAgentPort.status}`);
+  note("the dashboard fetches this queue from the control listener (8093) with the approver key");
 }
 
 // ── 5. Policies: two concurrent edits cannot fork a rule ──────────────────

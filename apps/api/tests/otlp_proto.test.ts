@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeTraceRequest, encodeTraceRequest } from "../src/otlp_proto.js";
+import { decodeTraceResponse, decodeTraceRequest, encodeTraceRequest, encodeTraceResponse } from "../src/otlp_proto.js";
 import { mapOtlpSpan, attrsToObject, type OtlpSpan } from "../src/otlp.js";
 
 function sampleJson() {
@@ -61,5 +61,15 @@ describe("otlp protobuf", () => {
     // Valid protobuf framing but wrong message: decodes to empty, not a crash.
     expect(decodeTraceRequest(Buffer.from([0x08, 0x01])).resourceSpans).toEqual([]);
     expect(() => decodeTraceRequest(Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff]))).toThrow();
+  });
+
+  it("encodes collector partial-success responses and round-trips them", () => {
+    // Full acceptance is the empty message, as the OTLP spec requires.
+    expect(encodeTraceResponse().length).toBe(0);
+    const decoded = decodeTraceResponse(
+      encodeTraceResponse({ rejectedSpans: 3, errorMessage: "3 span(s) rejected" })
+    );
+    expect(decoded.partialSuccess?.rejectedSpans).toBe("3");
+    expect(decoded.partialSuccess?.errorMessage).toBe("3 span(s) rejected");
   });
 });

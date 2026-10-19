@@ -6,7 +6,10 @@ metadata:
 data:
   PORT: "8080"
   GATEWAY_PORT: "8091"
+  # §9: human approval queue/decisions listen here, away from the agent port.
+  GATEWAY_CONTROL_PORT: "8093"
   APPROVAL_TTL_SECONDS: "300"
+  APPROVAL_CLAIM_LEASE_SECONDS: "30"
   ALLOW_PRIVATE_UPSTREAMS: "false"
   DASHBOARD_ORIGIN: "http://localhost:5173"
   # The gateway's accepted-policy-version anchor (backed by the gateway-state
