@@ -18,6 +18,9 @@ const PROTOCOL_VERSION = "2026-07-28";
 const META_PROTOCOL = "io.modelcontextprotocol/protocolVersion";
 const META_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
 const META_LOGICAL = "io.traceguard/logical_request_id";
+// FR-021: optional run/span correlation carried as request metadata.
+const META_RUN = "io.traceguard/run_id";
+const META_SPAN = "io.traceguard/span_id";
 
 import {
   ApprovalClientRequiredError,
@@ -100,7 +103,7 @@ export class CertifiedClient {
   async callTool(
     name: string,
     args: Record<string, unknown> = {},
-    opts: { logicalRequestId?: string; deadlineMs?: number } = {}
+    opts: { logicalRequestId?: string; deadlineMs?: number; runId?: string; spanId?: string } = {}
   ): Promise<unknown> {
     const logicalRequestId = opts.logicalRequestId ?? randomUUID();
     const deadline = Date.now() + (opts.deadlineMs ?? this.deadlineMs);
@@ -110,7 +113,7 @@ export class CertifiedClient {
     let authRefreshed = false;
 
     for (;;) {
-      const res = await this.post(name, args, logicalRequestId);
+      const res = await this.post(name, args, logicalRequestId, opts.runId, opts.spanId);
       if (res.status === 401 && this.oauth && !authRefreshed) {
         // A 401 comes from the auth hook, before anything is dispatched, so a
         // single retry with a fresh token cannot duplicate an action.
@@ -173,7 +176,8 @@ export class CertifiedClient {
   }
 
   private async post(
-    name: string, args: Record<string, unknown>, logicalRequestId: string
+    name: string, args: Record<string, unknown>, logicalRequestId: string,
+    runId?: string, spanId?: string
   ): Promise<{ status: number; body: JsonRpcResponse | null }> {
     const payload = {
       jsonrpc: "2.0",
@@ -185,7 +189,9 @@ export class CertifiedClient {
         _meta: {
           [META_PROTOCOL]: PROTOCOL_VERSION,
           [META_CAPABILITIES]: { tools: {} },
-          [META_LOGICAL]: logicalRequestId
+          [META_LOGICAL]: logicalRequestId,
+          ...(runId ? { [META_RUN]: runId } : {}),
+          ...(spanId ? { [META_SPAN]: spanId } : {})
         }
       }
     };

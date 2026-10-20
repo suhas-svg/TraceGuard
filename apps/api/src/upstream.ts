@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { canonicalize } from "@traceguard/canonical-json";
+import { PATH_CONFINEMENT_META_KEY } from "@traceguard/schemas";
 import { sha256Hex } from "./policy.js";
 
 export interface DiscoveredTool {
@@ -296,13 +297,17 @@ async function withClient<T>(
   return run(false);
 }
 
-// Only these `_meta` keys are covered by the pin (§7.5 allowlist). An empty
-// allowlist (the default) pins no metadata at all.
+// `_meta` keys covered by the pin (§7.5 allowlist), plus the mandatory
+// executor path-confinement attestation (FR-010). The attestation is always
+// pinned even when the operator's allowlist is empty: a path_within rule is
+// only publishable against a definition that carries it, and the pin hash
+// must cover it so it cannot change under an approval or after publication.
 function pinnedMetaKeys(): string[] {
-  return (process.env.TOOL_PIN_META_ALLOWLIST ?? "")
+  const configured = (process.env.TOOL_PIN_META_ALLOWLIST ?? "")
     .split(",")
     .map((k) => k.trim())
     .filter(Boolean);
+  return [...new Set([PATH_CONFINEMENT_META_KEY, ...configured])];
 }
 
 function pickMeta(meta: unknown): Record<string, unknown> | undefined {

@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { expect, test, type Page } from "@playwright/test";
 import {
-  apiGet, apiPost, event, gwCall, gwPost, ingest, publishPolicy, resetPolicyAnchor, seedRun, setKeys, upstreamHits
+  apiGet, apiPost, event, gwCall, gwPost, ingest, publishPolicy, resetPolicyAnchor, seedRun, setKeys, upstreamHits,
+  upstreamInfo
 } from "./helpers";
 import { API_KEY, GATEWAY_URL } from "./env";
 
@@ -124,6 +125,14 @@ test("scenario C: an exhausted budget blocks the call before the upstream", asyn
   await expect(page.getByText("denied").first()).toBeVisible();
   await page.getByText("tool.invocation").first().click();
   await expect(page.getByText(/budget exhausted/).first()).toBeVisible();
+
+  // FR-021: the same run view lists the gateway's policy decision, correlated
+  // to this run by run_id, with the winning rule and the denial reason.
+  await expect(page.getByRole("heading", { name: "Decisions" })).toBeVisible();
+  const decisions = page.locator("table").last();
+  await expect(decisions.getByText("deny", { exact: true }).first()).toBeVisible();
+  await expect(decisions.getByText("read_file").first()).toBeVisible();
+  await expect(decisions.getByText(/budget exhausted/).first()).toBeVisible();
 });
 
 test("scenario D: an approval-protected call waits for a human, then executes", async ({ page, request }) => {
@@ -323,4 +332,59 @@ test("scenario H: a case runs through a live adapter from the dashboard", async 
   } finally {
     adapter.close();
   }
+});
+
+// Must run last: it ends by creating a path_within draft the publisher must
+// refuse, and every later publish would fail on that draft.
+test("scenario I: path constraints are enforced by the executor, not by string comparison", async ({ request }) => {
+  const scoped = await gwPost(request, "/v1/policies", {
+    name: `e2e-path-${tag}`, priority: 10, server_id: serverId, tool_name: "read_file",
+    effect: "allow",
+    conditions: { arguments: { path: { path_within: "/tmp/traceguard-workspace" } } }
+  });
+  expect(scoped.status()).toBe(201);
+  publishPolicy();
+
+  const before = await upstreamHits(request);
+  const ok = await gwCall(request, {
+    server_id: serverId, tool: "read_file",
+    arguments: { path: "/tmp/traceguard-workspace/allowed.txt" }, caller: "e2e-path"
+  });
+  expect(ok.status()).toBe(200);
+  expect(JSON.stringify(await ok.json())).toContain("contents of");
+  expect(await upstreamHits(request)).toBe(before + 1);
+
+  // The gateway's string check sees a path under the allowed directory
+  // ("/tmp/traceguard-workspace/../etc/passwd" normalizes out of it, but the
+  // reference executor is what refuses it); the call reaches the upstream and
+  // the executor answers with a refusal instead of file contents.
+  const traversal = await gwCall(request, {
+    server_id: serverId, tool: "read_file",
+    arguments: { path: "/tmp/traceguard-workspace/../etc/passwd" }, caller: "e2e-path"
+  });
+  expect(traversal.status()).toBe(200);
+  expect(JSON.stringify(await traversal.json())).toContain("refused");
+
+  // A symlink inside the root that points outside it is the case a string
+  // comparison cannot see at all. Skipped where the OS refused the fixture.
+  const info = await upstreamInfo(request);
+  if (info.escape_ready) {
+    const escape = await gwCall(request, {
+      server_id: serverId, tool: "read_file",
+      arguments: { path: "/tmp/traceguard-workspace/escape" }, caller: "e2e-path"
+    });
+    expect(escape.status()).toBe(200);
+    expect(JSON.stringify(await escape.json())).toContain("refused");
+  }
+
+  // The publisher refuses to sign a path_within rule for a tool whose pinned
+  // definition carries no executor attestation: such a rule would rely on the
+  // gateway string comparison alone (§16.3 T9).
+  const unattested = await gwPost(request, "/v1/policies", {
+    name: `e2e-path-unattested-${tag}`, priority: 10, server_id: serverId,
+    tool_name: "read_file_unconfined", effect: "allow",
+    conditions: { arguments: { path: { path_within: "/tmp/traceguard-workspace" } } }
+  });
+  expect(unattested.status()).toBe(201);
+  expect(() => publishPolicy()).toThrow();
 });

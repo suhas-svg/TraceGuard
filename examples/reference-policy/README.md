@@ -76,7 +76,11 @@ curl -s -X POST http://localhost:8093/_control/v1/approvals/<approval-id>/decisi
 `conditions.arguments` maps a tool argument to a constraint:
 
 - `required: ["path"]` (a conditions-level list) — the argument must be present.
-- `path_within: "/srv/data"` — canonicalized path must stay inside the prefix.
+- `path_within: "/srv/data"` — requires a server- and tool-scoped rule and a
+  pinned executor attestation (`io.traceguard/path-confinement`). The executor
+  resolves real paths and refuses traversal/symlink escapes; the publisher will
+  not sign a rule whose executor does not attest to the prefix. The gateway
+  string check is only a pre-filter.
 - `regex: "^/tmp/"` — anchor carefully. Patterns are validated where the rule
   is stored: invalid syntax, over 512 characters, backreferences, and an
   unbounded quantifier over a repeating or alternating group (`(a+)+`,

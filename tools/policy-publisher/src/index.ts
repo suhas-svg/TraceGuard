@@ -1,11 +1,14 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { Pool, type PoolClient } from "pg";
 import { appendAuditEvent } from "@traceguard/audit-chain";
 import { contentHashOf, generateSigningKey, keyIdFor, signPayload } from "@traceguard/policy-signing";
 import {
   BUNDLE_VERSION,
+  PATH_CONFINEMENT_META_KEY,
   PROTOCOL_PROFILE,
+  hasPathWithin,
+  pathConfinementMetaSchema,
   policyBundleSchema,
   type PolicyBundle
 } from "@traceguard/schemas";
@@ -44,6 +47,17 @@ export async function resolveWorkspaceId(db: PoolClient | Pool, ref: string | un
   return String(res.rows[0].id);
 }
 
+// FR-010: same normalization as the gateway's pathWithin — posix.normalize
+// both sides, then a boundary-aware prefix test. Kept local so the publisher
+// does not depend on the API package at runtime; the two must agree, and the
+// publisher is the stricter gate because it refuses at signing time.
+function withinRoot(value: string, root: string): boolean {
+  const clean = (p: string) => (p.startsWith("/") ? posix.normalize(p) : posix.normalize("/" + p));
+  const v = clean(value);
+  const base = clean(root);
+  return v === base || v.startsWith(base.endsWith("/") ? base : base + "/");
+}
+
 // Builds the candidate bundle from current drafts. It never signs anything;
 // publish() validates the result and refuses on problems.
 export async function assembleBundle(client: PoolClient, workspaceId: string): Promise<Assembly> {
@@ -65,7 +79,7 @@ export async function assembleBundle(client: PoolClient, workspaceId: string): P
     [workspaceId]
   );
   const pins = await client.query(
-    `SELECT t.server_id, t.tool_name, t.definition_hash
+    `SELECT t.server_id, t.tool_name, t.definition_hash, t.definition
        FROM server_tools t JOIN mcp_servers s ON s.id = t.server_id
       WHERE s.workspace_id = $1 AND t.quarantined = false AND t.quarantine_reason IS NULL
       ORDER BY t.server_id, t.tool_name`,
@@ -121,6 +135,41 @@ export async function assembleBundle(client: PoolClient, workspaceId: string): P
   for (const rule of candidate.rules) {
     if (rule.server_id && !serverIds.has(String(rule.server_id))) {
       problems.push(`rule "${rule.name}" targets a server that is not in the server manifest`);
+    }
+  }
+  // FR-010 / §16.3 T9: a path_within rule is publishable only against a tool
+  // whose pinned definition carries the executor confinement attestation, and
+  // only when the constrained path is inside the attested root. Refusing here
+  // means an unenforceable rule never reaches the signed bundle.
+  const pinByTarget = new Map(
+    pins.rows.map((p) => [`${p.server_id}/${p.tool_name}`, p] as const)
+  );
+  for (const rule of candidate.rules) {
+    if (!hasPathWithin(rule.conditions)) continue;
+    if (!rule.server_id || !rule.tool_name) {
+      problems.push(`rule "${rule.name}" uses path_within without a server- and tool-scoped target`);
+      continue;
+    }
+    const pin = pinByTarget.get(`${rule.server_id}/${rule.tool_name}`);
+    if (!pin) {
+      problems.push(`rule "${rule.name}" uses path_within but tool "${rule.tool_name}" is not in the reviewed pin manifest`);
+      continue;
+    }
+    const definition = pin.definition as { _meta?: Record<string, unknown> } | null;
+    const attestation = definition?._meta?.[PATH_CONFINEMENT_META_KEY];
+    const parsedMeta = pathConfinementMetaSchema.safeParse(attestation);
+    if (!parsedMeta.success) {
+      problems.push(`rule "${rule.name}" uses path_within but tool "${rule.tool_name}" has no pinned executor path-confinement attestation (${PATH_CONFINEMENT_META_KEY})`);
+      continue;
+    }
+    const conditions = rule.conditions as {
+      arguments?: Record<string, { path_within?: unknown } | undefined>;
+    } | null;
+    for (const constraint of Object.values(conditions?.arguments ?? {})) {
+      const allowed = constraint?.path_within;
+      if (typeof allowed === "string" && !withinRoot(allowed, parsedMeta.data.root)) {
+        problems.push(`rule "${rule.name}" path_within "${allowed}" is outside the executor's attested root "${parsedMeta.data.root}"`);
+      }
     }
   }
   const parsed = policyBundleSchema.safeParse(candidate);

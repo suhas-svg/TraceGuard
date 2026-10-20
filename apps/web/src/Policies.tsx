@@ -95,8 +95,11 @@ function PolicyForm({
             value={form.conditions} onChange={(e) => set("conditions", e.target.value)} />
         </Field>
         <p className="text-xs text-ink-500">
-          The gateway decides these conditions itself. path_within is advisory unless the
-          upstream enforces it; schema, regex, enum, and max_length are enforced here.
+          The gateway decides these conditions itself. schema, regex, enum, and max_length are
+          enforced here. path_within requires a server- and tool-scoped rule and a pinned
+          executor attestation (io.traceguard/path-confinement); calls are refused when the
+          executor does not attest to enforcing it, so gateway string comparison is never the
+          boundary.
         </p>
         {error && <Alert>{error}</Alert>}
         <div>
@@ -392,9 +395,7 @@ function SignedPolicySection() {
 
 function AuditSection() {
   const query = useQuery({ queryKey: ["audit-events"], queryFn: () => gwApi.audit() });
-  const [verification, setVerification] = useState<
-    { ok: boolean; checked: number; truncated: boolean; problems: { id: string; problem: string }[] } | null
-  >(null);
+  const [verification, setVerification] = useState<Awaited<ReturnType<typeof gwApi.auditVerify>> | null>(null);
   const [verifying, setVerifying] = useState(false);
   const items = (query.data?.items ?? []).slice(0, 50);
   return (
@@ -419,16 +420,30 @@ function AuditSection() {
       </div>
       {verification && (
         <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
-          <Badge tone={verification.ok ? "ok" : "bad"}>
-            {verification.ok ? "chain verified" : "tampering detected"}
+          <Badge tone={verification.empty ? "mute" : !verification.ok ? "bad" : verification.complete ? "ok" : "warn"}>
+            {verification.empty
+              ? "no events to verify"
+              : !verification.ok
+                ? "tampering detected"
+                : verification.complete
+                  ? "chain verified - full history"
+                  : "chain verified - partial history"}
           </Badge>
-          <span className="text-ink-500">{verification.checked} events recomputed</span>
-          {verification.truncated && <span className="text-ink-500">newest segment only (bounded read)</span>}
-          {verification.problems.slice(0, 2).map((p) => (
+          {!verification.empty && <span className="text-ink-500">{verification.checked} events recomputed</span>}
+          {!verification.empty && !verification.ok && verification.problems.slice(0, 2).map((p) => (
             <span key={p.id} className="truncate font-mono text-ink-500" title={p.problem}>
               {p.id.slice(0, 8)}: {p.problem}
             </span>
           ))}
+          {!verification.empty && verification.ok && !verification.complete && (
+            <span className="text-ink-500">
+              {verification.anchored
+                ? `pruned prefix anchored to checkpoint ${verification.anchored.checkpoint_id.slice(0, 8)}`
+                : verification.truncated
+                  ? "newest segment only (bounded read)"
+                  : "partial history is not fully verified"}
+            </span>
+          )}
         </div>
       )}
       {query.isPending ? (

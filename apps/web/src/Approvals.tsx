@@ -1,12 +1,22 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { gwApi, type Approval } from "./api";
 import {
-  Alert, Button, Card, Empty, Input, ListSkeleton, Page,
+  Alert, Button, Card, Empty, Input, LinkButton, ListSkeleton, Page,
   Segmented, StatusBadge
 } from "./components";
 
-function ApprovalCard({ a, onChanged }: { a: Approval; onChanged: () => void }) {
+function ApprovalCard({
+  a,
+  onChanged,
+  onOpenRun,
+  highlighted = false
+}: {
+  a: Approval;
+  onChanged: () => void;
+  onOpenRun?: (runId: string) => void;
+  highlighted?: boolean;
+}) {
   const [reason, setReason] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState("");
@@ -29,7 +39,9 @@ function ApprovalCard({ a, onChanged }: { a: Approval; onChanged: () => void }) 
     try {
       const r = await gwApi.call({
         server_id: a.server_id, tool: a.tool_name, arguments: a.args,
-        caller: a.caller, request_id: a.request_id, approval_id: a.id
+        caller: a.caller, request_id: a.request_id, approval_id: a.id,
+        ...(a.run_id ? { run_id: a.run_id } : {}),
+        ...(a.span_id ? { span_id: a.span_id } : {})
       });
       setResult(r.result !== undefined ? `executed: ${JSON.stringify(r.result).slice(0, 200)}` : `status: ${r.status}`);
       onChanged();
@@ -39,11 +51,14 @@ function ApprovalCard({ a, onChanged }: { a: Approval; onChanged: () => void }) 
   };
 
   return (
-    <Card className="mb-3 p-4 text-sm">
+    <Card className={`mb-3 p-4 text-sm${highlighted ? " ring-2 ring-brand-500/60" : ""}`}>
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-mono font-semibold text-ink-900">{a.tool_name}</span>
         <StatusBadge status={a.status} />
         <span className="text-ink-500">from {a.caller}</span>
+        {a.run_id && onOpenRun && (
+          <LinkButton onClick={() => onOpenRun(a.run_id!)}>run {a.run_id.slice(0, 8)}</LinkButton>
+        )}
         <span className="ml-auto text-xs text-ink-500">expires {new Date(a.expires_at).toLocaleString()}</span>
       </div>
       <pre className="mt-2 max-h-48 overflow-auto rounded-lg bg-[#0b0e16] p-3 font-mono text-xs text-slate-100">
@@ -90,8 +105,16 @@ function ApprovalCard({ a, onChanged }: { a: Approval; onChanged: () => void }) 
   );
 }
 
-export default function ApprovalsView() {
-  const [filter, setFilter] = useState("pending");
+export default function ApprovalsView({
+  focusId = null,
+  onOpenRun
+}: {
+  focusId?: string | null;
+  onOpenRun?: (runId: string) => void;
+}) {
+  // A deep link from a run's decision panel opens the All filter so the
+  // referenced hold is present even when it is no longer pending.
+  const [filter, setFilter] = useState(focusId ? "" : "pending");
   const approvalsQuery = useQuery({
     queryKey: ["approvals", filter],
     queryFn: () => gwApi.approvals(filter || undefined),
@@ -104,6 +127,17 @@ export default function ApprovalsView() {
   // badge reads its own key, so deciding a hold left the count stale for up to
   // its 30s interval and the badge contradicted the list on screen.
   const reload = () => queryClient.invalidateQueries({ queryKey: ["approvals"] });
+
+  // FR-021: bring the deep-linked approval into view and mark it.
+  const focusRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (focusId && focusRef.current) {
+      focusRef.current.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }, [focusId, items.length]);
+  const ordered = focusId
+    ? [...items].sort((x, y) => Number(y.id === focusId) - Number(x.id === focusId))
+    : items;
 
   return (
     <Page
@@ -137,8 +171,15 @@ export default function ApprovalsView() {
       ) : items.length === 0 ? (
         <Empty hint="Nothing here. Held calls appear under the pending filter." />
       ) : null}
-      {items.map((a) => (
-        <ApprovalCard key={a.id} a={a} onChanged={reload} />
+      {ordered.map((a) => (
+        <div key={a.id} ref={a.id === focusId ? focusRef : undefined}>
+          <ApprovalCard
+            a={a}
+            onChanged={reload}
+            onOpenRun={onOpenRun}
+            highlighted={a.id === focusId}
+          />
+        </div>
       ))}
     </Page>
   );

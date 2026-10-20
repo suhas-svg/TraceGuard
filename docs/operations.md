@@ -100,15 +100,24 @@ curl -fsS -X POST "$API/v1/admin/sweep-budget-holds" \
 # Apply every enabled retention rule and report per-rule deletion counts.
 curl -fsS -X POST "$API/v1/retention/run" -H "Authorization: Bearer $API_KEY"
 
-# Before any audit pruning: sign a checkpoint over the chain head and keep the
-# signed copy outside the database and containers (§10.3/FR-019). Checkpoints
-# and pruning live on the gateway listener; pruning stays deliberate, never
-# scheduled.
+# Before any audit pruning: create a signed checkpoint over the chain head,
+# export it, and keep the export outside the database and containers
+# (§10.2/FR-019). The signed payload records the last sequence and hash of
+# every workspace covered by the segment. Checkpoints and pruning live on the
+# gateway listener; pruning stays deliberate, never scheduled.
 curl -fsS -X POST "http://localhost:8091/v1/audit/checkpoints" \
   -H "Authorization: Bearer $API_KEY"
+curl -fsS "http://localhost:8091/v1/audit/checkpoints/<checkpoint-id>/export" \
+  -H "Authorization: Bearer $API_KEY" > checkpoint-export.json
+# Verify the export offline — signature, chain links, per-workspace segments —
+# before trusting the copy you are about to prune against:
+npm run audit:verify -- --export checkpoint-export.json --public-key checkpoint.pub.pem
+# Only then prune. external_ref is required: it names the external copy of the
+# signed checkpoint and lands in the audit trail as the receipt for the
+# removed segment.
 curl -fsS -X POST "http://localhost:8091/v1/audit/prune" \
   -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-  -d '{"checkpoint_id":"<checkpoint-id>"}'
+  -d '{"checkpoint_id":"<checkpoint-id>","external_ref":"s3://audit-vault/2026-10-20/checkpoint.json"}'
 ```
 
 Suggested schedule: finalize every 15 minutes, retention nightly. Retention
@@ -176,16 +185,21 @@ restarts, and a forked anchor is treated as tampering.
 
 ```bash
 curl -fsS -X POST "$GATEWAY/v1/audit/verify" -H "Authorization: Bearer $API_KEY"
-# -> { ok, checked, truncated, problems: [{ id, problem }] }
+# -> { ok, checked, truncated, problems: [{ id, problem }], anchored, empty, complete }
 ```
 
 The verifier recomputes every event hash and checks every link. Since
 migration 022 the table is append-only at the database layer (UPDATE and
 DELETE are rejected), so a detected mutation means something with schema
 rights disabled the trigger — the party only an externally stored checkpoint
-anchors against. A bounded read reports `truncated: true` rather than
-labelling a prefix as fully verified. The dashboard's Policy tab has the
-same check behind the `Verify chain` button.
+anchors against. A bounded read reports `truncated: true`, and `complete` is
+true only when the whole chain is read, intact, and unpruned — an `anchored`
+prefix or a truncated read is reported as partial, never as fully verified.
+Since FR-019 pruning itself refuses without a valid externally stored
+checkpoint and an `external_ref` receipt. `npm run audit:verify -- --export
+<file> --public-key <pem>` runs the same checks offline against an exported
+checkpoint, without the live database or gateway. The dashboard's Policy tab
+has the same check behind the `Verify chain` button.
 
 Upgrade note: as of the signed-policy change, approval binding hashes
 (`request_hash`, `args_hash`) are computed over RFC 8785 canonical JSON and

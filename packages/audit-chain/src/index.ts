@@ -237,14 +237,35 @@ export function verifyAuditChain(rows: AuditRow[]): ChainVerification {
 // link is broken but covered by a valid checkpoint as anchored — a pruned
 // prefix — never as corruption.
 
-/** What a signed checkpoint commits to: the head event at signing time. */
-export interface CheckpointPayload {
+/** What a signed checkpoint commits to. v1 committed to the global head only;
+ * v2 additionally names the per-workspace segments covered by the cut, so an
+ * offline verifier can check the retained tail against each workspace's last
+ * covered sequence instead of trusting a single global hash (§10.2, FR-019). */
+export interface CheckpointSegment {
+  /** null for events the migration left un-attributed. */
+  workspace_id: string | null;
+  up_to_sequence: number | null;
+  up_to_hash: string;
+}
+
+export interface CheckpointPayloadV1 {
   v: 1;
   created_at: string;
   up_to_timestamp: string;
   up_to_hash: string;
   event_count: number;
 }
+
+export interface CheckpointPayloadV2 {
+  v: 2;
+  created_at: string;
+  up_to_timestamp: string;
+  up_to_hash: string;
+  event_count: number;
+  segments: CheckpointSegment[];
+}
+
+export type CheckpointPayload = CheckpointPayloadV1 | CheckpointPayloadV2;
 
 export interface CheckpointSignature {
   signature: string;

@@ -100,6 +100,26 @@ export const argConditionsSchema = z.object({
   arguments: z.record(fieldConstraintSchema).optional()
 }).strict();
 
+// FR-010 / §16.3 T9: a path constraint is only accepted when the executor
+// itself attests that it confines paths to a root. The gateway's string
+// comparison is a fast pre-check, never the enforcement boundary. The
+// attestation travels inside the tool's pinned definition so it is covered
+// by the signed bundle's pin hash and cannot be changed after publication.
+export const PATH_CONFINEMENT_META_KEY = "io.traceguard/path-confinement";
+
+export const pathConfinementMetaSchema = z.object({
+  root: z.string().min(1).max(4096),
+  enforcement: z.literal("executor")
+}).strict();
+
+type ConditionsShape = { arguments?: Record<string, { path_within?: unknown } | undefined> } | null | undefined;
+
+export function hasPathWithin(conditions: ConditionsShape): boolean {
+  return Object.values(conditions?.arguments ?? {}).some(
+    (constraint) => constraint?.path_within !== undefined
+  );
+}
+
 export const bundleRuleSchema = z.object({
   id: z.string().uuid(),
   name: z.string().min(1).max(128),
@@ -110,7 +130,15 @@ export const bundleRuleSchema = z.object({
   tool_name: z.string().min(1).max(128).nullable(),
   effect: z.enum(["allow", "deny", "require_approval"]),
   conditions: argConditionsSchema.default({})
-}).strict();
+}).strict().superRefine((rule, ctx) => {
+  if (hasPathWithin(rule.conditions) && (!rule.server_id || !rule.tool_name)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["conditions"],
+      message: "path_within requires a server- and tool-scoped rule so the executor attestation can be checked"
+    });
+  }
+});
 
 export const bundleServerSchema = z.object({
   server_id: z.string().uuid(),

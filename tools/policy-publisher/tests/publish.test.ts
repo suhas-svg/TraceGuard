@@ -203,4 +203,46 @@ describe("policy publisher", () => {
       client.release();
     }
   });
+
+  // FR-010 / §16.3 T9: path_within is enforceable only inside an executor that
+  // attests confinement in its pinned definition. The publisher is the last
+  // gate before signing, so it refuses what the gateway would have to
+  // second-guess.
+  it("refuses path_within drafts the executor cannot enforce", async () => {
+    await pool.query(
+      "UPDATE server_tools SET quarantined = false, quarantine_reason = NULL WHERE server_id = $1",
+      [serverId]
+    );
+    const insertRule = (name: string, p: string) => pool.query(
+      `INSERT INTO policies (workspace_id, name, server_id, tool_name, effect, conditions)
+       VALUES ($1,$2,$3,'read_file','allow',$4::jsonb)`,
+      [workspaceId, name, serverId, JSON.stringify({ arguments: { path: { path_within: p } } })]
+    );
+
+    // Pinned definition with no attestation at all.
+    await insertRule("path-no-meta", "/data");
+    await expect(publish(pool, { workspaceId, privateKeyPem: publisherKey.privateKeyPem }))
+      .rejects.toThrow(/path-confinement attestation/);
+    await pool.query("DELETE FROM policies WHERE name = 'path-no-meta'");
+
+    // Attested executor, but the constraint sits outside the attested root.
+    await pool.query(
+      "UPDATE server_tools SET definition = $2::jsonb WHERE server_id = $1 AND tool_name = 'read_file'",
+      [serverId, JSON.stringify({
+        _meta: { "io.traceguard/path-confinement": { root: "/data", enforcement: "executor" } }
+      })]
+    );
+    await insertRule("path-outside", "/etc");
+    await expect(publish(pool, { workspaceId, privateKeyPem: publisherKey.privateKeyPem }))
+      .rejects.toThrow(/outside the executor's attested root/);
+    await pool.query("DELETE FROM policies WHERE name = 'path-outside'");
+
+    // Inside the attested root: assembly passes and the dry run stays
+    // unpublished (nothing changes until a real publish).
+    await insertRule("path-ok", "/data/reports");
+    const dry = await publish(pool, { workspaceId, privateKeyPem: publisherKey.privateKeyPem, dryRun: true });
+    expect(dry.published).toBe(false);
+    expect(dry.bundle.rules.some((r) => r.name === "path-ok")).toBe(true);
+    await pool.query("DELETE FROM policies WHERE name = 'path-ok'");
+  });
 });
