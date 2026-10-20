@@ -94,9 +94,10 @@ export function Field({ label, children }: { label: string; children: ReactNode 
 
 // ---------- Layout ----------
 
-export function Page({ title, sub, actions, children }: {
-  title: string;
+export function Page({ title, sub, eyebrow, actions, children }: {
+  title: ReactNode;
   sub?: string;
+  eyebrow?: string;
   actions?: ReactNode;
   children: ReactNode;
 }) {
@@ -104,6 +105,11 @@ export function Page({ title, sub, actions, children }: {
     <div className="mx-auto max-w-[1480px] px-6 py-7 lg:px-8 lg:py-9">
       <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
         <div>
+          {eyebrow && (
+            <div className="mb-1.5 text-[10.5px] font-semibold uppercase tracking-[0.09em] text-ink-400">
+              {eyebrow}
+            </div>
+          )}
           <h1 className="text-[30px] font-semibold leading-[1.12] tracking-[-0.035em] text-ink-900">{title}</h1>
           {sub && <p className="mt-1.5 max-w-2xl text-[13.5px] leading-5 text-ink-500">{sub}</p>}
         </div>
@@ -274,7 +280,7 @@ export function Th({ children, className = "", onSort, sorted }: {
 }
 
 export function Td({ children, className = "", title }: { children?: ReactNode; className?: string; title?: string }) {
-  return <td title={title} className={`border-b border-ink-100 px-3 py-2.5 align-top last:border-0 ${className}`}>{children}</td>;
+  return <td title={title} className={`border-b border-ink-100 px-3 py-2.5 align-middle last:border-0 ${className}`}>{children}</td>;
 }
 
 export function LinkButton({ children, onClick }: { children: ReactNode; onClick: () => void }) {
@@ -314,7 +320,10 @@ const paths: Record<string, string> = {
   arrowLeft: "M19 12H5M12 19l-7-7 7-7",
   tool: "M14.7 6.3a4 4 0 00-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 005.4-5.4l-2.5 2.5-3-3 2.5-2.5z",
   calendar: "M3 5h18v16H3zM16 3v4M8 3v4M3 11h18",
-  more: "M5 12h.01M12 12h.01M19 12h.01"
+  more: "M5 12h.01M12 12h.01M19 12h.01",
+  eye: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 15a3 3 0 100-6 3 3 0 000 6z",
+  copy: "M9 9h11v11H9zM5 15H4V4h11v1",
+  model: "M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3zM12 12l8-4.5M12 12v9M12 12L4 7.5"
 };
 
 export function NavIcon({ name, className = "h-4 w-4" }: { name: string; className?: string }) {
