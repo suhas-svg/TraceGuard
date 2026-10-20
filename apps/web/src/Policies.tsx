@@ -251,7 +251,7 @@ function BudgetRow({ budget, onChanged, onError }: {
 }) {
   const [limit, setLimit] = useState((budget.limit_micro / 1_000_000).toFixed(2));
   const [effect, setEffect] = useState(budget.effect);
-  const used = budget.spent_micro + budget.reserved_micro;
+  const used = Number(budget.spent_micro) + Number(budget.reserved_micro);
   return (
     <div className="flex flex-wrap items-center gap-3 px-4 py-2.5 text-sm">
       <Badge tone={budget.effect === "block" ? "bad" : "warn"}>{budget.effect}</Badge>
