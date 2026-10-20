@@ -33,6 +33,28 @@ describe("checkpoint signing", () => {
     expect(verifyCheckpoint(payload, signed.signature, otherPublic)).toBe(false);
     expect(() => signCheckpoint(payload, otherPublic)).toThrow();
   });
+
+  // §10.2: a v2 checkpoint names the workspace segments covered by the prune,
+  // and those segments are signed material — editing them after the fact must
+  // invalidate the signature like any other payload byte.
+  it("covers the workspace segments inside the signed v2 payload", () => {
+    const v2: CheckpointPayload = {
+      ...payload,
+      v: 2,
+      segments: [
+        { workspace_id: "ws-1", up_to_sequence: 3, up_to_hash: "cd".repeat(32) },
+        { workspace_id: null, up_to_sequence: null, up_to_hash: "ef".repeat(32) }
+      ]
+    };
+    const signed = signCheckpoint(v2, privatePem);
+    expect(signed.key_id).toBe(checkpointKeyId(publicPem));
+    expect(verifyCheckpoint(v2, signed.signature, publicPem)).toBe(true);
+    expect(verifyCheckpoint({ ...v2, segments: [] }, signed.signature, publicPem)).toBe(false);
+    expect(verifyCheckpoint(
+      { ...v2, segments: [{ ...v2.segments[0], up_to_sequence: 4 }, v2.segments[1]] },
+      signed.signature, publicPem
+    )).toBe(false);
+  });
 });
 
 // The chain's value is entirely in recomputation: everything here modifies an

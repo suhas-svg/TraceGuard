@@ -210,7 +210,12 @@ browser scenarios with `npm run test:e2e`, the Kubernetes manifests with
 - Policy effects are allow, deny, and require_approval. Deny overrides
   everything, priority only orders rules with the same effect, and unmatched
   calls are denied. Conditions use a fixed operator set: required fields plus
-  `path_within`, `regex`, `enum`, and `max_length` per argument.
+  `path_within`, `regex`, `enum`, and `max_length` per argument. `path_within`
+  is not a gateway-only check: the rule must be server- and tool-scoped, the
+  pinned tool definition must attest `io.traceguard/path-confinement` with
+  `enforcement: "executor"`, and the executor itself resolves real paths and
+  refuses traversal and symlink escapes. The publisher refuses to sign a
+  `path_within` rule whose executor attestation is missing or out of root.
 - A call needing approval returns 202 with an approval id and the gateway
   makes no upstream contact. The client retries with the approval id after a
   human decides with the separate approver key. Approvals are single-use and

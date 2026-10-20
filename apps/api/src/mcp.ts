@@ -13,6 +13,11 @@ export const MCP_PROTOCOL_VERSION = "2026-07-28";
 const META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion";
 const META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
 const META_LOGICAL_REQUEST_ID = "io.traceguard/logical_request_id";
+// FR-021: optional trace correlation the shim may carry; the gateway records
+// them on the decision row and the span so the run view can join them.
+const META_RUN_ID = "io.traceguard/run_id";
+const META_SPAN_ID = "io.traceguard/span_id";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TOOLS_TTL_MS = 60_000;
 
 type JsonRpcId = string | number;
@@ -193,6 +198,14 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
   const logicalId = typeof logicalRaw === "string" && logicalRaw.length > 0 && logicalRaw.length <= 128
     ? logicalRaw
     : undefined;
+  // FR-021: trace ids travel only as client metadata, never as call
+  // arguments; malformed values are dropped rather than refused so a broken
+  // correlator cannot block a call. The gateway schema takes UUIDs, so only
+  // UUID-shaped values are forwarded.
+  const runRaw = meta[META_RUN_ID];
+  const runId = typeof runRaw === "string" && UUID_RE.test(runRaw) ? runRaw : undefined;
+  const spanRaw = meta[META_SPAN_ID];
+  const spanId = typeof spanRaw === "string" && UUID_RE.test(spanRaw) ? spanRaw : undefined;
 
   // §9.5: an approval needing call without the shim's stable logical id is
   // refused explicitly rather than silently creating an unmatchable hold.
@@ -238,7 +251,9 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
       arguments: args,
       caller,
       ...(logicalId ? { request_id: logicalId } : {}),
-      ...(approvalId ? { approval_id: approvalId } : {})
+      ...(approvalId ? { approval_id: approvalId } : {}),
+      ...(runId ? { run_id: runId } : {}),
+      ...(spanId ? { span_id: spanId } : {})
     }
   });
   const body = res.json() as Record<string, unknown> & { result?: unknown };

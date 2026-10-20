@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { posix } from "node:path";
 import { canonicalize } from "@traceguard/canonical-json";
+import { PATH_CONFINEMENT_META_KEY, pathConfinementMetaSchema } from "@traceguard/schemas";
 import { validateAgainstSchema } from "./schema-check.js";
 
 export type Effect = "allow" | "deny" | "require_approval";
@@ -83,14 +84,56 @@ export function requestHash(
 
 // path_within canonicalizes .. and duplicate separators before comparing, so
 // "data/../etc" cannot pass a "/data" prefix rule through string matching.
-// shortcut: symlinks are not resolved here; run the gateway where the tool
-// host resolves paths, or add realpath checks before production use.
+// FR-010: this is a pre-check only. The enforcement boundary is the executor
+// (see pathEnforcementIssue below): the gateway accepts a path_within rule
+// only when the pinned tool definition carries an executor attestation, and
+// the executor re-checks the resolved path (realpath, symlinks) itself.
 export function pathWithin(value: string, allowedDir: string): boolean {
   if (typeof value !== "string" || value.length === 0) return false;
   const clean = (p: string) => (p.startsWith("/") ? posix.normalize(p) : posix.normalize("/" + p));
   const v = clean(value);
   const base = clean(allowedDir);
   return v === base || v.startsWith(base.endsWith("/") ? base : base + "/");
+}
+
+// FR-010 / §16.3 T9: "Gateway string validation alone is insufficient."
+// A rule carrying path_within is enforceable only when
+//   (a) it is scoped to one server and one tool, so there is an executor to
+//       hold accountable, and
+//   (b) the pinned definition of that tool carries the executor attestation
+//       `_meta["io.traceguard/path-confinement"]` = {root, enforcement:"executor"},
+//       which is covered by the signed pin hash, and
+//   (c) every path_within is inside the attested root (otherwise the rule
+//       could never match a path the executor would allow).
+// Returns a human-readable refusal, or null when there is nothing to enforce.
+export function pathEnforcementIssue(
+  rule: PolicyRule | null,
+  definition: unknown
+): string | null {
+  if (!rule) return null;
+  const constrained = Object.values(rule.conditions?.arguments ?? {}).filter(
+    (constraint) => constraint?.path_within !== undefined
+  );
+  if (constrained.length === 0) return null;
+  if (!rule.server_id || !rule.tool_name) {
+    return "path_within requires a server- and tool-scoped rule so the executor attestation can be checked";
+  }
+  const meta = definition && typeof definition === "object"
+    ? (definition as { _meta?: unknown })._meta
+    : undefined;
+  const attestation = meta && typeof meta === "object"
+    ? (meta as Record<string, unknown>)[PATH_CONFINEMENT_META_KEY]
+    : undefined;
+  const parsed = pathConfinementMetaSchema.safeParse(attestation);
+  if (!parsed.success) {
+    return `tool "${rule.tool_name}" has no pinned executor path-confinement attestation (${PATH_CONFINEMENT_META_KEY}); gateway string comparison is not an enforcement boundary`;
+  }
+  for (const constraint of constrained) {
+    if (!pathWithin(constraint.path_within as string, parsed.data.root)) {
+      return `path_within "${constraint.path_within}" is outside the executor's attested root "${parsed.data.root}"`;
+    }
+  }
+  return null;
 }
 
 // T8: a rule pattern is bounded on both sides. The schema refuses invalid,

@@ -369,6 +369,32 @@ export interface Approval {
   decision_reason: string;
   response_is_error?: boolean | null;
   outcome_summary?: string;
+  // FR-021: the trace a call named when the hold was created.
+  run_id?: string | null;
+  span_id?: string | null;
+}
+
+// FR-021: one gateway policy decision, correlated to a run/span/request so
+// the trace view can show what the boundary decided for each call.
+export interface PolicyDecision {
+  id: string;
+  timestamp: string;
+  workspace_id: string;
+  caller: string;
+  server_id: string | null;
+  tool_name: string;
+  args_hash: string;
+  decision: string;
+  policy_id: string | null;
+  policy_version: number | null;
+  policy_version_id: string | null;
+  matched_rules: { id?: string; name?: string; effect?: string }[] | null;
+  reason: string;
+  approval_id: string | null;
+  overhead_ms: number | null;
+  run_id: string | null;
+  span_id: string | null;
+  request_id: string | null;
 }
 
 export interface AuditEvent {
@@ -426,9 +452,14 @@ export const gwApi = {
     ),
   audit: (action?: string) =>
     gw<{ items: AuditEvent[] }>(`/v1/audit-events${action ? `?action=${encodeURIComponent(action)}` : ""}`),
+  // FR-021: every decision recorded for one run, newest first.
+  decisions: (runId: string, limit = 200) =>
+    gw<{ items: PolicyDecision[] }>(`/v1/decisions?run_id=${encodeURIComponent(runId)}&limit=${limit}`),
   policyVersions: () => gw<{ items: PolicyVersion[] }>("/v1/policy-versions"),
   auditVerify: () =>
-    gw<{ ok: boolean; checked: number; truncated: boolean; problems: { id: string; problem: string }[] }>(
+    gw<{ ok: boolean; checked: number; truncated: boolean; problems: { id: string; problem: string }[];
+      anchored: { checkpoint_id: string; up_to_timestamp: string; up_to_hash: string; event_count: number } | null;
+      empty: boolean; complete: boolean }>(
       "/v1/audit/verify", { method: "POST", body: "{}" }
     )
 };

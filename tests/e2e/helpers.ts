@@ -86,6 +86,15 @@ export async function upstreamHits(request: APIRequestContext): Promise<number> 
   return (await res.json()).hits as number;
 }
 
+// FR-010: the mock upstream advertises whether it could create the symlink
+// escape fixture. Windows without the symlink privilege reports false, so the
+// escape case is skipped there rather than pretended to pass.
+export async function upstreamInfo(request: APIRequestContext): Promise<{ hits: number; escape_ready: boolean }> {
+  const res = await request.get(`${MOCK_TOOLS_URL}/hits`);
+  const body = await res.json();
+  return { hits: body.hits as number, escape_ready: body.escape_ready === true };
+}
+
 // The dashboard reads its connection settings from localStorage; every page
 // must be seeded before its first navigation in the test.
 export async function setKeys(page: Page) {

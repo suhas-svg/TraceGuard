@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   checkConditions,
   evaluate,
+  pathEnforcementIssue,
   pathWithin,
   requestHash,
   type PolicyRule
@@ -84,6 +85,54 @@ describe("argument constraints", () => {
     expect(checkConditions({ meta: { tag: 123 } }, cond)).toBe(false);
     expect(checkConditions({ meta: "nope" }, cond)).toBe(false);
     expect(checkConditions({ meta: { other: 1 } }, cond)).toBe(false);
+  });
+});
+
+describe("executor path confinement (FR-010)", () => {
+  const attested = {
+    _meta: { "io.traceguard/path-confinement": { root: "/data", enforcement: "executor" } }
+  };
+  const pathRule = (over: Partial<PolicyRule> = {}): PolicyRule =>
+    rule({
+      server_id: "srv-1",
+      tool_name: "read_file",
+      conditions: { arguments: { path: { path_within: "/data" } } },
+      ...over
+    });
+
+  it("ignores rules with no path_within constraint", () => {
+    expect(pathEnforcementIssue(rule({}), attested)).toBeNull();
+    expect(pathEnforcementIssue(rule({ server_id: "srv-1" }), attested)).toBeNull();
+    expect(pathEnforcementIssue(null, attested)).toBeNull();
+  });
+
+  it("refuses a path_within rule that is not server- and tool-scoped", () => {
+    const issue = pathEnforcementIssue(
+      rule({ conditions: { arguments: { path: { path_within: "/data" } } } }), attested
+    );
+    expect(issue).toMatch(/server- and tool-scoped/);
+  });
+
+  it("refuses a tool whose pinned definition carries no executor attestation", () => {
+    expect(pathEnforcementIssue(pathRule(), { _meta: {} }))
+      .toMatch(/io\.traceguard\/path-confinement/);
+    expect(pathEnforcementIssue(pathRule(), {})).toMatch(/attestation/);
+    expect(pathEnforcementIssue(pathRule(), null)).toMatch(/attestation/);
+  });
+
+  it("refuses an attestation that does not commit the executor", () => {
+    const issue = pathEnforcementIssue(pathRule(), {
+      _meta: { "io.traceguard/path-confinement": { root: "/data", enforcement: "gateway" } }
+    });
+    expect(issue).toMatch(/attestation/);
+  });
+
+  it("allows a constraint inside the attested root and refuses one outside", () => {
+    expect(pathEnforcementIssue(pathRule(), attested)).toBeNull();
+    const outside = pathRule({
+      conditions: { arguments: { path: { path_within: "/etc" } } }
+    });
+    expect(pathEnforcementIssue(outside, attested)).toMatch(/outside the executor's attested root/);
   });
 });
 

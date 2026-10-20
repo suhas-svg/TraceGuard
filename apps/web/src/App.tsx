@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  formatMicro, getDiagnostics, getOverview, getRunCounts, getTrace, getUsage, listAgents, listRuns,
+  formatMicro, getDiagnostics, getOverview, getRunCounts, getTrace, getUsage, gwApi, listAgents, listRuns,
   settings, type Span
 } from "./api";
 import { buildTree, tokenTotal, type SpanNode } from "./tree";
@@ -420,7 +420,15 @@ function SpanDetail({ span, costMicro }: { span: Span; costMicro?: number | null
   );
 }
 
-function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
+function TraceView({
+  runId,
+  onBack,
+  onOpenApproval
+}: {
+  runId: string;
+  onBack: () => void;
+  onOpenApproval: (approvalId: string) => void;
+}) {
   const [selected, setSelected] = useState<string | null>(null);
   const traceQuery = useQuery({ queryKey: ["trace", runId], queryFn: () => getTrace(runId) });
   const usageQuery = useQuery({ queryKey: ["usage", runId], queryFn: () => getUsage(runId) });
@@ -429,12 +437,21 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
     queryFn: () => getDiagnostics(runId),
     retry: false
   });
+  // FR-021: gateway decisions correlated to this trace by run_id.
+  const decisionsQuery = useQuery({
+    queryKey: ["decisions", runId],
+    queryFn: () => gwApi.decisions(runId),
+    retry: false
+  });
 
   const error = traceQuery.error instanceof Error ? traceQuery.error.message : traceQuery.error ? "load failed" : "";
   const run = traceQuery.data?.run ?? null;
   const spans: Span[] = traceQuery.data?.spans ?? [];
   const costBySpan = new Map((usageQuery.data?.spans ?? []).map((u) => [u.id, u.cost_micro]));
   const warnings = diagnosticsQuery.data?.warnings ?? [];
+  const decisions = decisionsQuery.data?.items ?? [];
+  const decisionTone = (decision: string): "ok" | "warn" | "bad" =>
+    decision === "allow" || decision === "approved_retry" ? "ok" : decision === "need_approval" ? "warn" : "bad";
   const cost = usageQuery.data
     ? `${formatMicro(usageQuery.data.estimated_cost_micro)}${usageQuery.data.cost_partial ? " (partial)" : ""}`
     : usageQuery.isError ? "n/a" : null;
@@ -505,12 +522,64 @@ function TraceView({ runId, onBack }: { runId: string; onBack: () => void }) {
           )}
         </div>
       </div>
+      <div className="mt-4">
+        <Card className="space-y-3 p-4">
+          <div>
+            <h2 className="text-sm font-semibold text-ink-900">Decisions</h2>
+            <p className="text-xs text-ink-500">
+              Gateway policy decisions for this run, including blocked and approval-gated calls.
+            </p>
+          </div>
+          {decisionsQuery.isError ? (
+            <Alert>{(decisionsQuery.error as Error)?.message ?? "decisions failed to load"}</Alert>
+          ) : decisions.length === 0 ? (
+            <p className="text-sm text-ink-500">No gateway decisions recorded for this run.</p>
+          ) : (
+            <Table>
+              <thead>
+                <tr>
+                  <Th>Time</Th>
+                  <Th>Tool</Th>
+                  <Th>Decision</Th>
+                  <Th>Reason</Th>
+                  <Th>Matched rule</Th>
+                  <Th>Policy</Th>
+                  <Th>Approval</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {decisions.map((d) => (
+                  <tr key={d.id}>
+                    <Td className="whitespace-nowrap">{relTime(d.timestamp)}</Td>
+                    <Td className="font-mono">{d.tool_name}</Td>
+                    <Td>
+                      <Badge tone={decisionTone(d.decision)}>{d.decision}</Badge>
+                    </Td>
+                    <Td>{d.reason ?? "—"}</Td>
+                    <Td>{(d.matched_rules ?? []).map((m) => m.name ?? m.id ?? "?").join(", ") || "—"}</Td>
+                    <Td>{d.policy_version ? `v${d.policy_version}` : "—"}</Td>
+                    <Td>
+                      {d.approval_id ? (
+                        <LinkButton onClick={() => onOpenApproval(d.approval_id!)}>
+                          open {short(d.approval_id)}
+                        </LinkButton>
+                      ) : (
+                        "—"
+                      )}
+                    </Td>
+                  </tr>
+                ))}
+              </tbody>
+            </Table>
+          )}
+        </Card>
+      </div>
     </Page>
   );
 }
 
 export default function App() {
-  const [{ tab, runId: openRun }, navigate] = useHashRoute();
+  const [{ tab, runId: openRun, approvalId }, navigate] = useHashRoute();
   const [drawer, setDrawer] = useState(false);
   const queryClient = useQueryClient();
   const health = useQuery({
@@ -529,7 +598,7 @@ export default function App() {
     retry: false
   }).data?.pending_approvals ?? 0;
 
-  const go = (t: Tab) => navigate({ tab: t, runId: null });
+  const go = (t: Tab) => navigate({ tab: t, runId: null, approvalId: null });
 
   // Ctrl/Cmd+K opens the switcher; Escape closes it from inside.
   const [palette, setPalette] = useState(false);
@@ -557,7 +626,7 @@ export default function App() {
       id: `run-${r.id}`,
       label: `Open run ${r.id.slice(0, 8)}`,
       hint: r.agent_name,
-      action: () => navigate({ tab: "runs", runId: r.id })
+      action: () => navigate({ tab: "runs", runId: r.id, approvalId: null })
     }));
     return [...TABS.map((t) => ({ id: `tab-${t.id}`, label: `Go to ${t.label}`, action: () => go(t.id) })), ...recent];
   }, [palette]);
@@ -624,11 +693,14 @@ export default function App() {
           {tab === "overview" ? (
             <OverviewView />
           ) : tab === "evals" ? (
-            <EvalsView onOpenRun={(id) => navigate({ tab: "runs", runId: id })} />
+            <EvalsView onOpenRun={(id) => navigate({ tab: "runs", runId: id, approvalId: null })} />
           ) : tab === "policy" ? (
             <PoliciesView />
           ) : tab === "approvals" ? (
-            <ApprovalsView />
+            <ApprovalsView
+              focusId={approvalId}
+              onOpenRun={(id) => navigate({ tab: "runs", runId: id, approvalId: null })}
+            />
           ) : tab === "webhooks" ? (
             <WebhooksView />
           ) : tab === "retention" ? (
@@ -638,9 +710,13 @@ export default function App() {
           ) : tab === "users" ? (
             <UsersView />
           ) : openRun ? (
-            <TraceView runId={openRun} onBack={() => navigate({ tab: "runs", runId: null })} />
+            <TraceView
+              runId={openRun}
+              onBack={() => navigate({ tab: "runs", runId: null, approvalId: null })}
+              onOpenApproval={(id) => navigate({ tab: "approvals", runId: null, approvalId: id })}
+            />
           ) : (
-            <RunsList onOpen={(id) => navigate({ tab: "runs", runId: id })} />
+            <RunsList onOpen={(id) => navigate({ tab: "runs", runId: id, approvalId: null })} />
           )}
         </main>
       </div>

@@ -6,10 +6,11 @@ import type { PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
 import { signCheckpoint, verifyAuditChain, verifyCheckpoint, type CheckpointPayload } from "@traceguard/audit-chain";
-import { argConditionsSchema } from "@traceguard/schemas";
+import { argConditionsSchema, hasPathWithin } from "@traceguard/schemas";
 import {
   argsHash,
   evaluate,
+  pathEnforcementIssue,
   requestHash,
   sha256Hex,
   stableStringify
@@ -115,6 +116,9 @@ async function recordDecision(client: PoolClient, d: {
   // The exact signed policy version this decision evaluated (§8.5).
   policy_version_id?: string | null;
   matched?: unknown[]; reason?: string; approval_id?: string | null;
+  // FR-021: trace and request correlation, so the run view can show which
+  // decision (and which approval) belongs to which call.
+  run_id?: string | null; span_id?: string | null; request_id?: string | null;
   // Section 14's policy-decision budget, measured from the start of handling
   // the call to the moment the decision is recorded. The upstream round trip
   // it excludes is excluded by construction: the value is read before
@@ -124,11 +128,13 @@ async function recordDecision(client: PoolClient, d: {
   await client.query(
     `INSERT INTO policy_decisions
        (workspace_id, caller, server_id, tool_name, args_hash, decision,
-        policy_id, policy_version, policy_version_id, matched_rules, reason, approval_id, overhead_ms)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13)`,
+        policy_id, policy_version, policy_version_id, matched_rules, reason, approval_id,
+        run_id, span_id, request_id, overhead_ms)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15,$16)`,
     [d.workspace_id, d.caller, d.server_id, d.tool_name, d.args_hash, d.decision,
      d.policy_id ?? null, d.policy_version ?? null, d.policy_version_id ?? null,
      JSON.stringify(d.matched ?? []), d.reason ?? "", d.approval_id ?? null,
+     d.run_id ?? null, d.span_id ?? null, d.request_id ?? null,
      d.overhead_ms ?? null]
   );
 }
@@ -358,6 +364,16 @@ export function buildGateway() {
     // The typed condition shape, not a free record: an unsupported pattern is
     // refused here rather than at bundle load (T8).
     conditions: argConditionsSchema.default({ required: [] })
+  }).superRefine((rule, ctx) => {
+    // FR-010: a path constraint needs a scoped target so the pinned executor
+    // attestation can be checked at publish and at call time.
+    if (hasPathWithin(rule.conditions) && (!rule.server_id || !rule.tool_name)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["conditions"],
+        message: "path_within requires a server- and tool-scoped rule"
+      });
+    }
   });
 
   app.post("/v1/policies", async (req, reply) => {
@@ -467,7 +483,7 @@ export function buildGateway() {
   // status the trace view and the eval violations counter look for.
   async function recordDeniedSpan(
     client: PoolClient,
-    ctx: { run_id?: string; span_id?: string },
+    ctx: { run_id?: string; span_id?: string; request_id?: string; approval_id?: string },
     serverId: string,
     tool: string,
     reason: string
@@ -480,7 +496,12 @@ export function buildGateway() {
          VALUES ($1,$2,$3,'tool.invocation',$4,$5,'denied','policy_denied',$6::jsonb)
          ON CONFLICT (id) DO NOTHING`,
         [ctx.span_id ?? randomUUID(), ctx.run_id, `gw-${randomUUID()}`, tool,
-         new Date().toISOString(), JSON.stringify(redactDeep({ server_id: serverId, tool, reason }, { captureRaw: true }))]
+         new Date().toISOString(), JSON.stringify(redactDeep({
+           server_id: serverId, tool, reason,
+           // FR-021: a denied span still points at the decision and the
+           // approval it belongs to, so the run view can explain the block.
+           request_id: ctx.request_id ?? null, approval_id: ctx.approval_id ?? null
+         }, { captureRaw: true }))]
       );
     } catch (err) {
       // The denial stands even when the trace write cannot land, but a
@@ -497,7 +518,9 @@ export function buildGateway() {
     caller: string,
     decisionMeta: { approval_id?: string | null; policy_id?: string | null; policy_version?: number | null;
       policy_version_id?: string | null; matched?: unknown[]; overheadMs?: number;
-      provenanceRecorded?: boolean }
+      provenanceRecorded?: boolean;
+      // FR-021: the same trace ids the call route attached to its decisions.
+      corr?: { run_id: string | null; span_id: string | null; request_id: string | null } }
   ): Promise<unknown> {
     // Gateway fails closed: any upstream or policy error denies, never allows.
     // Re-validate before every forward; a failure surfaces through the
@@ -508,6 +531,7 @@ export function buildGateway() {
       // The call never leaves, and the decision trail records why so the
       // console can explain the failure next to the allow rules.
       await recordDecision(client, {
+        ...decisionMeta.corr,
         workspace_id: server.workspace_id, caller, server_id: server.id, tool_name: tool,
         args_hash: sha256Hex(stableStringify(args)), decision: "error",
         policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
@@ -528,6 +552,7 @@ export function buildGateway() {
       // and the failure so the console can explain the eventual 502.
       const detail = err instanceof Error ? err.message : String(err);
       await recordDecision(client, {
+        ...decisionMeta.corr,
         workspace_id: server.workspace_id, caller, server_id: server.id, tool_name: tool,
         args_hash: sha256Hex(stableStringify(args)), decision: "error",
         policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
@@ -546,6 +571,7 @@ export function buildGateway() {
     // paths below still record — a failed dispatch is new information.
     if (!decisionMeta.provenanceRecorded) {
       await recordDecision(client, {
+        ...decisionMeta.corr,
         workspace_id: server.workspace_id, caller, server_id: server.id, tool_name: tool,
         args_hash: sha256Hex(stableStringify(args)), decision: decisionMeta.approval_id ? "approved_retry" : "allow",
         policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
@@ -572,6 +598,14 @@ export function buildGateway() {
     // never a request field. Static environment keys carry no subject, so
     // only for them does the body value stand in.
     const caller = req.principal?.userId ?? parsed.data.caller ?? parsed.data.agent_name ?? "agent";
+    // FR-021: the trace ids (when the caller supplies them) ride on every
+    // decision row this call records — including denials that never reach an
+    // approval — so the run view can show which decision belongs to which span.
+    const corr = {
+      run_id: parsed.data.run_id ?? null,
+      span_id: parsed.data.span_id ?? null,
+      request_id: parsed.data.request_id ?? null
+    };
     const client = await pool.connect();
     try {
       const srv = await client.query("SELECT * FROM mcp_servers WHERE id = $1", [server_id]);
@@ -592,7 +626,7 @@ export function buildGateway() {
       const policyLoad = await loadActivePolicy(client, server.workspace_id);
       if (!policyLoad.ok) {
         const reason = `policy unavailable: ${policyLoad.reason}`;
-        await recordDecision(client, { workspace_id: server.workspace_id, caller,
+        await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller,
           server_id, tool_name: tool, args_hash: argsHash(args as Record<string, unknown>),
           decision: "deny", reason, overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
@@ -608,7 +642,7 @@ export function buildGateway() {
       const manifestServer = policy.bundle.servers.find((s) => s.server_id === server.id);
       if (!manifestServer || manifestServer.base_url !== server.base_url) {
         const reason = "server is not in the active signed policy";
-        await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+        await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: argsHash(args as Record<string, unknown>), decision: "deny", reason,
           policy_version_id: policy.policy_version_id, overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
@@ -627,7 +661,7 @@ export function buildGateway() {
         const reason = wantsSecret
           ? "server is published with a gateway_secret credential, but no secret is configured"
           : "server is published credential-less, but a secret is still attached";
-        await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+        await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: argsHash(args as Record<string, unknown>), decision: "deny", reason,
           policy_version_id: policy.policy_version_id, overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
@@ -641,7 +675,7 @@ export function buildGateway() {
       );
       if (!toolRow.rows[0] || toolRow.rows[0].quarantined) {
         const reason = toolRow.rows[0] ? "tool quarantined" : "unknown tool";
-        await recordDecision(client, { workspace_id: server.workspace_id, caller,
+        await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller,
           server_id, tool_name: tool, args_hash: argsHash(args as Record<string, unknown>),
           decision: "deny", reason, policy_version_id: policy.policy_version_id,
           overhead_ms: overheadMs() });
@@ -679,7 +713,7 @@ export function buildGateway() {
       const argsCheck = validateAgainstSchema(inputSchema, args);
       if (!argsCheck.ok) {
         const reason = `arguments do not match the pinned input schema: ${argsCheck.reason}`;
-        await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+        await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: argsHash(args as Record<string, unknown>), decision: "deny",
           reason, policy_version_id: policy.policy_version_id, overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
@@ -700,7 +734,7 @@ export function buildGateway() {
           ? "tool definition changed since it was published"
           : null;
       if (pinIssue) {
-        await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+        await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: argsHash(args as Record<string, unknown>), decision: "deny",
           reason: pinIssue, policy_version_id: policy.policy_version_id, overhead_ms: overheadMs() });
         await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
@@ -742,7 +776,7 @@ export function buildGateway() {
       const callArgsHash = argsHash(args as Record<string, unknown>);
 
       if (verdict.decision === "deny") {
-        await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+        await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: callArgsHash, decision: "deny",
           policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null,
           policy_version_id: policy.policy_version_id,
@@ -775,6 +809,30 @@ export function buildGateway() {
         return reply.code(403).send({ error: "tool_blocked", reason: verdict.reason });
       }
 
+      // FR-010 / §16.3 T9: path_within is enforceable only when the executor
+      // attests confinement inside the tool's pinned definition. Checked for
+      // every non-deny verdict (allow and require_approval) before any budget
+      // or approval work, so an unenforceable path rule fails closed. The
+      // gateway string comparison is a pre-check; the executor re-checks the
+      // resolved path (realpath, symlinks) itself.
+      const pathIssue = pathEnforcementIssue(verdict.rule, definition);
+      if (pathIssue) {
+        const reason = `path enforcement refused: ${pathIssue}`;
+        await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
+          tool_name: tool, args_hash: callArgsHash, decision: "deny",
+          policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null,
+          policy_version_id: policy.policy_version_id,
+          matched: verdict.matched, reason,
+          approval_id: parsed.data.approval_id ?? null, overhead_ms: overheadMs() });
+        await audit(pool, { actor_type: "agent", actor_id: caller, action: "tool.execute",
+          resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied",
+          metadata: { reason: "path_enforcement", detail: pathIssue, rule: verdict.rule?.name ?? null } });
+        void notify(server.workspace_id, "tool.denied",
+          { caller, server_id, tool, rule: verdict.rule?.name ?? null, reason: pathIssue });
+        await recordDeniedSpan(client, parsed.data, server.id, tool, reason);
+        return reply.code(403).send({ error: "tool_blocked", reason, code: "path_enforcement" });
+      }
+
       // §11.3 step 3: hard budget limits gate managed operations. Tool calls
       // do not spend the budget themselves, but once a block budget covering
       // this run or agent is fully exhausted, the gateway stops forwarding
@@ -786,7 +844,7 @@ export function buildGateway() {
       });
       if (exhausted) {
         const reason = `budget exhausted (${exhausted.scope} ${exhausted.id})`;
-        await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+        await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: callArgsHash, decision: "deny",
           policy_version_id: policy.policy_version_id, matched: verdict.matched, reason,
           approval_id: parsed.data.approval_id ?? null, overhead_ms: overheadMs() });
@@ -832,7 +890,7 @@ export function buildGateway() {
                args_enc=false, args_summary=$2 WHERE id=$1 AND status='pending'`,
             [approval.id, safeSummary(approval)]
           );
-          await recordDecision(client, { workspace_id: server.workspace_id, caller,
+          await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller,
             server_id, tool_name: tool, args_hash: callArgsHash,
             policy_version_id: policy.policy_version_id,
             decision: "deny", reason: "approval expired", approval_id: approval.id,
@@ -857,7 +915,7 @@ export function buildGateway() {
                args_enc=false, args_summary=$2 WHERE id=$1 AND status='approved'`,
             [approval.id, safeSummary(approval)]
           );
-          await recordDecision(client, { workspace_id: server.workspace_id, caller,
+          await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller,
             server_id, tool_name: tool, args_hash: callArgsHash,
             policy_version_id: policy.policy_version_id,
             decision: "deny", reason: "approval expired", approval_id: approval.id,
@@ -869,7 +927,7 @@ export function buildGateway() {
         }
         const want = requestHash(caller, server_id, tool, args, approval.request_id, String(toolRow.rows[0].definition_hash));
         if (!hashesEqual(want, approval.args_hash) || approval.caller !== caller) {
-          await recordDecision(client, { workspace_id: server.workspace_id, caller,
+          await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller,
             server_id, tool_name: tool, args_hash: callArgsHash,
             policy_version_id: policy.policy_version_id,
             decision: "deny", reason: "approval binding mismatch", approval_id: approval.id,
@@ -906,7 +964,7 @@ export function buildGateway() {
         }
         const freshPolicy = freshLoad.policy;
         const toolNow = await client.query(
-          "SELECT quarantined, definition_hash FROM server_tools WHERE server_id = $1 AND tool_name = $2",
+          "SELECT quarantined, definition_hash, definition FROM server_tools WHERE server_id = $1 AND tool_name = $2",
           [server_id, tool]
         );
         if (!toolNow.rows[0] || toolNow.rows[0].quarantined) {
@@ -934,7 +992,7 @@ export function buildGateway() {
             [approval.id, `invalidated: ${why}`,
              summarizeArgs(stored, { captureRaw: captureRawEnabled() })]
           );
-          await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+          await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
             tool_name: tool, args_hash: callArgsHash, decision: "deny",
             policy_version_id: freshPolicy.policy_version_id,
             reason: `approval invalidated: ${why}`,
@@ -956,7 +1014,7 @@ export function buildGateway() {
             [approval.id, `invalidated: ${recheck.reason}`,
              summarizeArgs(stored, { captureRaw: captureRawEnabled() })]
           );
-          await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+          await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
             tool_name: tool, args_hash: callArgsHash, decision: "deny",
             policy_id: recheck.rule?.id ?? null, policy_version: recheck.rule?.version ?? null,
             policy_version_id: freshPolicy.policy_version_id,
@@ -968,6 +1026,30 @@ export function buildGateway() {
             metadata: { rule: recheck.rule?.name ?? null } });
           await client.query("COMMIT");
           return reply.code(403).send({ error: "policy_invalidated", reason: recheck.reason });
+        }
+        // FR-010: an approval authorizes a call under the policy that was
+        // active when it was issued. If the current policy's winning rule
+        // carries a path constraint the executor no longer attests (a changed
+        // pin) or never attested, the approval dies here.
+        const retryPathIssue = pathEnforcementIssue(recheck.rule, toolNow.rows[0].definition);
+        if (retryPathIssue) {
+          await client.query(
+            `UPDATE approvals SET status='policy_invalidated', terminal_at=now(), decision_reason=$2,
+               args='{}'::jsonb, args_enc=false, args_summary=$3 WHERE id=$1 AND status='approved'`,
+            [approval.id, `invalidated: ${retryPathIssue}`,
+             summarizeArgs(stored, { captureRaw: captureRawEnabled() })]
+          );
+          await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
+            tool_name: tool, args_hash: callArgsHash, decision: "deny",
+            policy_id: recheck.rule?.id ?? null, policy_version: recheck.rule?.version ?? null,
+            policy_version_id: freshPolicy.policy_version_id, matched: recheck.matched,
+            reason: `approval invalidated by path enforcement: ${retryPathIssue}`,
+            approval_id: approval.id, overhead_ms: overheadMs() });
+          await audit(client, { actor_type: "agent", actor_id: caller, action: "approval.policy_invalidated",
+            resource_type: "approval", resource_id: approval.id, result: "deny",
+            metadata: { reason: retryPathIssue } });
+          await client.query("COMMIT");
+          return reply.code(403).send({ error: "policy_invalidated", reason: retryPathIssue });
         }
         // Claim (compare-and-swap) with a short lease, committed separately
         // from the execution intent (§9.2): a crash after this COMMIT but
@@ -1022,7 +1104,7 @@ export function buildGateway() {
         }
         const lastPolicy = lastLoad.policy;
         const toolLast = await client.query(
-          "SELECT quarantined, definition_hash FROM server_tools WHERE server_id = $1 AND tool_name = $2",
+          "SELECT quarantined, definition_hash, definition FROM server_tools WHERE server_id = $1 AND tool_name = $2",
           [server_id, tool]
         );
         const pinLast = lastPolicy.bundle.pins.find(
@@ -1032,13 +1114,20 @@ export function buildGateway() {
           caller, agent_id: parsed.data.agent_id ?? null, server_id, tool_name: tool,
           args: stored
         });
+        // FR-010: the verdict recorded at the linearization point must be one
+        // the executor can actually enforce, not just one the gateway matched.
+        const lastPathIssue = lastVerdict.decision === "deny"
+          ? null
+          : pathEnforcementIssue(lastVerdict.rule, toolLast.rows[0]?.definition);
         const lastWhy = !toolLast.rows[0] || toolLast.rows[0].quarantined
           ? "the tool is quarantined"
           : !pinLast || pinLast.definition_hash !== toolLast.rows[0].definition_hash
             ? "the tool pin is no longer active in the signed policy"
-            : lastVerdict.decision === "deny"
-              ? lastVerdict.reason
-              : null;
+            : lastPathIssue
+              ? `path enforcement refused: ${lastPathIssue}`
+              : lastVerdict.decision === "deny"
+                ? lastVerdict.reason
+                : null;
         if (lastWhy) {
           const quarantined = !toolLast.rows[0] || !!toolLast.rows[0].quarantined;
           await client.query(
@@ -1049,7 +1138,7 @@ export function buildGateway() {
              `invalidated: ${lastWhy}`,
              summarizeArgs(stored, { captureRaw: captureRawEnabled() })]
           );
-          await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+          await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
             tool_name: tool, args_hash: callArgsHash, decision: "deny",
             policy_id: lastVerdict.rule?.id ?? null, policy_version: lastVerdict.rule?.version ?? null,
             policy_version_id: lastPolicy.policy_version_id, matched: lastVerdict.matched,
@@ -1076,7 +1165,7 @@ export function buildGateway() {
         // The verdict that authorizes this dispatch is recorded — with its
         // policy version and matched rules — before the intent commits, so a
         // crash in EXECUTING leaves the provenance behind (§9.2 rule 5).
-        await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+        await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: callArgsHash, decision: "approved_retry",
           policy_id: lastVerdict.rule?.id ?? null, policy_version: lastVerdict.rule?.version ?? null,
           policy_version_id: lastPolicy.policy_version_id, matched: lastVerdict.matched,
@@ -1092,7 +1181,7 @@ export function buildGateway() {
         let result: unknown;
         try {
           result = await forward(client, server, tool, stored,
-            caller, { approval_id: approval.id, policy_version_id: lastPolicy.policy_version_id,
+            caller, { corr, approval_id: approval.id, policy_version_id: lastPolicy.policy_version_id,
               // The decision trail keeps the linearization-point verdict's
               // rule attribution, not just the version it ran under.
               policy_id: lastVerdict.rule?.id ?? null, policy_version: lastVerdict.rule?.version ?? null,
@@ -1201,7 +1290,7 @@ export function buildGateway() {
           }
           row = found as ApprovalRow;
         }
-        await recordDecision(client, { workspace_id: server.workspace_id, caller, server_id,
+        await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: callArgsHash, decision: "need_approval",
           policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null,
           policy_version_id: policy.policy_version_id,
@@ -1217,7 +1306,7 @@ export function buildGateway() {
 
       try {
         const result = await forward(client, server, tool, args as Record<string, unknown>, caller,
-          { policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null,
+          { corr, policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null,
             policy_version_id: policy.policy_version_id, matched: verdict.matched, overheadMs: overheadMs() });
         return { result };
       } catch {
@@ -1236,7 +1325,9 @@ export function buildGateway() {
 
 
   app.get("/v1/decisions", async (req) => {
-    const q = req.query as { server_id?: string; tool?: string; limit?: string };
+    const q = req.query as { server_id?: string; tool?: string; limit?: string;
+      // FR-021: the run view and the approval cards filter by trace ids.
+      run_id?: string; span_id?: string; request_id?: string };
     const limit = Math.min(Math.max(Number(q.limit ?? 50), 1), 200);
     const params: unknown[] = [];
     const where: string[] = [];
@@ -1247,6 +1338,18 @@ export function buildGateway() {
     if (q.tool) {
       params.push(q.tool);
       where.push(`tool_name = $${params.length}`);
+    }
+    if (q.run_id) {
+      params.push(q.run_id);
+      where.push(`run_id = $${params.length}`);
+    }
+    if (q.span_id) {
+      params.push(q.span_id);
+      where.push(`span_id = $${params.length}`);
+    }
+    if (q.request_id) {
+      params.push(q.request_id);
+      where.push(`request_id = $${params.length}`);
     }
     const dscope = scopeClause(req.principal, params, "workspace_id");
     if (dscope) where.push(dscope);
@@ -1287,16 +1390,33 @@ export function buildGateway() {
     const privateKeyPem = process.env.AUDIT_CHECKPOINT_KEY;
     if (!privateKeyPem) return reply.code(503).send({ error: "checkpoint_key_unconfigured" });
     const head = await pool.query(
-      "SELECT hash, timestamp FROM audit_events ORDER BY timestamp DESC, id DESC LIMIT 1"
+      "SELECT id, hash, timestamp FROM audit_events ORDER BY timestamp DESC, id DESC LIMIT 1"
     );
     if (!head.rows[0]) return reply.code(409).send({ error: "audit_chain_empty" });
     const count = await pool.query("SELECT count(*)::bigint AS n FROM audit_events");
+    // §10.2: the checkpoint names the exact contiguous segment being cut —
+    // the global head plus each workspace's last sequence inside the cut.
+    // The chain itself is global (prev_hash links across workspaces), so the
+    // prune is one global prefix; the segments are what the offline verifier
+    // checks the retained tail against.
+    const segments = await pool.query(
+      `SELECT DISTINCT ON (workspace_id) workspace_id, seq, hash
+         FROM audit_events
+        WHERE (timestamp, id) <= ($1, $2)
+        ORDER BY workspace_id, seq DESC NULLS LAST, timestamp DESC, id DESC`,
+      [head.rows[0].timestamp, head.rows[0].id]
+    );
     const payload: CheckpointPayload = {
-      v: 1,
+      v: 2,
       created_at: new Date().toISOString(),
       up_to_timestamp: new Date(head.rows[0].timestamp).toISOString(),
       up_to_hash: head.rows[0].hash as string,
-      event_count: Number(count.rows[0].n)
+      event_count: Number(count.rows[0].n),
+      segments: segments.rows.map((r) => ({
+        workspace_id: (r.workspace_id as string | null) ?? null,
+        up_to_sequence: r.seq === null || r.seq === undefined ? null : Number(r.seq),
+        up_to_hash: r.hash as string
+      }))
     };
     let signed;
     try {
@@ -1312,16 +1432,74 @@ export function buildGateway() {
     );
     await audit(pool, { actor_type: "admin", action: "audit.checkpoint.created",
       resource_type: "audit_checkpoint", resource_id: inserted.rows[0].id, result: "success",
-      metadata: { up_to_hash: payload.up_to_hash, event_count: payload.event_count } });
+      metadata: { up_to_hash: payload.up_to_hash, event_count: payload.event_count,
+        segments: payload.v === 2 ? payload.segments.length : 0 } });
     return reply.code(201).send({ id: inserted.rows[0].id, created_at: inserted.rows[0].created_at,
       payload, signature: signed.signature, key_id: signed.key_id });
   });
 
+  // §10.2 / FR-019: the operator-storable artifact. The signed payload plus
+  // the covered events travel together, so the copy kept outside the database
+  // and the containers can be verified offline without trusting this process.
+  app.get("/v1/audit/checkpoints/:id/export", async (req, reply) => {
+    const q = req.params as { id?: string };
+    if (!q.id || !/^[0-9a-f-]{36}$/i.test(q.id)) return reply.code(400).send({ error: "invalid_checkpoint_id" });
+    const cp = await pool.query(
+      `SELECT id, created_at, up_to_timestamp, up_to_hash, event_count, signature, key_id, payload
+         FROM audit_checkpoints WHERE id = $1`,
+      [q.id]
+    );
+    if (!cp.rows[0]) return reply.code(404).send({ error: "checkpoint_not_found" });
+    // Find the covered head row by hash, then export the exact prefix it
+    // signed — the same cut the prune would delete. A bounded read reports
+    // truncation rather than silently exporting a short segment.
+    const headRow = await pool.query(
+      "SELECT id, timestamp FROM audit_events WHERE hash = $1 LIMIT 1",
+      [cp.rows[0].up_to_hash]
+    );
+    if (!headRow.rows[0]) {
+      return reply.code(409).send({ error: "checkpoint_head_not_found",
+        note: "the covered head event is not in this database; export must run before pruning" });
+    }
+    const limit = 1_000_000;
+    const res = await pool.query(
+      `SELECT id, timestamp, actor_type, actor_id, action, resource_type, resource_id,
+              result, metadata, prev_hash, hash,
+              workspace_id, seq, hash_version, policy_version_id, matched_rule_ids
+         FROM audit_events WHERE (timestamp, id) <= ($1, $2)
+        ORDER BY timestamp ASC, id ASC LIMIT $3`,
+      [headRow.rows[0].timestamp, headRow.rows[0].id, limit + 1]
+    );
+    const truncated = res.rows.length > limit;
+    return {
+      checkpoint: {
+        id: cp.rows[0].id,
+        created_at: cp.rows[0].created_at,
+        up_to_timestamp: cp.rows[0].up_to_timestamp,
+        up_to_hash: cp.rows[0].up_to_hash,
+        event_count: Number(cp.rows[0].event_count),
+        signature: cp.rows[0].signature,
+        key_id: cp.rows[0].key_id,
+        payload: cp.rows[0].payload
+      },
+      events: res.rows.slice(0, limit),
+      truncated
+    };
+  });
+
   // §10.3 / FR-019: pruning is refused unless a valid checkpoint covers the
-  // cut. The definer helper keeps the checkpoint's head row, so the surviving
-  // chain begins with a broken link the verifier can re-anchor.
+  // cut *and* the operator names where the signed copy is stored outside the
+  // database and the containers (external_ref). The definer helper keeps the
+  // checkpoint's head row, so the surviving chain begins with a broken link
+  // the verifier can re-anchor.
   app.post("/v1/audit/prune", async (req, reply) => {
-    const parsed = z.object({ checkpoint_id: z.string().uuid() }).safeParse(req.body);
+    const parsed = z.object({
+      checkpoint_id: z.string().uuid(),
+      // §10.2: "store the signed checkpoint in external storage or an offline
+      // backup before deleting covered rows" — the receipt is mandatory, not
+      // documentation.
+      external_ref: z.string().min(1).max(2048)
+    }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_prune" });
     const publicKeyPem = process.env.AUDIT_CHECKPOINT_PUBLIC_KEY;
     if (!publicKeyPem) return reply.code(503).send({ error: "checkpoint_public_key_unconfigured" });
@@ -1333,19 +1511,20 @@ export function buildGateway() {
     if (!verifyCheckpoint(cp.rows[0].payload as CheckpointPayload, cp.rows[0].signature, publicKeyPem)) {
       await audit(pool, { actor_type: "admin", action: "audit.segment.prune_rejected",
         resource_type: "audit_checkpoint", resource_id: cp.rows[0].id, result: "rejected",
-        metadata: { reason: "checkpoint signature does not verify" } });
+        metadata: { reason: "checkpoint signature does not verify", external_ref: parsed.data.external_ref } });
       return reply.code(403).send({ error: "checkpoint_signature_invalid" });
     }
     const pruned = await pool.query("SELECT prune_audit_events($1) AS deleted", [cp.rows[0].up_to_hash]);
     if (Number(pruned.rows[0].deleted) < 0) {
       await audit(pool, { actor_type: "admin", action: "audit.segment.prune_rejected",
         resource_type: "audit_checkpoint", resource_id: cp.rows[0].id, result: "rejected",
-        metadata: { reason: "checkpoint does not cover the chain" } });
+        metadata: { reason: "checkpoint does not cover the chain", external_ref: parsed.data.external_ref } });
       return reply.code(409).send({ error: "checkpoint_does_not_cover" });
     }
     await audit(pool, { actor_type: "admin", action: "audit.segment.pruned",
       resource_type: "audit_checkpoint", resource_id: cp.rows[0].id, result: "success",
-      metadata: { up_to_hash: cp.rows[0].up_to_hash, deleted: Number(pruned.rows[0].deleted) } });
+      metadata: { up_to_hash: cp.rows[0].up_to_hash, deleted: Number(pruned.rows[0].deleted),
+        external_ref: parsed.data.external_ref } });
     return { pruned: Number(pruned.rows[0].deleted), checkpoint_id: cp.rows[0].id };
   });
 
@@ -1388,9 +1567,16 @@ export function buildGateway() {
     }
     // A bounded read cannot prove the tail it never saw; say so instead of
     // reporting a prefix as the whole chain.
+    // FR-019 / §10.2: "never report a partial chain as fully verified". A
+    // complete verification means the whole retained history was read and
+    // every link checks out; an empty chain, a truncated read, or an
+    // anchored (pruned) prefix is not full verification and is labelled as
+    // such.
     return {
       ...verification,
       truncated,
+      empty: rows.length === 0,
+      complete: verification.ok && rows.length > 0 && !truncated && !anchored,
       checked_to: rows.length > 0 ? rows[rows.length - 1].hash : null,
       anchored
     };
@@ -1505,16 +1691,26 @@ export function registerApprovalControlRoutes(app: FastifyInstance): void {
     const where: string[] = [];
     if (q.status) {
       params.push(q.status);
-      where.push(`status = $${params.length}`);
+      where.push(`a.status = $${params.length}`);
     }
     // The control surface requires approve scope (auth table), so rows only
     // reach approvers; the workspace filter still bounds what they see.
-    const ascope = scopeClause(req.principal, params, "workspace_id");
+    const ascope = scopeClause(req.principal, params, "a.workspace_id");
     if (ascope) where.push(ascope);
     params.push(limit);
+    // FR-021: carry the gateway decision correlation (run/span/request) so the
+    // approver can open the trace the held call belongs to. The decision row
+    // that queued the approval is the latest one citing this approval id.
     const res = await pool.query(
-      `SELECT * FROM approvals ${where.length ? "WHERE " + where.join(" AND ") : ""}
-       ORDER BY requested_at DESC LIMIT $${params.length}`, params
+      `SELECT a.*, d.run_id, d.span_id, d.request_id
+         FROM approvals a
+         LEFT JOIN LATERAL (
+           SELECT run_id, span_id, request_id FROM policy_decisions
+            WHERE approval_id = a.id
+            ORDER BY timestamp DESC LIMIT 1
+         ) d ON true
+        ${where.length ? "WHERE " + where.join(" AND ") : ""}
+        ORDER BY a.requested_at DESC LIMIT $${params.length}`, params
     );
     // Approvers may open the seal; anything else with access gets the row
     // with the arguments withheld rather than the seal's contents.

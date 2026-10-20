@@ -27,7 +27,8 @@
     "policy:keygen": "tsx tools/policy-publisher/src/index.ts keygen",
     "policy:trust": "tsx tools/policy-publisher/src/index.ts trust",
     "policy:publish": "tsx tools/policy-publisher/src/index.ts publish",
-    "policy:status": "tsx tools/policy-publisher/src/index.ts status"
+    "policy:status": "tsx tools/policy-publisher/src/index.ts status",
+    "audit:verify": "tsx scripts/verify-audit.mts"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",

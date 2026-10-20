@@ -1712,31 +1712,47 @@ describe("integration and security", () => {
       const checkpoint = created.json();
       expect(checkpoint.payload.event_count).toBeGreaterThanOrEqual(1);
       expect(checkpoint.key_id).toBeTruthy();
+      // FR-019: the signed payload records the checked segment per workspace.
+      expect(checkpoint.payload.v).toBe(2);
+      expect(Array.isArray(checkpoint.payload.segments)).toBe(true);
+      expect(checkpoint.payload.segments.length).toBeGreaterThanOrEqual(1);
+      // Pruning requires an external-storage receipt for the signed payload.
+      const noReceipt = await gw.inject({ method: "POST", url: "/v1/audit/prune", headers: key,
+        payload: { checkpoint_id: checkpoint.id } });
+      expect(noReceipt.statusCode).toBe(400);
+      expect(noReceipt.json().error).toBe("invalid_prune");
       // A checkpoint row whose signature does not verify is refused, and the
       // refusal lands in the chain.
       const bogus = await pool.query(
         `INSERT INTO audit_checkpoints (up_to_timestamp, up_to_hash, event_count, signature, key_id, payload)
          VALUES (now(), 'deadbeef', 0, 'not-a-signature', 'unknown', '{}'::jsonb) RETURNING id`);
       const rejected = await gw.inject({ method: "POST", url: "/v1/audit/prune", headers: key,
-        payload: { checkpoint_id: bogus.rows[0].id } });
+        payload: { checkpoint_id: bogus.rows[0].id, external_ref: "https://vault.example/receipts/bogus" } });
       expect(rejected.statusCode).toBe(403);
       expect(rejected.json().error).toBe("checkpoint_signature_invalid");
       const rejectedAudit = await pool.query(
         "SELECT count(*)::int AS n FROM audit_events WHERE action = 'audit.segment.prune_rejected'");
       expect(rejectedAudit.rows[0].n).toBeGreaterThanOrEqual(1);
-      // The real checkpoint authorizes the prune; the covered prefix leaves.
+      // The real checkpoint authorizes the prune; the covered prefix leaves,
+      // and the external receipt is recorded in the audit trail.
       const pruned = await gw.inject({ method: "POST", url: "/v1/audit/prune", headers: key,
-        payload: { checkpoint_id: checkpoint.id } });
+        payload: { checkpoint_id: checkpoint.id, external_ref: "https://vault.example/receipts/1" } });
       expect(pruned.statusCode).toBe(200);
       expect(pruned.json().pruned).toBeGreaterThanOrEqual(1);
       const segment = await pool.query(
         "SELECT count(*)::int AS n FROM audit_events WHERE action = 'audit.segment.pruned'");
       expect(segment.rows[0].n).toBe(1);
+      const receipt = await pool.query(
+        "SELECT metadata FROM audit_events WHERE action = 'audit.segment.pruned' ORDER BY id DESC LIMIT 1");
+      expect(receipt.rows[0].metadata).toMatchObject({ external_ref: "https://vault.example/receipts/1" });
       // The verified chain now anchors at the checkpoint instead of
-      // reporting a broken first link.
+      // reporting a broken first link — and a partial history is never
+      // reported as fully verified.
       const verify = await gw.inject({ method: "POST", url: "/v1/audit/verify", headers: key });
       expect(verify.statusCode).toBe(200);
       expect(verify.json().ok).toBe(true);
+      expect(verify.json().empty).toBe(false);
+      expect(verify.json().complete).toBe(false);
       expect(verify.json().anchored).toMatchObject({
         checkpoint_id: checkpoint.id, event_count: checkpoint.payload.event_count });
     } finally {
