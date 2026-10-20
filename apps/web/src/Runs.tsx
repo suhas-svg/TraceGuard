@@ -112,7 +112,8 @@ export default function RunsView({ onOpen }: { onOpen: (id: string) => void }) {
   const flipSort = (key: RunSortKey) =>
     setSort((cur) => (cur?.key === key ? { key, dir: cur.dir === "desc" ? "asc" : "desc" } : { key, dir: "desc" }));
 
-  const advancedCount = [agentId, provider, model, since, until, evalRunId].filter(Boolean).length;
+  const panelCount = [provider, model, since, until, evalRunId].filter(Boolean).length;
+  const hasFilters = Boolean(status || agentId || panelCount);
   const agentName = agentsQuery.data?.items.find((a) => a.id === agentId)?.name ?? (agentId ? agentId.slice(0, 8) : "");
   const clearAll = () => {
     setStatus("");
@@ -196,9 +197,9 @@ export default function RunsView({ onOpen }: { onOpen: (id: string) => void }) {
           >
             <NavIcon name="filter" className="h-3.5 w-3.5" />
             Filters
-            {advancedCount > 0 && (
+            {panelCount > 0 && (
               <span className="tg-nums rounded-full bg-brand-600 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-white">
-                {advancedCount}
+                {panelCount}
               </span>
             )}
           </Button>
@@ -212,7 +213,7 @@ export default function RunsView({ onOpen }: { onOpen: (id: string) => void }) {
           </span>
         </div>
 
-        {(status || advancedCount > 0) && (
+        {hasFilters && (
           <div className="flex flex-wrap items-center gap-1.5 border-t border-ink-200 px-3.5 py-2 text-[11px]">
             <span className="mr-1 text-ink-400">Active</span>
             {status && <FilterChip label={`Status: ${status}`} onClear={() => setStatus("")} />}
@@ -280,7 +281,7 @@ export default function RunsView({ onOpen }: { onOpen: (id: string) => void }) {
               <div className="text-[13px] font-semibold text-ink-900">All runs</div>
               <div className="mt-0.5 text-[11px] text-ink-500">
                 {runs.length === 0
-                  ? "No runs yet"
+                  ? (hasFilters ? "No matching runs" : "No runs yet")
                   : query.trim()
                     ? `${visible.length} of ${runs.length} loaded runs match`
                     : `${runs.length} run${runs.length === 1 ? "" : "s"} loaded`}
