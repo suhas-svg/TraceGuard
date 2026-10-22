@@ -17,8 +17,14 @@ client.model_event(run_id, provider="demo", model="demo-1",
 client.end_run(run_id, ok=True)
 client.flush(timeout=60)
 
-req = urllib.request.Request(
-    f"{BASE}/v1/runs/{run_id}/trace",
-    headers={"Authorization": f"Bearer {KEY}"},
-)
-print(json.dumps(json.loads(urllib.request.urlopen(req, timeout=30).read()), indent=2)[:2000])
+# The compose agent can reach only the gateway (FR-004), so reading the trace
+# over that network would not work. Print the trace when the API is directly
+# reachable (the host path above), otherwise point at the dashboard and exit 0.
+try:
+    req = urllib.request.Request(
+        f"{BASE}/v1/runs/{run_id}/trace",
+        headers={"Authorization": f"Bearer {KEY}"},
+    )
+    print(json.dumps(json.loads(urllib.request.urlopen(req, timeout=30).read()), indent=2)[:2000])
+except Exception:
+    print(f"trace: http://localhost:5173/#/runs/{run_id}")

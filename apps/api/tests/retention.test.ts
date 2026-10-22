@@ -18,7 +18,7 @@ describe("retention sweep", () => {
   });
 
   it("runs every rule type and records the run", async () => {
-    for (const target of ["runs", "approvals", "webhook_deliveries"]) {
+    for (const target of ["runs", "webhook_deliveries"]) {
       const res = await app.inject({
         method: "POST", url: "/v1/retention/rules", headers: key,
         payload: { name: `sweep-${target}`, target, older_than_days: 1 }
@@ -30,7 +30,7 @@ describe("retention sweep", () => {
     expect(run.statusCode).toBe(200);
     const body = run.json() as { run_id: string; deleted: Record<string, number> };
     expect(Object.keys(body.deleted).sort())
-      .toEqual(["sweep-approvals", "sweep-runs", "sweep-webhook_deliveries"]);
+      .toEqual(["sweep-runs", "sweep-webhook_deliveries"]);
 
     const row = await pool.query<{ status: string }>(
       "SELECT status FROM retention_runs WHERE id = $1", [body.run_id]

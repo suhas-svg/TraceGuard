@@ -2,10 +2,10 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { expect, test, type Page } from "@playwright/test";
 import {
-  apiGet, apiPost, event, gwCall, gwPost, ingest, publishPolicy, resetPolicyAnchor, seedRun, setKeys, upstreamHits,
+  apiGet, apiPost, event, gwCall, ingest, publishPolicy, resetPolicyAnchor, seedRun, setKeys, upstreamHits,
   upstreamInfo
 } from "./helpers";
-import { API_KEY, GATEWAY_URL } from "./env";
+import { API_KEY, API_URL, GATEWAY_URL } from "./env";
 
 // Scenarios A-F from the specification, run against the real stack. The
 // describe is serial and shares one database and one upstream hit counter;
@@ -17,14 +17,14 @@ const tag = Date.now().toString(36);
 let serverId = "";
 
 test.beforeAll(async ({ request }) => {
-  const reg = await gwPost(request, "/v1/servers", {
+  const reg = await apiPost(request, "/v1/servers", {
     name: `e2e-tools-${tag}`,
     base_url: "http://127.0.0.1:8092/mcp"
   });
   expect(reg.status()).toBe(201);
   serverId = (await reg.json()).id;
 
-  const disc = await gwPost(request, `/v1/servers/${serverId}/discover`, {});
+  const disc = await apiPost(request, `/v1/servers/${serverId}/discover`, {});
   expect(disc.status()).toBe(200);
   const tools = (await disc.json()).tools.map((t: { tool_name: string }) => t.tool_name);
   expect(tools).toContain("read_file");
@@ -40,7 +40,7 @@ test.beforeAll(async ({ request }) => {
     }
   ];
   for (const policy of policies) {
-    const res = await gwPost(request, "/v1/policies", policy);
+    const res = await apiPost(request, "/v1/policies", policy);
     expect(res.status()).toBe(201);
   }
 
@@ -197,7 +197,7 @@ test("scenario G: editing a second rule does not inherit the first rule's fields
     { name: nameA, server_id: serverId, tool_name: "read_file", effect: "allow", priority: 1 },
     { name: nameB, server_id: serverId, tool_name: "wipe_disk", effect: "deny", priority: 2 }
   ]) {
-    const res = await gwPost(request, "/v1/policies", policy);
+    const res = await apiPost(request, "/v1/policies", policy);
     expect(res.status()).toBe(201);
   }
 
@@ -220,7 +220,7 @@ test("scenario G: editing a second rule does not inherit the first rule's fields
 
   // The new version carries rule B's own fields, and rule A was not touched.
   await expect(async () => {
-    const listed = await request.get(`${GATEWAY_URL}/v1/policies?limit=200`, {
+    const listed = await request.get(`${API_URL}/v1/policies?limit=200`, {
       headers: { authorization: `Bearer ${API_KEY}` }
     });
     expect(listed.status()).toBe(200);
@@ -334,10 +334,24 @@ test("scenario H: a case runs through a live adapter from the dashboard", async 
   }
 });
 
+// The agent network can reach only the gateway (FR-004), so telemetry written
+// to the gateway's fixed ingest path must materialise as a visible run.
+test("scenario J: the gateway forwards agent telemetry to the API", async ({ request }) => {
+  const runId = randomUUID();
+  const forwarded = await request.post(`${GATEWAY_URL}/v1/ingest/events`, {
+    headers: { authorization: `Bearer ${API_KEY}` },
+    data: { events: [event({ run_id: runId, agent_name: `e2e-ingest-${tag}`, event_type: "run.started" })] }
+  });
+  expect(forwarded.status()).toBe(200);
+  const trace = await apiGet(request, `/v1/runs/${runId}/trace`);
+  expect(trace.status()).toBe(200);
+  expect((await trace.json()).run.id).toBe(runId);
+});
+
 // Must run last: it ends by creating a path_within draft the publisher must
 // refuse, and every later publish would fail on that draft.
 test("scenario I: path constraints are enforced by the executor, not by string comparison", async ({ request }) => {
-  const scoped = await gwPost(request, "/v1/policies", {
+  const scoped = await apiPost(request, "/v1/policies", {
     name: `e2e-path-${tag}`, priority: 10, server_id: serverId, tool_name: "read_file",
     effect: "allow",
     conditions: { arguments: { path: { path_within: "/tmp/traceguard-workspace" } } }
@@ -380,7 +394,7 @@ test("scenario I: path constraints are enforced by the executor, not by string c
   // The publisher refuses to sign a path_within rule for a tool whose pinned
   // definition carries no executor attestation: such a rule would rely on the
   // gateway string comparison alone (§16.3 T9).
-  const unattested = await gwPost(request, "/v1/policies", {
+  const unattested = await apiPost(request, "/v1/policies", {
     name: `e2e-path-unattested-${tag}`, priority: 10, server_id: serverId,
     tool_name: "read_file_unconfined", effect: "allow",
     conditions: { arguments: { path: { path_within: "/tmp/traceguard-workspace" } } }

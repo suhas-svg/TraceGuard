@@ -6,7 +6,7 @@ import {
   Select, StatusBadge
 } from "./components";
 
-const TARGETS = ["runs", "approvals", "webhook_deliveries", "spans"];
+const TARGETS = ["runs", "webhook_deliveries", "spans"];
 
 export default function RetentionView() {
   const [form, setForm] = useState({ name: "", target: "runs", older_than_days: "30", max_rows: "" });
@@ -25,7 +25,7 @@ export default function RetentionView() {
   return (
     <Page
       title="Retention"
-      sub="Age out runs, terminal approvals, delivery logs, and whole traces. Policies, decisions, audit, and money are never targets."
+      sub="Age out runs, delivery logs, and whole traces. Approvals, policies, decisions, audit, and money are retained."
       actions={
         <Button variant="primary"
           onClick={() => opsApi.runRetention().then((r) => { setLastRun(r.deleted); reload(); }).catch((e) => setError(String(e)))}>

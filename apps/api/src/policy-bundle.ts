@@ -95,16 +95,18 @@ export function rulesFromBundle(bundle: PolicyBundle): PolicyRule[] {
 
 export async function loadActivePolicy(
   client: Queryable,
-  workspaceId: string
+  projectId: string
 ): Promise<ActivePolicyResult> {
   const row = await client.query(
     `SELECT pv.id, pv.version, pv.bundle, pv.content_hash, pv.signature, pv.previous_version_hash,
-            pk.key_id AS pinned_key_id, pk.public_key_pem, pk.retired_at
+            pk.key_id AS pinned_key_id, pk.public_key_pem, pk.retired_at,
+            p.workspace_id AS project_workspace_id, p.name AS project_name
        FROM active_config ac
+       JOIN projects p ON p.id = ac.project_id
        JOIN policy_versions pv ON pv.id = ac.policy_version_id
        JOIN policy_signing_keys pk ON pk.id = pv.signing_key_id
-      WHERE ac.workspace_id = $1`,
-    [workspaceId]
+      WHERE ac.project_id = $1`,
+    [projectId]
   );
   const pv = row.rows[0];
   if (!pv) return { ok: false, reason: "no signed policy version is active" };
@@ -133,8 +135,18 @@ export async function loadActivePolicy(
     return { ok: false, reason: "policy bundle does not match the schema" };
   }
   const bundle = parsed.data;
+  const workspaceId = String(pv.project_workspace_id);
   if (bundle.workspace_id !== workspaceId) {
     return { ok: false, reason: "policy bundle belongs to another workspace" };
+  }
+  if (bundle.project_id !== undefined && bundle.project_id !== projectId) {
+    return { ok: false, reason: "policy bundle belongs to another project" };
+  }
+  // Bundles signed before project-scoped publication have no project_id. They
+  // remain valid only for the workspace's default project; anything else would
+  // let a legacy bundle silently cover a project it never named.
+  if (bundle.project_id === undefined && pv.project_name !== "default") {
+    return { ok: false, reason: "legacy policy bundle has no project attribution" };
   }
   if (bundle.version !== Number(pv.version)) {
     return { ok: false, reason: "policy bundle version does not match its row" };
@@ -144,8 +156,11 @@ export async function loadActivePolicy(
   }
 
   // 4. Rollback, fork, and history-gap checks against the last accepted state.
+  // Anchors are keyed by project. A default project may still find an anchor
+  // written before migration 039 keyed by its workspace; consuming that anchor
+  // preserves rollback detection across the upgrade.
   const state = readState();
-  const stored = state[workspaceId];
+  const stored = state[projectId] ?? (pv.project_name === "default" ? state[workspaceId] : undefined);
   if (stored) {
     if (Number(pv.version) < stored.version) {
       return { ok: false, reason: `policy rollback detected (active v${pv.version}, last accepted v${stored.version})` };
@@ -170,8 +185,8 @@ export async function loadActivePolicy(
           return { ok: false, reason: `policy history gap before v${cursor.version}` };
         }
         const parent = await client.query(
-          "SELECT version, content_hash, previous_version_hash FROM policy_versions WHERE workspace_id = $1 AND version = $2",
-          [workspaceId, cursor.version - 1]
+          "SELECT version, content_hash, previous_version_hash FROM policy_versions WHERE project_id = $1 AND version = $2",
+          [projectId, cursor.version - 1]
         );
         const p = parent.rows[0];
         if (!p || p.content_hash !== cursor.previous) {
@@ -192,14 +207,14 @@ export async function loadActivePolicy(
   // Accepted: remember it. Persisted after every check, so a crash can never
   // mark an unverified version as accepted.
   const anchor = `${Number(pv.version)}:${contentHash}`;
-  if (persistedAnchors[workspaceId] !== anchor) {
-    state[workspaceId] = { version: Number(pv.version), content_hash: contentHash };
+  if (persistedAnchors[projectId] !== anchor) {
+    state[projectId] = { version: Number(pv.version), content_hash: contentHash };
     try {
       writeState(state);
     } catch (err) {
       return { ok: false, reason: (err as Error).message };
     }
-    persistedAnchors[workspaceId] = anchor;
+    persistedAnchors[projectId] = anchor;
   }
 
   return {

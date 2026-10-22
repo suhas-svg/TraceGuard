@@ -7,8 +7,9 @@ process — `tools/policy-publisher` — is the only thing that signs policy, an
 it never runs as a service.
 
 ```
-agent/SDK ---> API :8090 ---> postgres
+agent/SDK ---> API :8090 ---> postgres         (host and SDK callers)
 agent ------> gateway :8091 ---> upstream MCP   (agent_edge -> tools; upstream internal)
+              gateway :8091 /v1/ingest/events ---> API :8090   (telemetry forward)
 human ------> web :5173 ---> API / gateway
 human ------> gateway :8093 control listener   (approval queue + decisions)
 operator ---> policy-publisher ---> postgres   (signs; holds the private key)
@@ -22,17 +23,22 @@ Identity has two modes. The development profile authenticates callers with
 static keys from the environment. Configuring `OAUTH_ISSUER`, `OAUTH_AUDIENCE`
 and a JWKS source switches both services to real OAuth: bearer tokens are
 validated as JWTs (signature against the issuer's keys, issuer, audience,
-expiry), the issuer's scopes become the principal's scopes, its `workspaces`
-claim becomes the principal's write scope, the gateway advertises the issuer
-at `/.well-known/oauth-protected-resource`, and a 401 carries the RFC 9728
+expiry), and the issuer's scopes become the principal's scopes. The `projects`
+claim selects a project-scoped `AgentPrincipal`; a token can act only in a
+project that has an active principal row for its issuer and subject, and its
+scopes are intersected with that principal's allowed scopes. OTLP ingest keys
+are separate hashed `tgi_` credentials that cannot reach MCP or control
+routes. The gateway advertises the issuer at
+`/.well-known/oauth-protected-resource`, and a 401 carries the RFC 9728
 challenge. A production start without an issuer is refused rather than
 silently falling back to development keys.
 
 Policy enforcement is a verification problem before it is an evaluation
-problem. The gateway loads the active `policy_versions` row, checks its
-content hash and Ed25519 signature against the pinned public key, and only
-then reads the rule set, the server manifest, and the tool-pin manifest out
-of the bundle. It also keeps its own record of the highest version it has
+problem. The gateway loads the active `policy_versions` row for the target
+project, checks its content hash and Ed25519 signature against the pinned
+public key, verifies the bundle's workspace and project ids, and only then
+reads the rule set, the server manifest, and the tool-pin manifest out of the
+bundle. It also keeps its own record of the highest version it has
 accepted, so a pointer rolled back to an older (genuinely signed) bundle is
 detected as a rollback rather than accepted as policy. Anything that fails
 this sequence — no active version, bad signature, mismatched hash, retired
@@ -42,9 +48,11 @@ Drafts are the untrusted half: rules in `policies`, server registrations,
 and discovered tool definitions. Discovery pins the complete definition
 (title, both schemas, annotations, icons, execution hints, allowlisted
 _meta) and quarantines drift. Reviewing and publishing is what makes a draft
-executable: `policy-publisher` assembles the bundle from the current drafts,
-signs it, inserts an immutable `policy_versions` row, and moves the
-`active_config` pointer in one transaction.
+executable: `policy-publisher` assembles the bundle from the current drafts
+for one project, signs it, inserts an immutable `policy_versions` row with
+that `project_id`, and moves the project's `active_config` pointer in one
+transaction. Signed signing keys remain workspace-scoped trust anchors;
+versions and active pointers are per project.
 
 An allowed call forwards with the upstream credential; a deny or an unknown
 tool returns without opening a connection. Calls needing a human return 202
@@ -62,7 +70,9 @@ The audit log is append-only with a hash chain, implemented once in
 `packages/audit-chain` and shared by the API, the gateway, and the policy
 publisher so the hash formula cannot drift between writers. Migration 022
 rejects UPDATE/DELETE on the table at the database layer, and
-`POST /v1/audit/verify` recomputes every event and link. Tamper-evident, not
+`POST /v1/audit/verify` recomputes every event and link. Events carry
+workspace and project attribution; new writes use v4 hashes that cover both,
+while v1–v3 rows keep their original formulas. Tamper-evident, not
 tamper-proof: only an externally stored checkpoint anchors history against a
 host owner.
 

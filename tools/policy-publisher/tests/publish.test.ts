@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Pool } from "pg";
 import { generateSigningKey } from "@traceguard/policy-signing";
 import { randomUUID } from "node:crypto";
-import { assembleBundle, publish, trustKey, writeKeyPair } from "../src/index.js";
+import { assembleBundle, publish, resolveProjectId, trustKey, writeKeyPair } from "../src/index.js";
 
 // Test-only defaults, mirroring the API suite. CI passes real values through
 // the environment.
@@ -15,6 +15,7 @@ process.env.DATABASE_URL ??=
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 let workspaceId = "";
+let projectId = "";
 let serverId = "";
 const publisherKey = generateSigningKey();
 
@@ -28,6 +29,7 @@ beforeAll(async () => {
   }
   const ws = await pool.query("INSERT INTO workspaces (name) VALUES ('default') RETURNING id");
   workspaceId = String(ws.rows[0].id);
+  projectId = await resolveProjectId(pool, workspaceId);
 });
 
 afterAll(async () => {
@@ -117,6 +119,8 @@ describe("policy publisher", () => {
     ]);
     expect(first.bundle.pins).toEqual([{ server_id: serverId, tool_name: "read_file", definition_hash: hash }]);
     expect(first.bundle.previous_version_hash).toBeNull();
+    expect(first.projectId).toBe(projectId);
+    expect(first.bundle.project_id).toBe(projectId);
 
     const active = await pool.query(
       `SELECT pv.version, pv.content_hash, pv.published_by FROM active_config ac
@@ -196,7 +200,7 @@ describe("policy publisher", () => {
 
     const client = await pool.connect();
     try {
-      const assembled = await assembleBundle(client, workspaceId);
+      const assembled = await assembleBundle(client, workspaceId, projectId);
       expect(assembled.problems).toEqual([]);
       expect(assembled.counts).toEqual({ rules: 2, servers: 1, pins: 0 });
     } finally {
@@ -244,5 +248,50 @@ describe("policy publisher", () => {
     expect(dry.published).toBe(false);
     expect(dry.bundle.rules.some((r) => r.name === "path-ok")).toBe(true);
     await pool.query("DELETE FROM policies WHERE name = 'path-ok'");
+  });
+
+  it("publishes independent signed histories per project", async () => {
+    const beta = await pool.query(
+      `INSERT INTO projects (workspace_id, name) VALUES ($1, 'beta') RETURNING id`,
+      [workspaceId]
+    );
+    const betaId = String(beta.rows[0].id);
+    const betaServer = await pool.query(
+      `INSERT INTO mcp_servers (workspace_id, project_id, name, gateway_alias, base_url)
+       VALUES ($1,$2,'beta-files','betafiles','http://127.0.0.1:9/mcp') RETURNING id`,
+      [workspaceId, betaId]
+    );
+    await pool.query(
+      `INSERT INTO policies (workspace_id, project_id, name, server_id, tool_name, effect)
+       VALUES ($1,$2,'beta-allow',$3,'read_file','allow')`,
+      [workspaceId, betaId, String(betaServer.rows[0].id)]
+    );
+
+    const before = await pool.query(
+      "SELECT policy_version_id FROM active_config WHERE project_id = $1", [projectId]
+    );
+    const betaFirst = await publish(pool, {
+      workspaceId, projectId: betaId, privateKeyPem: publisherKey.privateKeyPem, publishedBy: "operator"
+    });
+    expect(betaFirst.published).toBe(true);
+    expect(betaFirst.version).toBe(1);
+    expect(betaFirst.bundle.project_id).toBe(betaId);
+    expect(betaFirst.bundle.servers.map((s) => s.alias)).toEqual(["betafiles"]);
+
+    const betaActive = await pool.query(
+      "SELECT policy_version_id FROM active_config WHERE project_id = $1", [betaId]
+    );
+    expect(String(betaActive.rows[0].policy_version_id)).toBe(
+      String((await pool.query(
+        "SELECT id FROM policy_versions WHERE project_id = $1 AND version = 1", [betaId]
+      )).rows[0].id)
+    );
+    const after = await pool.query(
+      "SELECT policy_version_id FROM active_config WHERE project_id = $1", [projectId]
+    );
+    expect(String(after.rows[0].policy_version_id)).toBe(String(before.rows[0].policy_version_id));
+
+    // A name resolves to the same project as the id.
+    expect(await resolveProjectId(pool, workspaceId, "beta")).toBe(betaId);
   });
 });

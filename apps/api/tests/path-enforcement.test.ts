@@ -76,13 +76,13 @@ describe("executor path confinement", () => {
 
   beforeAll(async () => {
     await startMock();
-    const reg = await gw.inject({
+    const reg = await api.inject({
       method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `path-${tag}`, base_url: `http://127.0.0.1:${port}/mcp` }
     });
     expect(reg.statusCode).toBe(201);
     serverId = reg.json().id as string;
-    const disc = await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     expect(disc.statusCode).toBe(200);
     expect((disc.json().pinned as string[]).sort()).toEqual(["read_file", "read_file_unconfined"]);
     const row = await pool.query(
@@ -100,7 +100,7 @@ describe("executor path confinement", () => {
   });
 
   async function createRule(payload: Record<string, unknown>): Promise<string> {
-    const res = await gw.inject({
+    const res = await api.inject({
       method: "POST", url: "/v1/policies", headers: key,
       payload: { enabled: true, priority: 0, effect: "allow", ...payload }
     });

@@ -21,6 +21,9 @@ export interface OAuthClaims {
   sub: string;
   scopes: string[];
   workspaces: string[];
+  // Project ids are the primary scope for agents. The legacy workspaces claim
+  // stays supported for deployments that have not moved to projects yet.
+  projects: string[];
 }
 
 interface Jwk {
@@ -209,7 +212,10 @@ export async function verifyAccessToken(
   const workspaces = Array.isArray(payload.workspaces)
     ? payload.workspaces.filter((w): w is string => typeof w === "string")
     : [];
-  return { sub: payload.sub, scopes: claimScopes(payload), workspaces };
+  const projects = Array.isArray(payload.projects)
+    ? payload.projects.filter((p): p is string => typeof p === "string")
+    : [];
+  return { sub: payload.sub, scopes: claimScopes(payload), workspaces, projects };
 }
 
 // RFC 9728: what the gateway tells a client about how to get a token for it.

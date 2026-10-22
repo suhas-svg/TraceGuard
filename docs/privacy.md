@@ -74,14 +74,14 @@ arguments. This is the only place tool arguments are stored.
 | Data | Default retention | Mechanism |
 |---|---|---|
 | Spans / runs | 7 days or 100,000 spans, whichever limit is reached first (configurable) | `POST /v1/retention/run`, called from cron; deletes whole traces where possible |
-| Terminal approvals | per retention rule (age) | same; pending approvals are never a deletion target |
+| Terminal approvals | indefinite | not a retention target; pending arguments are wiped at the state transition |
 | Webhook deliveries | per retention rule (age) | same |
 | Audit events | indefinite | never pruned by the normal retention job |
 | Pending approval arguments | the approval TTL (≤ 60 min) | ciphertext wiped at the state transition, independent of retention rules |
 | Policy versions, tool pins, decisions, budgets | indefinite | not valid retention targets; the API refuses them |
 
-Retention never deletes gateway security decisions or audit events under
-the trace-retention policy. Removal runs report per-rule deletion counts
+Retention never deletes gateway security decisions, approvals, or audit
+events under the trace-retention policy. Removal runs report per-rule deletion counts
 and write an audit row for each run.
 
 ## Deletion

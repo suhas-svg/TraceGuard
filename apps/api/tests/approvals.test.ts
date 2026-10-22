@@ -59,14 +59,14 @@ describe("approval state machine v2", () => {
     });
     await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
     const port = (httpServer.address() as { port: number }).port;
-    const reg = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+    const reg = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `approvals-${tag}`, base_url: `http://127.0.0.1:${port}/mcp` } });
     expect(reg.statusCode).toBe(201);
     serverId = reg.json().id as string;
-    const disc = await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     expect(disc.statusCode).toBe(200);
     // Every tool in this file needs approval.
-    const rule = await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+    const rule = await api.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `approvals-hold-${tag}`, priority: 10, server_id: serverId,
         effect: "require_approval" } });
     expect(rule.statusCode).toBe(201);

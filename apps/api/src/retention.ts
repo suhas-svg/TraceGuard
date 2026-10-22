@@ -5,10 +5,10 @@ import { pool, retentionPool } from "./db.js";
 import { audit } from "./audit.js";
 
 // Retention deletes execution and operational data past its age. It never
-// touches policies, decisions, pending approvals, the audit log, or money.
+// touches policies, decisions, approvals, the audit log, or money.
 // Like the stale-run finalizer, an operator cron calls the run endpoint;
 // the app holds no scheduler.
-const targets = ["runs", "approvals", "webhook_deliveries", "spans"] as const;
+const targets = ["runs", "webhook_deliveries", "spans"] as const;
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
   const found = await client.query("SELECT id FROM workspaces WHERE name = 'default'");
@@ -49,17 +49,6 @@ async function applyRule(
       // Spans go with their runs through the foreign-key cascade.
       const r = await client.query(
         `DELETE FROM runs WHERE workspace_id = $1 AND started_at < ${cutoff}`, [rule.workspace_id]
-      );
-      return r.rowCount ?? 0;
-    }
-    case "approvals": {
-      // §13.4: retention never deletes live work. Pending approvals decide
-      // real calls, approved ones are about to execute, and claimed or
-      // executing rows may still be in flight — only terminal rows age out.
-      const r = await client.query(
-        `DELETE FROM approvals WHERE workspace_id = $1
-           AND status NOT IN ('pending', 'approved', 'claimed', 'executing')
-           AND requested_at < ${cutoff}`, [rule.workspace_id]
       );
       return r.rowCount ?? 0;
     }

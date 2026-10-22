@@ -47,6 +47,8 @@ export interface MappedSpan {
   errorType: string | null;
   agentName: string;
   workspaceName: string;
+  projectName: string | null;
+  projectId: string | null;
   attributes: Record<string, unknown>;
 }
 
@@ -256,6 +258,8 @@ export function mapOtlpSpan(
   }
 
   const workspaceName = (resource["traceguard.workspace"] as string | undefined) ?? "default";
+  const projectName = (resource["traceguard.project"] as string | undefined) ?? null;
+  const projectId = (resource["traceguard.project_id"] as string | undefined) ?? null;
   return {
     runId: traceRunId(workspaceName, span.traceId),
     spanId: spanRowId(workspaceName, span.spanId),
@@ -281,6 +285,8 @@ export function mapOtlpSpan(
     errorType,
     agentName: (resource["service.name"] as string | undefined) ?? "otel-agent",
     workspaceName,
+    projectName,
+    projectId,
     attributes
   };
 }

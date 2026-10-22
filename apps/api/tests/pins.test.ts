@@ -75,14 +75,14 @@ describe("tool definition pins", () => {
 
   beforeAll(async () => {
     await startMock([echo()]);
-    const reg = await gw.inject({
+    const reg = await api.inject({
       method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `pins-${tag}`, base_url: `http://127.0.0.1:${port}/mcp` }
     });
     expect(reg.statusCode).toBe(201);
     serverId = reg.json().id as string;
     alias = reg.json().gateway_alias as string;
-    const disc = await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     expect(disc.statusCode).toBe(200);
     expect(disc.json().pinned).toEqual(["echo"]);
     await publishTestPolicy(pool);
@@ -155,7 +155,7 @@ describe("tool definition pins", () => {
       execution: { taskSupport: "optional" },
       _meta: { "io.example/flag": 2 }
     })]);
-    const disc = await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     expect(disc.statusCode).toBe(200);
     expect(disc.json().changed).toEqual(["echo"]);
 
@@ -195,7 +195,7 @@ describe("tool definition pins", () => {
   });
 
   it("re-review clears the quarantine and keeps the new pin version", async () => {
-    const review = await gw.inject({
+    const review = await api.inject({
       method: "PUT", url: `/v1/servers/${serverId}/tools/echo/quarantine`, headers: key,
       payload: { quarantined: false }
     });
@@ -214,7 +214,7 @@ describe("tool definition pins", () => {
   it("keeps the first approved pin across a second drift before review", async () => {
     // Drift once: the approved baseline moves to the v2 definition.
     await startMock([echo({ title: "Echo v3" })]);
-    await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     const afterFirst = await toolRow();
     expect(afterFirst.quarantined).toBe(true);
     const approvedHash = afterFirst.previous_hash as string;
@@ -222,13 +222,13 @@ describe("tool definition pins", () => {
     // Drift again while still quarantined: §7.5 re-approval is against the
     // reviewed baseline, so the second mistake must not overwrite it.
     await startMock([echo({ title: "Echo v4" })]);
-    await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     const afterSecond = await toolRow();
     expect(afterSecond.quarantined).toBe(true);
     expect(afterSecond.previous_hash).toBe(approvedHash);
     expect(afterSecond.definition_hash).not.toBe(approvedHash);
 
-    const cleared = await gw.inject({
+    const cleared = await api.inject({
       method: "PUT", url: `/v1/servers/${serverId}/tools/echo/quarantine`, headers: key,
       payload: { quarantined: false }
     });
@@ -244,7 +244,7 @@ describe("tool definition pins", () => {
         inputSchema: { type: "object", properties: { x: { $ref: "http://evil.example/x.json" } } }
       }
     ]);
-    const disc = await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     expect(disc.statusCode).toBe(200);
     const rejected = disc.json().rejected as { name: string; reason: string }[];
     expect(rejected.map((r) => r.name).sort()).toEqual(["echo", "fresh"]);

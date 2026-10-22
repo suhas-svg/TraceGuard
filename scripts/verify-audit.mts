@@ -4,13 +4,14 @@
 // containers.
 //
 // Inputs:
-//   --export <file>      JSON from GET /v1/audit/checkpoints/:id/export
+//   --export <file>      JSON artifact written by `audit:checkpoint create`
 //                        (covered prefix) or an equivalent dump of the
 //                        retained events (tail).
 //   --public-key <file>  PEM of the operator-controlled checkpoint key.
 //
 // The verifier never calls the API and trusts nothing it reads from the
-// database: it checks the checkpoint signature, the event hashes and links
+// database: it checks the checkpoint signature, any prior signed checkpoint
+// carried as the artifact's `anchor`, the event hashes and links
 // with the same code the gateway appends with, the cut the checkpoint names,
 // and the per-workspace sequences. A partial or truncated history is
 // reported as partial — never as fully verified (§10.2).
@@ -20,7 +21,7 @@
 import { readFileSync } from "node:fs";
 import {
   verifyAuditChain, verifyCheckpoint, checkpointKeyId,
-  type AuditRow, type CheckpointPayload
+  type AuditRow, type CheckpointPayload, type CheckpointSegment
 } from "@traceguard/audit-chain";
 
 const args = process.argv.slice(2);
@@ -45,9 +46,18 @@ interface ExportedCheckpoint {
   event_count?: number; signature?: string; key_id?: string; payload?: CheckpointPayload;
 }
 
-let doc: { checkpoint?: ExportedCheckpoint; events?: AuditRow[]; truncated?: boolean };
+interface ExportDoc {
+  checkpoint?: ExportedCheckpoint;
+  /** The prior pruned checkpoint, carried by `audit:checkpoint create` so a
+   * retained segment after a prune can still be verified offline. */
+  anchor?: ExportedCheckpoint;
+  events?: AuditRow[];
+  truncated?: boolean;
+}
+
+let doc: ExportDoc;
 try {
-  doc = JSON.parse(readFileSync(exportPath, "utf8")) as typeof doc;
+  doc = JSON.parse(readFileSync(exportPath, "utf8")) as ExportDoc;
 } catch (err) {
   console.error(`cannot read export: ${(err as Error).message}`);
   process.exit(2);
@@ -85,9 +95,35 @@ if (!payload || typeof payload !== "object" || typeof checkpoint.signature !== "
   ok(`checkpoint ${checkpoint.id ?? "?"} signature verifies (v${payload.v}, ${payload.event_count} events signed)`);
 }
 
+// 2a. A retained segment after a prune must carry the prior signed checkpoint.
+// That signature, not an unsigned artifact field, proves where the segment
+// starts and which workspace sequences it continues.
+let priorAnchorHash: string | null = null;
+let priorAnchorSegments: CheckpointSegment[] | undefined;
+const priorAnchor = doc.anchor;
+if (priorAnchor && typeof priorAnchor === "object") {
+  const anchorPayload = priorAnchor.payload;
+  if (!anchorPayload || typeof priorAnchor.signature !== "string") {
+    fail("prior anchor checkpoint is incomplete");
+  } else if (priorAnchor.key_id && checkpointKeyId(publicKeyPem) !== priorAnchor.key_id) {
+    fail(`prior anchor checkpoint key_id ${priorAnchor.key_id} does not match the supplied public key`);
+  } else if (!verifyCheckpoint(anchorPayload, priorAnchor.signature, publicKeyPem)) {
+    fail("prior anchor checkpoint signature does not verify");
+  } else if (!events[0] || events[0].prev_hash !== anchorPayload.up_to_hash) {
+    fail("prior anchor checkpoint does not link to the first exported event");
+  } else {
+    priorAnchorHash = anchorPayload.up_to_hash;
+    priorAnchorSegments = anchorPayload.v === 1 ? undefined : anchorPayload.segments;
+    ok(`prior anchor checkpoint ${priorAnchor.id ?? "?"} verifies and links the retained segment`);
+  }
+}
+
 if (payload && typeof payload === "object") {
   // 3. The cut the checkpoint signed must be present and match.
   const upToHash = payload.up_to_hash;
+  // v1 checkpoints predate per-workspace segments. Narrowing on the literal
+  // version keeps TypeScript from treating `segments` as optional on v2/v3.
+  const segments = payload.v === 1 ? [] : payload.segments;
   const lastHash = events.length > 0 ? events[events.length - 1].hash : null;
   const firstEvent = events[0];
   const coveredByCheckpoint = lastHash === upToHash;
@@ -103,8 +139,11 @@ if (payload && typeof payload === "object") {
     } else {
       ok(`signed segment present: ${events.length} events cut at ${String(upToHash).slice(0, 12)}…`);
     }
-    // v2: every workspace's last covered sequence must be the one signed.
-    if (payload.v === 2) {
+    if (payload.v === 3 && payload.up_to_event_id !== events[events.length - 1]?.id) {
+      fail("checkpoint names a different last event than the exported segment");
+    }
+    // v2+: every workspace's last covered sequence must be the one signed.
+    if (payload.v >= 2) {
       const byWorkspace = new Map<string, { seq: number | null; hash: string }>();
       for (const row of events) {
         const ws = row.workspace_id ?? null;
@@ -115,23 +154,38 @@ if (payload && typeof payload === "object") {
           byWorkspace.set(key, { seq, hash: row.hash });
         }
       }
-      for (const segment of payload.segments ?? []) {
+      // A workspace with no event in this segment inherits the prior
+      // checkpoint's head. The inherited value must still match exactly.
+      const carried = new Map<string, { seq: number | null; hash: string }>();
+      for (const segment of priorAnchorSegments ?? []) {
+        carried.set(segment.workspace_id ?? "(unattributed)", {
+          seq: segment.up_to_sequence,
+          hash: segment.up_to_hash
+        });
+      }
+      for (const segment of segments) {
         const key = segment.workspace_id ?? "(unattributed)";
         const found = byWorkspace.get(key);
         if (!found) {
-          fail(`segment for workspace ${key} is missing from the export`);
+          const inherited = carried.get(key);
+          if (!inherited) {
+            fail(`segment for workspace ${key} is missing from the export`);
+          } else if (inherited.hash !== segment.up_to_hash ||
+                     (segment.up_to_sequence !== null && inherited.seq !== segment.up_to_sequence)) {
+            fail(`carried segment for workspace ${key} does not match the prior signed head`);
+          }
         } else if (found.hash !== segment.up_to_hash ||
                    (segment.up_to_sequence !== null && found.seq !== segment.up_to_sequence)) {
           fail(`segment for workspace ${key} does not match the signed head (sequence/hash)`);
         }
       }
-      ok(`checked ${(payload.segments ?? []).length} per-workspace segment head(s) against the export`);
+      ok(`checked ${segments.length} per-workspace segment head(s) against the export`);
     }
   } else {
-    // Retained-tail export: the first row must link back to the cut, and no
-    // retained sequence may predate its signed segment head.
+    // Retained-tail export: the first row must link back to the cut, and each
+    // workspace's retained sequence must continue exactly at the signed head.
     ok(`retained tail is anchored to checkpoint ${checkpoint.id ?? "?"} at ${String(upToHash).slice(0, 12)}…`);
-    if (payload.v === 2) {
+    if (payload.v >= 2) {
       const firstSeq = new Map<string, number>();
       for (const row of events) {
         if (row.seq === null || row.seq === undefined) continue;
@@ -139,14 +193,18 @@ if (payload && typeof payload === "object") {
         const seq = Number(row.seq);
         if (!firstSeq.has(key) || seq < firstSeq.get(key)!) firstSeq.set(key, seq);
       }
-      for (const segment of payload.segments ?? []) {
+      for (const segment of segments) {
         const key = segment.workspace_id ?? "(unattributed)";
         if (segment.up_to_sequence === null) continue;
         const first = firstSeq.get(key);
         if (first === undefined) {
-          fail(`retained events for workspace ${key} are missing; cannot prove continuity past the cut`);
+          // No event for this workspace in the retained tail. That is not a
+          // gap; the next event must continue from the signed head.
+          continue;
         } else if (first <= segment.up_to_sequence) {
           fail(`retained event for workspace ${key} (seq ${first}) is already covered by the checkpoint (seq ${segment.up_to_sequence})`);
+        } else if (first !== segment.up_to_sequence + 1) {
+          fail(`sequence gap in workspace ${key}: checkpoint ends at ${segment.up_to_sequence}, retained starts at ${first}`);
         }
       }
     }
@@ -172,21 +230,29 @@ if (payload && typeof payload === "object") {
   ok(`sequence continuity checked${nullSeqs > 0 ? ` (${nullSeqs} legacy row(s) carry no sequence)` : ""}`);
 
   // 5. Every event hash and chain link, verified with the append formula.
-  const verification = verifyAuditChain(events);
-  const remaining = [...verification.problems];
-  if (remaining.length > 0 && anchoredToCheckpoint && !coveredByCheckpoint) {
-    // The broken first link of a pruned tail is expected once the checkpoint
-    // anchors it; every other problem stands.
-    const first = remaining[0];
-    if (first.id === events[0]?.id && first.problem.startsWith("chain link broken")) {
-      remaining.shift();
-    }
+  // A retained tail is checked against the signed cut so its first sequence
+  // is not mistaken for a gap. A covered prefix after an earlier prune uses
+  // the prior checkpoint carried in the artifact.
+  let anchorForVerify = priorAnchorHash;
+  let sequencesForVerify = priorAnchorSegments;
+  if (!anchorForVerify && anchoredToCheckpoint && !coveredByCheckpoint && typeof upToHash === "string") {
+    anchorForVerify = upToHash;
+    sequencesForVerify = payload.v === 1 ? undefined : segments;
   }
-  if (remaining.length > 0) {
-    for (const p of remaining.slice(0, 20)) fail(`event ${p.id}: ${p.problem}`);
-    if (remaining.length > 20) fail(`…and ${remaining.length - 20} more problem(s)`);
+  const verification = verifyAuditChain(
+    events,
+    anchorForVerify
+      ? { anchorHash: anchorForVerify, expectedSequences: sequencesForVerify }
+      : {}
+  );
+  if (verification.problems.length > 0) {
+    for (const p of verification.problems.slice(0, 20)) fail(`event ${p.id}: ${p.problem}`);
+    if (verification.problems.length > 20) fail(`…and ${verification.problems.length - 20} more problem(s)`);
   } else {
     ok(`all ${events.length} event hash(es) and chain link(s) verified`);
+  }
+  for (const gap of verification.gaps) {
+    fail(`missing sequence range in ${gap.workspace_id ?? "(unattributed)"}: ${gap.from}..${gap.to}`);
   }
 }
 

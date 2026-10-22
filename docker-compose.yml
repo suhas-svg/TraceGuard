@@ -74,6 +74,9 @@ services:
     environment:
       DATABASE_URL: postgres://gateway_runtime:${GATEWAY_DB_PASSWORD:-gateway_dev_pw}@postgres:5432/${POSTGRES_DB:-traceguard}
       API_KEY: ${API_KEY:-dev_key_change_me}
+      # The agent network can reach only the gateway; the gateway forwards the
+      # fixed telemetry write path (/v1/ingest/events) to the API (§24, FR-004).
+      CONTROL_API_URL: http://api:8080
       APPROVER_KEY: ${APPROVER_KEY:-dev_approver_change_me}
       APPROVAL_ARGS_KEY: ${APPROVAL_ARGS_KEY}
       APPROVAL_ARGS_KEY_PREVIOUS: ${APPROVAL_ARGS_KEY_PREVIOUS:-}
@@ -81,12 +84,11 @@ services:
       # §9: human approvals live on their own control listener so agent
       # credentials never reach the queue or decisions.
       GATEWAY_CONTROL_PORT: 8093
-      APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS:-300}
+      APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS:-900}
       APPROVAL_CLAIM_LEASE_SECONDS: ${APPROVAL_CLAIM_LEASE_SECONDS:-30}
-      # §10.3/FR-019: PEM strings for the audit checkpoint keypair. The private
-      # key belongs to the operator host (never to the DB or the repo); export
-      # it only for a demo/CI run. Unset: checkpoint route answers 503.
-      AUDIT_CHECKPOINT_KEY: ${AUDIT_CHECKPOINT_KEY:-}
+      # §10.2/FR-019: the gateway may verify a checkpoint, never sign one. The
+      # private key stays on the operator host and is used by
+      # `npm run audit:checkpoint`; only the public key is mounted here.
       AUDIT_CHECKPOINT_PUBLIC_KEY: ${AUDIT_CHECKPOINT_PUBLIC_KEY:-}
       # Demo upstream (mock-tools) lives on the private `tools` network, so
       # the reference deployment opts in explicitly. FR-005: production

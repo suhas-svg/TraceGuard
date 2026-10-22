@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  createBudget, formatMicro, gwApi, listBudgets, updateBudget,
+  adminApi, createBudget, formatMicro, gwApi, listBudgets, updateBudget,
   type Budget, type McpServer, type Policy
 } from "./api";
 import {
@@ -48,8 +48,8 @@ function PolicyForm({
             tool_name: form.tool_name || null, effect: form.effect,
             priority: Number(form.priority) || 0, conditions };
           try {
-            if (initial) await gwApi.updatePolicy(initial.id, body);
-            else await gwApi.createPolicy(body);
+            if (initial) await adminApi.updatePolicy(initial.id, body);
+            else await adminApi.createPolicy(body);
             onDone();
           } catch (err) {
             setError(err instanceof Error ? err.message : "save failed");
@@ -126,7 +126,7 @@ function ServerForm({ onDone, onError }: { onDone: () => void; onError: (m: stri
         className="flex flex-wrap items-end gap-3 text-sm"
         onSubmit={(e) => {
           e.preventDefault();
-          gwApi.createServer({
+          adminApi.createServer({
             name: form.name,
             base_url: form.base_url,
             ...(form.auth_secret ? { auth_secret: form.auth_secret } : {})
@@ -177,7 +177,7 @@ function ServerTools({ server, onError }: { server: McpServer; onError: (m: stri
   const [tools, setTools] = useState<ServerToolRow[] | null>(null);
   const [busy, setBusy] = useState("");
   const refresh = () =>
-    gwApi.discover(server.id)
+    adminApi.discover(server.id)
       .then((r) => setTools(r.tools ?? []))
       .catch((e) => onError(e instanceof Error ? e.message : "discover failed"));
   return (
@@ -196,7 +196,7 @@ function ServerTools({ server, onError }: { server: McpServer; onError: (m: stri
                 disabled={busy === t.tool_name}
                 onClick={() => {
                   setBusy(t.tool_name);
-                  gwApi.quarantine(server.id, t.tool_name, !t.quarantined)
+                  adminApi.quarantine(server.id, t.tool_name, !t.quarantined)
                     .then(refresh)
                     .catch((e) => onError(e instanceof Error ? e.message : "quarantine failed"))
                     .finally(() => setBusy(""));
@@ -236,7 +236,7 @@ function ServerRow({ server, onChanged, onError }: {
           <Button size="sm" variant="ghost" onClick={() => setOpen((v) => !v)}>
             {open ? "Hide tools" : "Tools"}
           </Button>
-          <Button size="sm" onClick={() => gwApi.discover(server.id).then(onChanged).catch((e) => onError(String(e)))}>
+          <Button size="sm" onClick={() => adminApi.discover(server.id).then(onChanged).catch((e) => onError(String(e)))}>
             Rediscover
           </Button>
         </span>
@@ -477,8 +477,8 @@ export default function PoliciesView() {
   const [showServer, setShowServer] = useState(false);
   const [error, setError] = useState("");
   const queryClient = useQueryClient();
-  const serversQuery = useQuery({ queryKey: ["mcp-servers"], queryFn: () => gwApi.servers() });
-  const policiesQuery = useQuery({ queryKey: ["policies"], queryFn: () => gwApi.policies() });
+  const serversQuery = useQuery({ queryKey: ["mcp-servers"], queryFn: () => adminApi.servers() });
+  const policiesQuery = useQuery({ queryKey: ["policies"], queryFn: () => adminApi.policies() });
   const servers = serversQuery.data?.items ?? [];
   const policies = policiesQuery.data?.items ?? [];
   const loadError = serversQuery.error ?? policiesQuery.error;

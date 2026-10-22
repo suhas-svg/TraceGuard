@@ -28,6 +28,7 @@ describe("signed policy enforcement", () => {
   let hits = 0;
   let serverId = "";
   let workspaceId = "";
+  let projectId = "";
   let v1Id = "";
 
   async function startMock(): Promise<void> {
@@ -94,23 +95,27 @@ describe("signed policy enforcement", () => {
 
   async function activeVersionId(): Promise<string> {
     const res = await pool.query(
-      "SELECT policy_version_id FROM active_config WHERE workspace_id = $1", [workspaceId]
+      "SELECT policy_version_id FROM active_config WHERE project_id = $1", [projectId]
     );
     return String(res.rows[0].policy_version_id);
   }
 
   beforeAll(async () => {
     await startMock();
-    const reg = await gw.inject({
+    const reg = await api.inject({
       method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `signed-${tag}`, base_url: `http://127.0.0.1:${port}/mcp` }
     });
     expect(reg.statusCode).toBe(201);
     serverId = reg.json().id as string;
-    const disc = await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     expect(disc.statusCode).toBe(200);
     const ws = await pool.query("SELECT id FROM workspaces WHERE name = 'default'");
     workspaceId = String(ws.rows[0].id);
+    const project = await pool.query(
+      "SELECT id FROM projects WHERE workspace_id = $1 AND name = 'default'", [workspaceId]
+    );
+    projectId = String(project.rows[0].id);
   });
 
   afterAll(async () => {
@@ -141,7 +146,7 @@ describe("signed policy enforcement", () => {
     expect(String(decision.rows[0].reason)).toContain("policy unavailable");
 
     // The draft rule exists before any bundle does; nothing enforces it yet.
-    const rule = await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+    const rule = await api.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `signed-allow-${tag}`, server_id: serverId, tool_name: "echo", effect: "allow" } });
     expect(rule.statusCode).toBe(201);
   });
@@ -159,12 +164,12 @@ describe("signed policy enforcement", () => {
   });
 
   it("refuses a server that is not in the active signed policy", async () => {
-    const reg = await gw.inject({
+    const reg = await api.inject({
       method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `signed-extra-${tag}`, base_url: `http://127.0.0.1:${port}/mcp` }
     });
     const extraId = reg.json().id as string;
-    await gw.inject({ method: "POST", url: `/v1/servers/${extraId}/discover`, headers: key });
+    await api.inject({ method: "POST", url: `/v1/servers/${extraId}/discover`, headers: key });
     const before = hits;
     const res = await gw.inject({
       method: "POST", url: "/v1/gateway/tools/call", headers: key,
@@ -210,9 +215,9 @@ describe("signed policy enforcement", () => {
       [workspaceId, JSON.stringify({ ...forged, version: 3 }), "0".repeat(64), keyRow.rows[0].id]
     );
     const setActive = (id: string) => pool.query(
-      `INSERT INTO active_config (workspace_id, policy_version_id, updated_at) VALUES ($1,$2,now())
-       ON CONFLICT (workspace_id) DO UPDATE SET policy_version_id=EXCLUDED.policy_version_id, updated_at=now()`,
-      [workspaceId, id]
+      `INSERT INTO active_config (project_id, workspace_id, policy_version_id, updated_at) VALUES ($1,$2,$3,now())
+       ON CONFLICT (project_id) DO UPDATE SET policy_version_id=EXCLUDED.policy_version_id, updated_at=now()`,
+      [projectId, workspaceId, id]
     );
 
     try {
@@ -259,7 +264,7 @@ describe("signed policy enforcement", () => {
     ).rejects.toThrow(/immutable/);
 
     await pool.query(
-      "UPDATE active_config SET policy_version_id = $2 WHERE workspace_id = $1", [workspaceId, v1Id]
+      "UPDATE active_config SET policy_version_id = $2 WHERE project_id = $1", [projectId, v1Id]
     );
     const before = hits;
     const res = await call({});
@@ -272,15 +277,15 @@ describe("signed policy enforcement", () => {
       "SELECT id FROM policy_versions WHERE workspace_id = $1 AND version = 2", [workspaceId]
     );
     await pool.query(
-      "UPDATE active_config SET policy_version_id = $2 WHERE workspace_id = $1", [workspaceId, v2.rows[0].id]
+      "UPDATE active_config SET policy_version_id = $2 WHERE project_id = $1", [projectId, v2.rows[0].id]
     );
     expect((await call({})).statusCode).toBe(200);
   });
 
   it("refuses a fork where the recorded anchor disagrees with the active version", async () => {
     const anchor = readAnchor();
-    const good = anchor[workspaceId];
-    writeAnchor({ ...anchor, [workspaceId]: { version: good.version, content_hash: "0".repeat(64) } });
+    const good = anchor[projectId];
+    writeAnchor({ ...anchor, [projectId]: { version: good.version, content_hash: "0".repeat(64) } });
     try {
       const before = hits;
       const res = await call({});
@@ -288,7 +293,7 @@ describe("signed policy enforcement", () => {
       expect(res.json().reason).toContain("fork");
       expect(hits).toBe(before);
     } finally {
-      writeAnchor({ ...anchor, [workspaceId]: good });
+      writeAnchor({ ...anchor, [projectId]: good });
     }
     expect((await call({})).statusCode).toBe(200);
   });
@@ -365,5 +370,10 @@ describe("signed policy enforcement", () => {
       pool.query("UPDATE audit_events SET result = 'x' WHERE id = $1", [row.id])
     ).rejects.toThrow(/append-only/);
     expect(await activeVersionId()).toBeTruthy();
+    const scoped = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_events
+        WHERE action IN ('policy.published','tool.execute') AND project_id IS NOT NULL`
+    );
+    expect(scoped.rows[0].n).toBeGreaterThan(0);
   });
 });

@@ -14,7 +14,7 @@ afterAll(async () => {
   await pool.end();
 });
 
-const ROLES = ["api_runtime", "gateway_runtime", "policy_publisher", "retention_job", "audit_owner", "migration_owner"];
+const ROLES = ["api_runtime", "gateway_runtime", "policy_publisher", "retention_job", "approval_owner", "policy_owner", "audit_owner", "migration_owner"];
 
 async function asRole<T>(role: string, fn: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
@@ -48,7 +48,7 @@ async function attempt(client: PoolClient, db: () => Promise<unknown>): Promise<
 const DENIED = "42501";
 
 describe("least-privilege database roles", () => {
-  it("creates all six roles, none privileged, and the audit owner can never log in", async () => {
+  it("creates all eight roles, none privileged, and the owner roles can never log in", async () => {
     const res = await pool.query<{ rolname: string; rolcanlogin: boolean; rolsuper: boolean }>(
       "SELECT rolname, rolcanlogin, rolsuper FROM pg_roles WHERE rolname = ANY($1)",
       [ROLES]
@@ -57,10 +57,10 @@ describe("least-privilege database roles", () => {
     for (const row of res.rows) expect(row.rolsuper).toBe(false);
     // Roles are cluster-wide, and enabling a login is a deployment decision
     // (compose's db-roles service enables the four runtime logins), so this
-    // asserts only what must always hold: the audit owner and the migration
-    // identity cannot connect.
+    // asserts only what must always hold: the owner identities cannot connect.
     for (const row of res.rows) {
-      if (row.rolname === "audit_owner" || row.rolname === "migration_owner") {
+      if (row.rolname === "audit_owner" || row.rolname === "migration_owner" ||
+          row.rolname === "approval_owner" || row.rolname === "policy_owner") {
         expect(row.rolcanlogin).toBe(false);
       }
     }
@@ -94,6 +94,9 @@ describe("least-privilege database roles", () => {
       expect(await attempt(c, () => c.query("UPDATE audit_events SET result = 'x' WHERE false"))).toBe(DENIED);
       expect(await attempt(c, () => c.query("UPDATE approvals SET status = status WHERE false"))).toBe(DENIED);
       expect(await attempt(c, () => c.query("DELETE FROM approvals WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query(
+        "SELECT policy_activate_version(NULL, NULL)"
+      ))).toBe(DENIED);
     });
   });
 
@@ -102,6 +105,8 @@ describe("least-privilege database roles", () => {
       expect(await attempt(c, () => c.query("SELECT count(*) FROM policy_versions"))).toBe("ok");
       expect(await attempt(c, () => c.query("SELECT count(*) FROM approvals"))).toBe("ok");
       expect(await attempt(c, () => c.query("UPDATE policies SET name = name WHERE false"))).toBe("ok");
+      expect(await attempt(c, () => c.query("UPDATE mcp_servers SET name = name WHERE false"))).toBe("ok");
+      expect(await attempt(c, () => c.query("UPDATE server_tools SET quarantined = quarantined WHERE false"))).toBe("ok");
       expect(await attempt(c, () => c.query("UPDATE users SET role = role WHERE false"))).toBe("ok");
     });
   });
@@ -111,6 +116,9 @@ describe("least-privilege database roles", () => {
       expect(await attempt(c, () => c.query("INSERT INTO policy_versions (workspace_id, version) VALUES (gen_random_uuid(), 1)"))).toBe(DENIED);
       expect(await attempt(c, () => c.query("UPDATE policy_versions SET content_hash = 'x' WHERE false"))).toBe(DENIED);
       expect(await attempt(c, () => c.query("UPDATE active_config SET updated_at = now() WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("UPDATE mcp_servers SET name = name WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("UPDATE server_tools SET quarantined = quarantined WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("UPDATE policies SET name = name WHERE false"))).toBe(DENIED);
       expect(await attempt(c, () => c.query("DELETE FROM policy_signing_keys WHERE false"))).toBe(DENIED);
       expect(await attempt(c, () => c.query(
         "INSERT INTO audit_events (actor_type, action, resource_type, result) VALUES ('a','a','a','ok')"
@@ -118,25 +126,70 @@ describe("least-privilege database roles", () => {
     });
   });
 
-  it("gateway_runtime can enforce: approvals, decisions, pins", async () => {
+  it("gateway_runtime enforces through narrow approval procedures, not table DML", async () => {
     await asRole("gateway_runtime", async (c) => {
-      expect(await attempt(c, () => c.query("UPDATE approvals SET status = status WHERE false"))).toBe("ok");
-      expect(await attempt(c, () => c.query("UPDATE server_tools SET quarantined = quarantined WHERE false"))).toBe("ok");
+      expect(await attempt(c, () => c.query("UPDATE approvals SET status = status WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("DELETE FROM approvals WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query(
+        "INSERT INTO approvals (request_id, workspace_id, caller, server_id, tool_name, args_hash, args, requested_by, expires_at) VALUES ('x', gen_random_uuid(), 'c', gen_random_uuid(), 't', 'h', '{}', 'c', now())"
+      ))).toBe(DENIED);
+      // The transition procedure is executable, but a CAS miss returns zero
+      // rows rather than a NULL composite row.
+      const miss = await c.query(
+        "SELECT * FROM approval_transition('00000000-0000-0000-0000-000000000000', 'expire_pending')"
+      );
+      expect(miss.rows).toEqual([]);
       expect(await attempt(c, () => c.query("SELECT count(*) FROM policy_versions"))).toBe("ok");
       expect(await attempt(c, () => c.query("SELECT count(*) FROM policy_signing_keys"))).toBe("ok");
     });
   });
 
+  it("approval transitions are owned by the non-login approval_owner", async () => {
+    const res = await pool.query<{ proname: string; owner: string; secdef: boolean }>(
+      `SELECT proname, pg_get_userbyid(proowner) AS owner, prosecdef AS secdef
+         FROM pg_proc
+        WHERE proname IN ('approval_request', 'approval_decide', 'approval_transition')
+        ORDER BY proname`
+    );
+    expect(res.rows.map((r) => r.proname)).toEqual(["approval_decide", "approval_request", "approval_transition"]);
+    for (const row of res.rows) {
+      expect(row.owner).toBe("approval_owner");
+      expect(row.secdef).toBe(true);
+    }
+  });
+
+  it("api_runtime cannot execute approval procedures", async () => {
+    await asRole("api_runtime", async (c) => {
+      expect(await attempt(c, () => c.query(
+        "SELECT * FROM approval_transition('00000000-0000-0000-0000-000000000000', 'expire_pending')"
+      ))).toBe(DENIED);
+    });
+  });
+
+  it("policy trust and activation procedures are owned by non-login policy_owner", async () => {
+    const res = await pool.query<{ proname: string; owner: string; secdef: boolean }>(
+      `SELECT proname, pg_get_userbyid(proowner) AS owner, prosecdef AS secdef
+         FROM pg_proc
+        WHERE proname IN ('policy_trust_key', 'policy_activate_version')
+        ORDER BY proname`
+    );
+    expect(res.rows.map((r) => r.proname)).toEqual(["policy_activate_version", "policy_trust_key"]);
+    for (const row of res.rows) {
+      expect(row.owner).toBe("policy_owner");
+      expect(row.secdef).toBe(true);
+    }
+  });
+
   it("serializes on active_config through the definer helper without write access", async () => {
     // §9.2's consume-time row lock needs FOR SHARE, which PostgreSQL checks
     // against UPDATE privilege — a privilege gateway_runtime deliberately
-    // lacks. Migration 027's SECURITY DEFINER helper is owned by
-    // policy_publisher, and the row lock still lands on the calling
-    // transaction, so serialization holds while the runtime stays read-only.
+    // lacks. Migration 036's SECURITY DEFINER helper is owned by policy_owner,
+    // and the row lock still lands on the calling transaction, so serialization
+    // holds while the runtime stays read-only.
     const fn = await pool.query<{ owner: string }>(
       "SELECT pg_get_userbyid(proowner) AS owner FROM pg_proc WHERE proname = 'lock_active_config_share'"
     );
-    expect(fn.rows[0]?.owner).toBe("policy_publisher");
+    expect(fn.rows[0]?.owner).toBe("policy_owner");
     await asRole("gateway_runtime", async (c) => {
       expect(await attempt(c, () => c.query(
         "SELECT lock_active_config_share('00000000-0000-0000-0000-000000000000')"
@@ -145,44 +198,63 @@ describe("least-privilege database roles", () => {
     });
   });
 
-  it("policy_publisher appends versions and trust, never rewrites them", async () => {
+  it("policy_publisher appends versions and trust through narrow procedures", async () => {
     await asRole("policy_publisher", async (c) => {
       expect(await attempt(c, () => c.query("UPDATE policy_versions SET content_hash = 'x' WHERE false"))).toBe(DENIED);
       expect(await attempt(c, () => c.query("DELETE FROM policy_versions WHERE false"))).toBe(DENIED);
       expect(await attempt(c, () => c.query("UPDATE audit_events SET result = 'x' WHERE false"))).toBe(DENIED);
-      expect(await attempt(c, () => c.query("UPDATE active_config SET updated_at = active_config.updated_at WHERE false"))).toBe("ok");
-      expect(await attempt(c, () => c.query("UPDATE policy_signing_keys SET retired_at = retired_at WHERE false"))).toBe("ok");
+      expect(await attempt(c, () => c.query("UPDATE active_config SET updated_at = active_config.updated_at WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("UPDATE policy_signing_keys SET retired_at = retired_at WHERE false"))).toBe(DENIED);
+      // Execute is granted; the procedures validate their inputs before any
+      // table write, so these calls prove the grant without leaving rows.
+      // P0001 is the procedures' own raise_exception, not a privilege error.
+      expect(await attempt(c, () => c.query(
+        "SELECT * FROM policy_trust_key(NULL, NULL, NULL, false)"
+      ))).toBe("P0001");
+      expect(await attempt(c, () => c.query(
+        "SELECT policy_activate_version(NULL, NULL)"
+      ))).toBe("P0001");
     });
   });
 
-  it("retention_job deletes trace data and prunes terminal approvals", async () => {
+  it("retention_job deletes trace data but never approval history", async () => {
     await asRole("retention_job", async (c) => {
       expect(await attempt(c, () => c.query("DELETE FROM spans WHERE false"))).toBe("ok");
-      expect(await attempt(c, () => c.query("DELETE FROM approvals WHERE false"))).toBe("ok");
-      // ...but holds nothing on the audit chain at all.
-      expect(await attempt(c, () => c.query("SELECT count(*) FROM audit_events"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("DELETE FROM approvals WHERE false"))).toBe(DENIED);
+      // ...and may read the chain only to produce/check an operator
+      // checkpoint; it still cannot delete or rewrite the log itself.
+      expect(await attempt(c, () => c.query("SELECT count(*) FROM audit_events"))).toBe("ok");
       expect(await attempt(c, () => c.query("DELETE FROM audit_events WHERE false"))).toBe(DENIED);
       expect(await attempt(c, () => c.query("DELETE FROM policy_versions WHERE false"))).toBe(DENIED);
+    });
+  });
+
+  it("prune refuses a blank external receipt even for the retention role", async () => {
+    await asRole("retention_job", async (c) => {
+      await expect(c.query(
+        "SELECT prune_audit_events(gen_random_uuid(), '   ')"
+      )).rejects.toThrow(/non-empty external receipt/);
     });
   });
 
   it("the append function refuses an append that does not link to the head", async () => {
     await asRole("api_runtime", async (c) => {
       const res = await c.query<{ appended: boolean }>(
-        `SELECT append_audit_event(now(), 'test', 'db-roles', 'audit.probe', 'audit_event', '', 'success',
-          '{}'::jsonb, 'not-the-head', repeat('f', 64)) AS appended`
+        `SELECT append_audit_event(gen_random_uuid(), now(), 'test', 'db-roles', 'audit.probe',
+          'audit_event', '', 'success', '{}'::jsonb, 'not-the-head', repeat('f', 64),
+          NULL, 999) AS appended`
       );
       expect(res.rows[0]?.appended).toBe(false);
     });
   });
 
   it("the append function is not callable by roles it was not granted to", async () => {
-    await asRole("retention_job", async (c) => {
-      // The function's v2 parameters carry defaults, so the historical
-      // 10-argument call still resolves — and still only for the roles the
-      // function was granted to.
+    await asRole("migration_owner", async (c) => {
+      // Only the four append roles hold EXECUTE. The migration role owns the
+      // schema but has no runtime grant on the append function.
       expect(await attempt(c, () => c.query(
-        `SELECT append_audit_event(now(), 'test', '', 'a', 'r', '', 'success', '{}'::jsonb, '', repeat('a', 64))`
+        `SELECT append_audit_event(gen_random_uuid(), now(), 'test', '', 'a', 'r', '', 'success',
+          '{}'::jsonb, '', repeat('a', 64), NULL, 1)`
       ))).toBe(DENIED);
     });
   });

@@ -32,31 +32,34 @@
 
 ## Database roles
 
-Since migration `023`, the boundary between "can enforce" and "can rewrite
-policy" is a database privilege, not a convention. Six roles exist, all
-`NOLOGIN` until a deployment gives them credentials:
+Since migration `023`, with the later tightening in `035`–`039`, the boundary
+between "can enforce" and "can rewrite policy" is a database privilege, not a
+convention. Eight roles exist, all `NOLOGIN` until a deployment gives them
+credentials:
 
 | Role | Holds | Denied |
 |---|---|---|
-| `api_runtime` | reads; drafts (`policies`, `mcp_servers`); users/keys; runs, spans, budgets, evals, webhooks, retention rules; trace-data deletes | every write to `policy_versions`, `policy_signing_keys`, `active_config`; direct insert/update/delete on `audit_events`; all approval transitions (it cannot UPDATE or DELETE `approvals`) |
-| `gateway_runtime` | reads of signed policy, trust keys, active config; approval transitions, decisions, pins, discovery; spans | publish or alter `policy_versions`/`active_config`/`policy_signing_keys`; direct `audit_events` DML |
-| `policy_publisher` | inserts `policy_versions` and trust keys, moves the active pointer, appends audit | update/delete of `policy_versions` (the immutability trigger backs this up); any audit DML |
-| `retention_job` | deletes `spans`, `runs`, terminal `approvals`, webhook deliveries; its own run bookkeeping | no privilege at all on `audit_events`, `policy_versions`, or trust state |
+| `api_runtime` | reads; control-plane drafts (`policies`, `mcp_servers`, `server_tools`); projects, agent principals, ingest keys; users/keys/memberships; runs, spans, budgets, evals, webhooks, retention rules; trace-data deletes | every write to `policy_versions`, `policy_signing_keys`, `active_config`; direct insert/update/delete on `audit_events`; all approval writes |
+| `gateway_runtime` | reads of signed policy, trust keys, active config, projects, principals; approval procedures, decisions, discovery; spans | publish or alter `policy_versions`/`active_config`/`policy_signing_keys`; server, pin, or policy writes; direct `approvals` or `audit_events` DML |
+| `policy_publisher` | inserts `policy_versions`; executes `policy_trust_key`/`policy_activate_version`; appends audit | update/delete of `policy_versions` (the immutability trigger backs this up); direct trust or active-pointer writes; any audit DML |
+| `retention_job` | deletes `spans`, `runs`, webhook deliveries; its own run bookkeeping; executes the checkpoint-gated audit prune | approval deletes; ordinary audit DML; `policy_versions` or trust-state writes |
+| `approval_owner` | owns the approval procedures and tables; cannot log in | runtime traffic |
+| `policy_owner` | owns the trust/activation procedures and `lock_active_config_share`; cannot log in | runtime traffic |
 | `audit_owner` | owns `audit_events` and `append_audit_event`; cannot log in | runtime traffic |
 | `migration_owner` | a membership target for the deployer; migrations should run as it | runtime traffic |
 
-The append-only guarantee is now structural: runtime roles hold no `INSERT`
-on `audit_events`. They call `append_audit_event(...)`, which takes the chain
+The append-only guarantee is structural: runtime roles hold no `INSERT` on
+`audit_events`. They call `append_audit_event(...)`, which takes the chain
 lock, refuses an append that does not link to the current head (returning
-`false`, so a caller's transaction survives the retry), and inserts. The hash
-formula stays in `@traceguard/audit-chain`, where the verifier shares it.
+`false`, so a caller's transaction survives the retry), and inserts. New
+events use v4 hashes with workspace and project attribution; v1–v3 hashes
+remain byte-identical for old rows. The hash formula stays in
+`@traceguard/audit-chain`, where the verifier shares it.
 
-Two deviations from the spec's §13.4 table, on purpose: the gateway holds
-table-level `UPDATE` on `approvals` (its CAS transitions are one shape in one
-file) rather than one procedure per transition, and this single-node
-deployment serves the policy screens from the gateway, so `gateway_runtime`
-keeps the draft writes those routes make. Tightening either is a follow-up
-that does not change the denials above.
+The remaining deviation from the spec's §13.4 table is the local identity
+path: `api_runtime` can still insert/update `users`, `api_keys`, and
+`memberships`, so a non-OAuth deployment can mint trusted roles. Removing
+that path is tracked as an open identity workstream, not a hidden exception.
 
 `apps/api/tests/db-roles.test.ts` proves the matrix at the database layer by
 running each probe under `SET ROLE`; it fails if a grant widens.

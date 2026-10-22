@@ -47,6 +47,25 @@ export async function resolveWorkspaceId(db: PoolClient | Pool, ref: string | un
   return String(res.rows[0].id);
 }
 
+// Signed policy is published per project. Omitting the ref selects the
+// workspace's default project, which is what every pre-039 workflow used.
+export async function resolveProjectId(
+  db: PoolClient | Pool,
+  workspaceId: string,
+  ref: string | undefined
+): Promise<string> {
+  const wanted = ref ?? "default";
+  const res = await db.query(
+    `SELECT id FROM projects
+      WHERE workspace_id = $1 AND (name = $2 OR id::text = $2)`,
+    [workspaceId, wanted]
+  );
+  if (!res.rows[0]) {
+    throw new Error(`project "${wanted}" not found in workspace ${workspaceId}`);
+  }
+  return String(res.rows[0].id);
+}
+
 // FR-010: same normalization as the gateway's pathWithin — posix.normalize
 // both sides, then a boundary-aware prefix test. Kept local so the publisher
 // does not depend on the API package at runtime; the two must agree, and the
@@ -60,36 +79,47 @@ function withinRoot(value: string, root: string): boolean {
 
 // Builds the candidate bundle from current drafts. It never signs anything;
 // publish() validates the result and refuses on problems.
-export async function assembleBundle(client: PoolClient, workspaceId: string): Promise<Assembly> {
+export async function assembleBundle(
+  client: PoolClient,
+  workspaceId: string,
+  projectId: string
+): Promise<Assembly> {
+  const project = await client.query(
+    "SELECT id FROM projects WHERE id = $1 AND workspace_id = $2",
+    [projectId, workspaceId]
+  );
+  if (!project.rows[0]) {
+    throw new Error(`project ${projectId} does not belong to workspace ${workspaceId}`);
+  }
   const versionRow = await client.query(
-    "SELECT coalesce(max(version), 0) AS v FROM policy_versions WHERE workspace_id = $1",
-    [workspaceId]
+    "SELECT coalesce(max(version), 0) AS v FROM policy_versions WHERE project_id = $1",
+    [projectId]
   );
   const nextVersion = Number(versionRow.rows[0].v) + 1;
   const activeRow = await client.query(
     `SELECT pv.content_hash FROM active_config ac
        JOIN policy_versions pv ON pv.id = ac.policy_version_id
-      WHERE ac.workspace_id = $1`,
-    [workspaceId]
+      WHERE ac.project_id = $1`,
+    [projectId]
   );
   const previous = (activeRow.rows[0]?.content_hash as string | undefined) ?? null;
 
   const servers = await client.query(
-    "SELECT id, gateway_alias, base_url, auth_secret FROM mcp_servers WHERE workspace_id = $1 ORDER BY gateway_alias",
-    [workspaceId]
+    "SELECT id, gateway_alias, base_url, auth_secret FROM mcp_servers WHERE project_id = $1 ORDER BY gateway_alias",
+    [projectId]
   );
   const pins = await client.query(
     `SELECT t.server_id, t.tool_name, t.definition_hash, t.definition
        FROM server_tools t JOIN mcp_servers s ON s.id = t.server_id
-      WHERE s.workspace_id = $1 AND t.quarantined = false AND t.quarantine_reason IS NULL
+      WHERE s.project_id = $1 AND t.quarantined = false AND t.quarantine_reason IS NULL
       ORDER BY t.server_id, t.tool_name`,
-    [workspaceId]
+    [projectId]
   );
   const rules = await client.query(
     `SELECT id, name, enabled, priority, agent_id, server_id, tool_name, effect, conditions
-       FROM policies WHERE workspace_id = $1 AND superseded_by IS NULL
+       FROM policies WHERE project_id = $1 AND superseded_by IS NULL
       ORDER BY name, id`,
-    [workspaceId]
+    [projectId]
   );
 
   const counts: PublishCounts = {
@@ -101,6 +131,7 @@ export async function assembleBundle(client: PoolClient, workspaceId: string): P
     bundle_version: BUNDLE_VERSION,
     protocol_profile: PROTOCOL_PROFILE,
     workspace_id: workspaceId,
+    project_id: projectId,
     version: nextVersion,
     previous_version_hash: previous,
     rules: rules.rows.map((r) => ({
@@ -205,52 +236,37 @@ export async function trustKey(pool: Pool, opts: TrustOptions): Promise<TrustRes
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    // Serialized per workspace: without the lock, two concurrent trusts on a
-    // fresh workspace can both see "no live key" and both insert, leaving two
-    // live keys the gateway would equally trust.
-    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`policy-keys:${opts.workspaceId}`]);
-    const existing = await client.query(
-      "SELECT id, key_id, retired_at FROM policy_signing_keys WHERE workspace_id = $1", [opts.workspaceId]
+    // The procedure serializes per workspace and owns the only INSERT/UPDATE
+    // path on policy_signing_keys. It returns the exact rows it changed so the
+    // publisher can append matching audit events in the same transaction.
+    const changed = await client.query<{ action: string; out_key_id: string }>(
+      "SELECT action, out_key_id FROM policy_trust_key($1,$2,$3,$4)",
+      [opts.workspaceId, keyId, opts.publicKeyPem.trim(), opts.rotate ?? false]
     );
-    const forThisKey = existing.rows.find((r) => r.key_id === keyId);
-    const live = existing.rows.filter((r) => !r.retired_at);
-    if (forThisKey && !forThisKey.retired_at) {
+    if (changed.rows.some((row) => row.action === "already_trusted")) {
       await client.query("COMMIT");
       return { keyId, retired: [], alreadyTrusted: true };
     }
-    if (live.length > 0 && !opts.rotate) {
-      throw new Error(
-        "this workspace already trusts a different signing key; pass --rotate to replace it"
-      );
-    }
     const retired: string[] = [];
-    for (const row of live) {
-      await client.query("UPDATE policy_signing_keys SET retired_at = now() WHERE id = $1", [row.id]);
+    for (const row of changed.rows.filter((entry) => entry.action === "retired")) {
       await appendAuditEvent(client, {
         actor_type: "admin", actor_id: opts.trustedBy ?? "operator",
         action: "policy.signing_key.retired", resource_type: "policy_signing_key",
-        resource_id: String(row.key_id), result: "success"
+        resource_id: String(row.out_key_id), result: "success"
       });
-      retired.push(String(row.key_id));
+      retired.push(String(row.out_key_id));
     }
-    if (forThisKey) {
-      // A previously retired key coming back: re-activate the same row, never
-      // a second row for the same key material (the unique index would refuse
-      // it, and two rows would make retirement ambiguous).
-      await client.query(
-        "UPDATE policy_signing_keys SET retired_at = NULL WHERE id = $1", [forThisKey.id]
-      );
-    } else {
-      await client.query(
-        "INSERT INTO policy_signing_keys (workspace_id, key_id, public_key_pem) VALUES ($1,$2,$3)",
-        [opts.workspaceId, keyId, opts.publicKeyPem.trim()]
-      );
+    const trusted = changed.rows.find(
+      (entry) => entry.action === "trusted" || entry.action === "reactivated"
+    );
+    if (!trusted) {
+      throw new Error("trust procedure returned no trusted key state");
     }
     await appendAuditEvent(client, {
       actor_type: "admin", actor_id: opts.trustedBy ?? "operator",
       action: "policy.signing_key.trusted", resource_type: "policy_signing_key",
       resource_id: keyId, result: "success",
-      metadata: forThisKey ? { reactivated: true } : {}
+      metadata: trusted.action === "reactivated" ? { reactivated: true } : {}
     });
     await client.query("COMMIT");
     return { keyId, retired, alreadyTrusted: false };
@@ -264,6 +280,8 @@ export async function trustKey(pool: Pool, opts: TrustOptions): Promise<TrustRes
 
 export interface PublishOptions {
   workspaceId: string;
+  /** Project name or id. Defaults to the workspace's `default` project. */
+  projectId?: string;
   privateKeyPem: string;
   publishedBy?: string;
   dryRun?: boolean;
@@ -271,6 +289,7 @@ export interface PublishOptions {
 
 export interface PublishResult {
   published: boolean;
+  projectId: string;
   version: number;
   contentHash: string;
   keyId: string;
@@ -281,7 +300,8 @@ export interface PublishResult {
 export async function publish(pool: Pool, opts: PublishOptions): Promise<PublishResult> {
   const client = await pool.connect();
   try {
-    const { bundle, counts, problems } = await assembleBundle(client, opts.workspaceId);
+    const projectId = await resolveProjectId(client, opts.workspaceId, opts.projectId);
+    const { bundle, counts, problems } = await assembleBundle(client, opts.workspaceId, projectId);
     if (problems.length > 0) {
       throw new Error(`refusing to publish:\n  - ${problems.join("\n  - ")}`);
     }
@@ -304,7 +324,7 @@ export async function publish(pool: Pool, opts: PublishOptions): Promise<Publish
     }
 
     if (opts.dryRun) {
-      return { published: false, version: bundle.version, contentHash, keyId, counts, bundle };
+      return { published: false, projectId, version: bundle.version, contentHash, keyId, counts, bundle };
     }
 
     await client.query("BEGIN");
@@ -312,11 +332,11 @@ export async function publish(pool: Pool, opts: PublishOptions): Promise<Publish
     try {
       inserted = await client.query(
         `INSERT INTO policy_versions
-           (workspace_id, version, bundle, content_hash, signature, signing_key_id,
+           (workspace_id, project_id, version, bundle, content_hash, signature, signing_key_id,
             previous_version_hash, published_by)
-         VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7,$8)
+         VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9)
          RETURNING id`,
-        [opts.workspaceId, bundle.version, JSON.stringify(bundle), contentHash, signature,
+        [opts.workspaceId, projectId, bundle.version, JSON.stringify(bundle), contentHash, signature,
          keyRow.rows[0].id, bundle.previous_version_hash, opts.publishedBy ?? "operator"]
       );
     } catch (err) {
@@ -327,18 +347,19 @@ export async function publish(pool: Pool, opts: PublishOptions): Promise<Publish
       }
       throw err;
     }
-    await client.query(
-      `INSERT INTO active_config (workspace_id, policy_version_id, updated_at)
-       VALUES ($1,$2,now())
-       ON CONFLICT (workspace_id) DO UPDATE
-         SET policy_version_id = EXCLUDED.policy_version_id, updated_at = now()`,
-      [opts.workspaceId, inserted.rows[0].id]
-    );
+    // Activation is a narrow procedure: it verifies that the signed version
+    // belongs to this workspace and owns the only active_config write.
+    await client.query("SELECT policy_activate_version($1,$2)", [
+      opts.workspaceId, inserted.rows[0].id
+    ]);
     await appendAuditEvent(client, {
       actor_type: "admin", actor_id: opts.publishedBy ?? "operator",
       action: "policy.published", resource_type: "policy_version",
       resource_id: String(inserted.rows[0].id), result: "success",
+      workspace_id: opts.workspaceId,
+      project_id: projectId,
       metadata: {
+        project_id: projectId,
         version: bundle.version,
         content_hash: contentHash,
         key_id: keyId,
@@ -348,7 +369,7 @@ export async function publish(pool: Pool, opts: PublishOptions): Promise<Publish
       }
     });
     await client.query("COMMIT");
-    return { published: true, version: bundle.version, contentHash, keyId, counts, bundle };
+    return { published: true, projectId, version: bundle.version, contentHash, keyId, counts, bundle };
   } catch (err) {
     await client.query("ROLLBACK").catch(() => undefined);
     throw err;
@@ -412,9 +433,11 @@ function usage(): void {
       "  keygen  --out <dir>                Generate an Ed25519 signing key pair (default ./policy-keys)",
       "  trust   --workspace <id|name>      Trust a public key for a workspace [--public-key <file>] [--rotate]",
       "  publish --workspace <id|name>      Sign and publish the current drafts as the active policy",
+      "          [--project <id|name>]      Project to publish (default: the workspace default project)",
       "          --key <file>               Private key PEM (or POLICY_SIGNING_KEY_FILE)",
       "          [--dry-run] [--by <name>]",
       "  status  --workspace <id|name>      Show the active version, its key, and what a publish would contain",
+      "          [--project <id|name>]      Project to inspect (default: the workspace default project)",
       "",
       "Environment: DATABASE_URL (or --database-url). The private key never belongs",
       "in the API or gateway containers; run this tool on the operator's host.",
@@ -496,6 +519,7 @@ async function main(): Promise<void> {
       const workspaceId = await resolveWorkspaceId(pool, flags.workspace as string | undefined);
       const result = await publish(pool, {
         workspaceId,
+        projectId: flags.project as string | undefined,
         privateKeyPem,
         publishedBy: by,
         dryRun: flags["dry-run"] === true
@@ -503,6 +527,7 @@ async function main(): Promise<void> {
       process.stdout.write(
         [
           `${result.published ? "published" : "dry run"}: version ${result.version}`,
+          `project:      ${result.projectId}`,
           `content hash: ${result.contentHash}`,
           `key id:       ${result.keyId.slice(0, 12)}...`,
           `manifest:     ${result.counts.rules} rules, ${result.counts.servers} servers, ${result.counts.pins} tool pins`,
@@ -520,14 +545,15 @@ async function main(): Promise<void> {
     const client = await pool.connect();
     try {
       const workspaceId = await resolveWorkspaceId(client, flags.workspace as string | undefined);
+      const projectId = await resolveProjectId(client, workspaceId, flags.project as string | undefined);
       const active = await client.query(
         `SELECT pv.version, pv.content_hash, pv.published_at, pv.published_by,
                 pk.key_id, (pk.retired_at IS NOT NULL) AS key_retired
            FROM active_config ac
            JOIN policy_versions pv ON pv.id = ac.policy_version_id
            JOIN policy_signing_keys pk ON pk.id = pv.signing_key_id
-          WHERE ac.workspace_id = $1`,
-        [workspaceId]
+          WHERE ac.project_id = $1`,
+        [projectId]
       );
       if (active.rows[0]) {
         const row = active.rows[0];
@@ -538,8 +564,9 @@ async function main(): Promise<void> {
       } else {
         process.stdout.write("active: nothing published yet\n");
       }
-      const { counts, problems } = await assembleBundle(client, workspaceId);
+      const { counts, problems } = await assembleBundle(client, workspaceId, projectId);
       process.stdout.write(
+        `project: ${projectId}\n` +
         `draft:  ${counts.rules} rules, ${counts.servers} servers, ${counts.pins} reviewed tool pins\n`
       );
       for (const problem of problems) {

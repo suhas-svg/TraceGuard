@@ -47,10 +47,10 @@ friends, which shadow the test defaults that `tests/setup.ts` installs with
 separate, disposable database — and leave the rest unset. `tests/e2e` is the
 exception: it sets its own environment and recreates its own database.
 
-The gateway enforces only signed policy: bring a workspace up with
+The gateway enforces only signed policy: bring a project up with
 `npm run policy:keygen`, `npm run policy:trust -- --workspace default`, and
-`npm run policy:publish -- --workspace default` (repeat the publish after
-every rule, server, or reviewed-pin change). The signing key stays in
+`npm run policy:publish -- --workspace default --project default` (repeat the
+publish after every rule, server, or reviewed-pin change). The signing key stays in
 `./policy-keys/` on your machine — never in a container. The e2e suite runs
 its own publish against its own key and `GATEWAY_STATE_DIR` under
 `test-results/`, so it cannot collide with your dev anchor.
