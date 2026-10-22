@@ -1,16 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  formatMicro, getDiagnostics, getOverview, getRunCounts, getTrace, getUsage, gwApi, listAgents, listRuns,
-  settings, type Span
-} from "./api";
-import { buildTree, tokenTotal, type SpanNode } from "./tree";
-import { relTime } from "./format";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { getOverview, settings } from "./api";
 import { useHashRoute, type Tab } from "./router";
-import { filterRuns, sortRuns, type RunSortDir, type RunSortKey } from "./runsview";
 import type { PaletteItem } from "./palette";
 import { Palette } from "./CommandPalette";
 import OverviewView from "./Overview";
+import RunsView from "./Runs";
+import TraceView from "./Trace";
 import EvalsView from "./Evals";
 import PoliciesView from "./Policies";
 import ApprovalsView from "./Approvals";
@@ -18,10 +14,7 @@ import WebhooksView from "./Webhooks";
 import RetentionView from "./Retention";
 import CostsView from "./Costs";
 import UsersView from "./Users";
-import {
-  Alert, Badge, Button, Card, Empty, Field, Input, LinkButton,
-  NavIcon, Page, Segmented, Select, Stat, StatusBadge, Table, TableSkeleton, Td, Th
-} from "./components";
+import { Button, Field, Input, NavIcon } from "./components";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
@@ -35,8 +28,19 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "users", label: "Users" }
 ];
 
+const NAV_GROUPS: { label: string; tabs: Tab[] }[] = [
+  { label: "Monitor", tabs: ["overview", "runs"] },
+  { label: "Control", tabs: ["policy", "approvals"] },
+  { label: "Analyze", tabs: ["evals", "costs"] },
+  { label: "Configure", tabs: ["webhooks", "retention", "users"] }
+];
+
 function short(id: string) {
   return id.slice(0, 8);
+}
+
+function tabLabel(id: Tab) {
+  return TABS.find((t) => t.id === id)?.label ?? id;
 }
 
 function theme(): "light" | "dark" {
@@ -63,7 +67,7 @@ function ThemeToggle() {
       }}
       aria-label={mode === "dark" ? "Switch to light mode" : "Switch to dark mode"}
       title={mode === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-      className="flex h-8 w-8 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
+      className="flex h-8 w-8 items-center justify-center rounded-lg text-ink-400 transition-colors hover:bg-ink-100 hover:text-ink-900"
     >
       {mode === "dark" ? (
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}
@@ -125,462 +129,11 @@ function ConnectionDrawer({ open, onClose, onSaved }: {
   );
 }
 
-function RunsList({ onOpen }: { onOpen: (id: string) => void }) {
-  const [status, setStatus] = useState("");
-  const [query, setQuery] = useState("");
-  const [sort, setSort] = useState<{ key: RunSortKey; dir: RunSortDir } | null>(null);
-  // Server-side filters: these narrow what the API returns, including runs
-  // that have not been paged in yet. The search box below stays client-side
-  // over the loaded pages.
-  const [agentId, setAgentId] = useState("");
-  const [provider, setProvider] = useState("");
-  const [model, setModel] = useState("");
-  const [since, setSince] = useState("");
-  const [until, setUntil] = useState("");
-  const [evalRunId, setEvalRunId] = useState("");
-  const agentsQuery = useQuery({ queryKey: ["agents"], queryFn: listAgents, staleTime: 60_000 });
-  const filters = {
-    status: status || undefined,
-    agent_id: agentId || undefined,
-    provider: provider.trim() || undefined,
-    model: model.trim() || undefined,
-    since: since ? new Date(`${since}T00:00:00`).toISOString() : undefined,
-    until: until ? new Date(`${until}T23:59:59.999`).toISOString() : undefined,
-    eval_run_id: evalRunId.trim() || undefined
-  };
-  const runsQuery = useInfiniteQuery({
-    queryKey: ["runs", filters],
-    queryFn: ({ pageParam }) => listRuns({ ...filters, limit: 50, cursor: pageParam ?? undefined }),
-    initialPageParam: null as string | null,
-    getNextPageParam: (last) => last.next_cursor,
-    refetchInterval: 10_000
-  });
-  const runs = runsQuery.data?.pages.flatMap((p) => p.items) ?? [];
-  const error = runsQuery.error instanceof Error ? runsQuery.error.message : runsQuery.error ? "load failed" : "";
-
-  // Global totals from the counts endpoint: the tiles keep their meaning while
-  // the list below is filtered.
-  const totalsQuery = useQuery({
-    queryKey: ["runs", "counts"],
-    queryFn: getRunCounts,
-    refetchInterval: 15_000
-  });
-  const totals = totalsQuery.data;
-  // Search and sort apply to the loaded pages; the server keeps owning paging.
-  const filtered = filterRuns(runs, query);
-  const visible = sort ? sortRuns(filtered, sort.key, sort.dir) : filtered;
-  const flipSort = (key: RunSortKey) =>
-    setSort((cur) => (cur?.key === key ? { key, dir: cur.dir === "desc" ? "asc" : "desc" } : { key, dir: "desc" }));
-  // Clicking a KPI filters the list below it; clicking it again clears the filter.
-  const toggleStatus = (s: string) => setStatus((cur) => (cur === s ? "" : s));
-
-  return (
-    <Page
-      title="Runs"
-      sub="Every agent execution, newest first. Open one for its full trace."
-      actions={
-        <>
-          <Segmented
-            label="Filter by status"
-            value={status}
-            onChange={(v) => setStatus(v)}
-            options={[
-              { value: "", label: "All" },
-              { value: "running", label: "Running" },
-              { value: "success", label: "Success" },
-              { value: "failed", label: "Failed" },
-              { value: "cancelled", label: "Cancelled" }
-            ]}
-          />
-          <Button onClick={() => runsQuery.refetch()}>Refresh</Button>
-        </>
-      }
-    >
-      <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Stat label="Total runs" value={totals ? totals.total : "–"} />
-        <Stat
-          label="Failed" value={totals ? totals.counts.failed ?? 0 : "–"}
-          tone={(totals?.counts.failed ?? 0) > 0 ? "bad" : "default"}
-          active={status === "failed"} onClick={() => toggleStatus("failed")}
-        />
-        <Stat
-          label="Running" value={totals ? totals.counts.running ?? 0 : "–"}
-          tone={(totals?.counts.running ?? 0) > 0 ? "warn" : "default"}
-          active={status === "running"} onClick={() => toggleStatus("running")}
-        />
-        <Stat label="Denied spans" value={totals ? totals.denied_spans : "–"} />
-      </div>
-      {error && <Alert>{error}</Alert>}
-      <div className="mb-3 flex flex-wrap items-end gap-2">
-        <Field label="Search loaded">
-          <Input
-            aria-label="Search runs"
-            placeholder="run id or agent..."
-            className="w-52"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-        </Field>
-        <Field label="Agent">
-          <Select aria-label="Filter by agent" className="w-44" value={agentId}
-            onChange={(e) => setAgentId(e.target.value)}>
-            <option value="">All agents</option>
-            {(agentsQuery.data?.items ?? []).map((a) => (
-              <option key={a.id} value={a.id}>{a.name}</option>
-            ))}
-          </Select>
-        </Field>
-        <Field label="Provider">
-          <Input aria-label="Filter by provider" className="w-32" placeholder="any"
-            value={provider} onChange={(e) => setProvider(e.target.value)} />
-        </Field>
-        <Field label="Model">
-          <Input aria-label="Filter by model" className="w-32" placeholder="any"
-            value={model} onChange={(e) => setModel(e.target.value)} />
-        </Field>
-        <Field label="From">
-          <Input aria-label="Started after" type="date" value={since}
-            onChange={(e) => setSince(e.target.value)} />
-        </Field>
-        <Field label="To">
-          <Input aria-label="Started before" type="date" value={until}
-            onChange={(e) => setUntil(e.target.value)} />
-        </Field>
-        <Field label="Eval run">
-          <Input aria-label="Filter by evaluation run" className="w-40" placeholder="eval run id"
-            value={evalRunId} onChange={(e) => setEvalRunId(e.target.value)} />
-        </Field>
-        {(agentId || provider || model || since || until || evalRunId) && (
-          <Button variant="ghost" size="sm" onClick={() => {
-            setAgentId(""); setProvider(""); setModel(""); setSince(""); setUntil(""); setEvalRunId("");
-          }}>
-            Clear filters
-          </Button>
-        )}
-      </div>
-      {runsQuery.isPending ? (
-        <TableSkeleton label="Loading runs..." />
-      ) : runs.length === 0 ? (
-        <Empty hint="No runs yet. Run the demo agent to create one." />
-      ) : visible.length === 0 ? (
-        <Empty hint={`No loaded runs match "${query.trim()}".`} />
-      ) : (
-        <Table>
-          <thead>
-            <tr>
-              <Th>Run</Th>
-              <Th>Agent</Th>
-              <Th>Status</Th>
-              <Th onSort={() => flipSort("started")} sorted={sort?.key === "started" ? sort.dir : undefined}>Started</Th>
-              <Th className="text-right" onSort={() => flipSort("spans")} sorted={sort?.key === "spans" ? sort.dir : undefined}>Spans</Th>
-              <Th className="text-right" onSort={() => flipSort("tokens")} sorted={sort?.key === "tokens" ? sort.dir : undefined}>
-                Tokens in/out
-              </Th>
-            </tr>
-          </thead>
-          <tbody>
-            {visible.map((r) => (
-              <tr key={r.id} className="transition-colors hover:bg-ink-50/70">
-                <Td><LinkButton onClick={() => onOpen(r.id)}>{short(r.id)}</LinkButton></Td>
-                <Td>{r.agent_name}</Td>
-                <Td><StatusBadge status={r.status} /></Td>
-                <Td className="whitespace-nowrap text-ink-500" title={new Date(r.started_at).toLocaleString()}>
-                  {relTime(r.started_at)}
-                </Td>
-                <Td className="text-right">{r.span_count}</Td>
-                <Td className="whitespace-nowrap text-right">{r.input_tokens}/{r.output_tokens}</Td>
-              </tr>
-            ))}
-          </tbody>
-        </Table>
-      )}
-      {runs.length > 0 && (
-        <p className="mt-2 text-xs text-ink-500">
-          {query.trim() ? `Showing ${visible.length} of ${runs.length} loaded` : `${runs.length} run${runs.length === 1 ? "" : "s"} loaded`}
-          {runsQuery.hasNextPage ? " · older runs load on demand" : ""} · refreshes every 10 s
-        </p>
-      )}
-      <div className="mt-3">
-        {runsQuery.hasNextPage && (
-          <Button disabled={runsQuery.isFetching} onClick={() => runsQuery.fetchNextPage()}>
-            Load more
-          </Button>
-        )}
-      </div>
-    </Page>
-  );
-}
-
-function SpanRow({ node, depth, selected, onSelect, base, maxEnd }: {
-  node: SpanNode;
-  depth: number;
-  selected: string | null;
-  onSelect: (id: string) => void;
-  base: number;
-  maxEnd: number;
-}) {
-  const s = node.span;
-  const start = new Date(s.started_at).getTime() - base;
-  const dur = s.duration_ms ?? 0;
-  const left = maxEnd > 0 ? Math.min(96, (start / maxEnd) * 100) : 0;
-  const width = maxEnd > 0 && dur > 0 ? Math.max(1.5, Math.min(100 - left, (dur / maxEnd) * 100)) : 1.5;
-  const barTone =
-    s.status === "failed" || s.status === "denied" ? "bg-bad-700/70"
-    : s.operation_type.includes("tool") ? "bg-brand-500/70"
-    : "bg-ink-300";
-  return (
-    <>
-      <button
-        data-span={s.id}
-        className={`block w-full rounded-md px-2 py-1.5 text-left transition-colors hover:bg-ink-50 ${
-          selected === s.id ? "bg-brand-50 ring-1 ring-brand-200" : ""
-        }`}
-        style={{ paddingLeft: `${depth * 1.25 + 0.5}rem` }}
-        onClick={() => onSelect(s.id)}
-        onKeyDown={(e) => {
-          // Arrows walk the flattened visible tree in DOM order.
-          if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
-          e.preventDefault();
-          const all = [...document.querySelectorAll<HTMLButtonElement>("[data-span]")];
-          const next = all[all.indexOf(e.currentTarget) + (e.key === "ArrowDown" ? 1 : -1)];
-          if (next?.dataset.span) {
-            onSelect(next.dataset.span);
-            next.focus();
-          }
-        }}
-      >
-        <span className="flex items-center gap-2 text-sm">
-          <StatusBadge status={s.status} />
-          <span className="font-mono font-medium text-ink-800">{s.operation_type}</span>
-          {s.model && <span className="truncate text-ink-500">{s.model}</span>}
-          {s.error_type && <span className="text-bad-700">{s.error_type}</span>}
-          <span className="tg-nums ml-auto shrink-0 text-xs text-ink-500">
-            {s.duration_ms != null ? `${s.duration_ms} ms` : ""}
-          </span>
-        </span>
-        <span className="tg-track mt-1 block h-1.5 w-full" aria-hidden="true">
-          <span className={`tg-bar block h-1.5 ${barTone}`} style={{ marginLeft: `${left}%`, width: `${width}%` }} />
-        </span>
-      </button>
-      {node.children.map((c) => (
-        <SpanRow key={c.span.id} node={c} depth={depth + 1} selected={selected} onSelect={onSelect} base={base} maxEnd={maxEnd} />
-      ))}
-    </>
-  );
-}
-
-function SpanDetail({ span, costMicro }: { span: Span; costMicro?: number | null }) {
-  // Denials come from policy rules or exhausted budgets. The stored reason
-  // names the cause; the label only says denied.
-  const denialCause =
-    (span.attributes?.reason as string | undefined) ?? span.error_type ?? "policy";
-  // Reasons that already read as a sentence ("denied by rule ...",
-  // "budget exhausted ...") replace the "denied by" prefix instead of
-  // doubling it.
-  const statusText =
-    span.status !== "denied" ? span.status
-    : /^(denied|budget)/.test(denialCause) ? denialCause
-    : `denied by ${denialCause}`;
-  // Cost comes from the usage endpoint's per-span breakdown: undefined while
-  // it is still loading, null when no pricing row covers the span.
-  const hasUsage = span.input_tokens != null || span.output_tokens != null;
-  const costText =
-    costMicro === undefined ? "…" : !hasUsage ? "n/a"
-    : costMicro === null ? "unpriced (no pricing row)" : formatMicro(costMicro);
-  const rows: [string, React.ReactNode][] = [
-    ["Operation", <span className="font-mono">{span.operation_type}</span>],
-    ["Status", statusText],
-    ["Started", new Date(span.started_at).toLocaleString()],
-    ["Duration", span.duration_ms != null ? `${span.duration_ms} ms` : "n/a"],
-    ["Provider", span.provider ?? "n/a"],
-    ["Model", span.model ?? "n/a"],
-    ["Tokens", `${span.input_tokens ?? "unknown"} in / ${span.output_tokens ?? "unknown"} out`],
-    ["Cost", costText],
-    ["Usage source", span.usage_source ?? "n/a"],
-    ["Error", span.error_type ?? "none"]
-  ];
-  return (
-    <Card className="p-4 text-sm">
-      <h3 className="mb-2 font-mono font-semibold text-ink-900">span {short(span.id)}</h3>
-      <dl>
-        {rows.map(([k, v]) => (
-          <div key={k} className="flex gap-3 border-b border-ink-100 py-1.5 last:border-0">
-            <dt className="w-28 shrink-0 text-ink-500">{k}</dt>
-            <dd className="text-ink-800">{v}</dd>
-          </div>
-        ))}
-      </dl>
-      <details className="mt-2">
-        <summary className="cursor-pointer text-sm text-ink-500">attributes</summary>
-        <pre className="mt-1 max-h-64 overflow-auto rounded-md bg-[#0b0e16] p-3 font-mono text-xs text-slate-100">
-          {JSON.stringify(span.attributes, null, 2)}
-        </pre>
-      </details>
-    </Card>
-  );
-}
-
-function TraceView({
-  runId,
-  onBack,
-  onOpenApproval
-}: {
-  runId: string;
-  onBack: () => void;
-  onOpenApproval: (approvalId: string) => void;
-}) {
-  const [selected, setSelected] = useState<string | null>(null);
-  const traceQuery = useQuery({ queryKey: ["trace", runId], queryFn: () => getTrace(runId) });
-  const usageQuery = useQuery({ queryKey: ["usage", runId], queryFn: () => getUsage(runId) });
-  const diagnosticsQuery = useQuery({
-    queryKey: ["diagnostics", runId],
-    queryFn: () => getDiagnostics(runId),
-    retry: false
-  });
-  // FR-021: gateway decisions correlated to this trace by run_id.
-  const decisionsQuery = useQuery({
-    queryKey: ["decisions", runId],
-    queryFn: () => gwApi.decisions(runId),
-    retry: false
-  });
-
-  const error = traceQuery.error instanceof Error ? traceQuery.error.message : traceQuery.error ? "load failed" : "";
-  const run = traceQuery.data?.run ?? null;
-  const spans: Span[] = traceQuery.data?.spans ?? [];
-  const costBySpan = new Map((usageQuery.data?.spans ?? []).map((u) => [u.id, u.cost_micro]));
-  const warnings = diagnosticsQuery.data?.warnings ?? [];
-  const decisions = decisionsQuery.data?.items ?? [];
-  const decisionTone = (decision: string): "ok" | "warn" | "bad" =>
-    decision === "allow" || decision === "approved_retry" ? "ok" : decision === "need_approval" ? "warn" : "bad";
-  const cost = usageQuery.data
-    ? `${formatMicro(usageQuery.data.estimated_cost_micro)}${usageQuery.data.cost_partial ? " (partial)" : ""}`
-    : usageQuery.isError ? "n/a" : null;
-
-  if (error) {
-    return (
-      <Page title="Trace">
-        <Alert>{error}</Alert>
-        <Button onClick={onBack}>Back to runs</Button>
-      </Page>
-    );
-  }
-  if (!run) {
-    return (
-      <Page title="Trace"><TableSkeleton label="Loading trace..." /></Page>
-    );
-  }
-
-  const roots = buildTree(spans);
-  const totals = tokenTotal(spans);
-  const selectedSpan = spans.find((s) => s.id === selected) ?? null;
-  const base = spans.length
-    ? Math.min(...spans.map((s) => new Date(s.started_at).getTime()))
-    : 0;
-  const maxEnd = spans.length
-    ? Math.max(...spans.map((s) => new Date(s.started_at).getTime() + (s.duration_ms ?? 0))) - base
-    : 0;
-
-  return (
-    <Page
-      title={short(run.id)}
-      sub={`${run.agent_name ?? "unknown agent"} · started ${new Date(run.started_at).toLocaleString()}`}
-      actions={<Button onClick={onBack}>Back to runs</Button>}
-    >
-      <div className="mb-4 flex flex-wrap items-center gap-2">
-        <StatusBadge status={run.status} />
-        {run.error_type && <Badge tone="bad">{run.error_type}</Badge>}
-        <span className="tg-nums text-sm text-ink-500">{totals.input} in / {totals.output} out</span>
-        {cost && <span className="tg-nums text-sm text-ink-500">est. {cost}</span>}
-      </div>
-      {warnings.length > 0 && (
-        <div
-          role="status"
-          className="mb-4 rounded-md border border-warn-100 bg-warn-100/50 px-3 py-2 text-sm text-warn-700"
-        >
-          <span className="font-medium">Diagnostics: </span>
-          {warnings.map((w) => w.message).join(" · ")}
-        </div>
-      )}
-      <div className="grid items-start gap-4 lg:grid-cols-2">
-        <Card className="space-y-0.5 p-2">
-          {roots.map((n) => (
-            <SpanRow key={n.span.id} node={n} depth={0} selected={selected} onSelect={setSelected} base={base} maxEnd={maxEnd} />
-          ))}
-          {roots.length === 0 && <p className="p-2 text-sm text-ink-500">No spans recorded.</p>}
-          {roots.length > 0 && (
-            <p className="px-2 py-1 text-xs text-ink-500">↑↓ moves through spans</p>
-          )}
-        </Card>
-        <div className="lg:sticky lg:top-4">
-          {selectedSpan ? (
-            <SpanDetail
-              span={selectedSpan}
-              costMicro={usageQuery.data ? costBySpan.get(selectedSpan.id) ?? null : undefined}
-            />
-          ) : (
-            <Empty hint="Select a span to inspect its timing, tokens, and error." />
-          )}
-        </div>
-      </div>
-      <div className="mt-4">
-        <Card className="space-y-3 p-4">
-          <div>
-            <h2 className="text-sm font-semibold text-ink-900">Decisions</h2>
-            <p className="text-xs text-ink-500">
-              Gateway policy decisions for this run, including blocked and approval-gated calls.
-            </p>
-          </div>
-          {decisionsQuery.isError ? (
-            <Alert>{(decisionsQuery.error as Error)?.message ?? "decisions failed to load"}</Alert>
-          ) : decisions.length === 0 ? (
-            <p className="text-sm text-ink-500">No gateway decisions recorded for this run.</p>
-          ) : (
-            <Table>
-              <thead>
-                <tr>
-                  <Th>Time</Th>
-                  <Th>Tool</Th>
-                  <Th>Decision</Th>
-                  <Th>Reason</Th>
-                  <Th>Matched rule</Th>
-                  <Th>Policy</Th>
-                  <Th>Approval</Th>
-                </tr>
-              </thead>
-              <tbody>
-                {decisions.map((d) => (
-                  <tr key={d.id}>
-                    <Td className="whitespace-nowrap">{relTime(d.timestamp)}</Td>
-                    <Td className="font-mono">{d.tool_name}</Td>
-                    <Td>
-                      <Badge tone={decisionTone(d.decision)}>{d.decision}</Badge>
-                    </Td>
-                    <Td>{d.reason ?? "—"}</Td>
-                    <Td>{(d.matched_rules ?? []).map((m) => m.name ?? m.id ?? "?").join(", ") || "—"}</Td>
-                    <Td>{d.policy_version ? `v${d.policy_version}` : "—"}</Td>
-                    <Td>
-                      {d.approval_id ? (
-                        <LinkButton onClick={() => onOpenApproval(d.approval_id!)}>
-                          open {short(d.approval_id)}
-                        </LinkButton>
-                      ) : (
-                        "—"
-                      )}
-                    </Td>
-                  </tr>
-                ))}
-              </tbody>
-            </Table>
-          )}
-        </Card>
-      </div>
-    </Page>
-  );
-}
 
 export default function App() {
   const [{ tab, runId: openRun, approvalId }, navigate] = useHashRoute();
   const [drawer, setDrawer] = useState(false);
+  const [mobileNav, setMobileNav] = useState(false);
   const queryClient = useQueryClient();
   const health = useQuery({
     queryKey: ["healthz"],
@@ -598,7 +151,19 @@ export default function App() {
     retry: false
   }).data?.pending_approvals ?? 0;
 
-  const go = (t: Tab) => navigate({ tab: t, runId: null, approvalId: null });
+  const go = (t: Tab) => {
+    setMobileNav(false);
+    navigate({ tab: t, runId: null, approvalId: null });
+  };
+
+  useEffect(() => {
+    if (!mobileNav) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMobileNav(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [mobileNav]);
 
   // Ctrl/Cmd+K opens the switcher; Escape closes it from inside.
   const [palette, setPalette] = useState(false);
@@ -632,66 +197,153 @@ export default function App() {
   }, [palette]);
 
   return (
-    <div className="flex min-h-screen">
-      <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r border-white/5 bg-gradient-to-b from-[#101528] via-[#0b0e16] to-[#07090f] text-slate-300">
-        <div className="flex items-center gap-2 px-5 pb-5 pt-6">
-          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 font-mono text-sm font-bold text-white shadow-lg shadow-brand-600/30">
+    <div className="min-h-screen lg:flex">
+      {mobileNav && (
+        <button
+          type="button"
+          aria-label="Close navigation"
+          onClick={() => setMobileNav(false)}
+          className="fixed inset-0 z-40 bg-[#090b0f]/45 backdrop-blur-[2px] lg:hidden"
+        />
+      )}
+
+      <aside
+        className={`fixed inset-y-0 left-0 z-50 flex w-[248px] shrink-0 flex-col border-r border-ink-200 bg-surface-2 px-3.5 pb-3.5 pt-4 transition-transform duration-200 lg:sticky lg:top-0 lg:h-screen lg:translate-x-0 ${
+          mobileNav ? "translate-x-0" : "-translate-x-full"
+        }`}
+      >
+        <div className="flex items-center gap-2.5 px-2 pb-5">
+          <span className="flex h-[34px] w-[34px] items-center justify-center rounded-[10px] bg-gradient-to-br from-brand-500 to-brand-700 font-mono text-[12px] font-bold text-white shadow-[0_4px_12px_rgba(79,70,229,0.28)]">
             TG
           </span>
-          <div>
-            <div className="text-[15px] font-semibold tracking-tight text-white">TraceGuard</div>
-            <div className="text-[11px] text-slate-500">agent control plane</div>
+          <div className="min-w-0">
+            <div className="text-[15px] font-semibold tracking-[-0.025em] text-ink-900">TraceGuard</div>
+            <div className="mt-px text-[11px] text-ink-400">agent control plane</div>
           </div>
-          <span className="ml-auto">
-            <ThemeToggle />
-          </span>
         </div>
-        <nav className="flex flex-col gap-0.5 px-3" aria-label="Primary">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              onClick={() => go(t.id)}
-              aria-current={tab === t.id && !openRun ? "page" : undefined}
-              className={`flex items-center gap-2.5 rounded-md px-3 py-2 text-sm transition-colors ${
-                tab === t.id && !openRun
-                  ? "bg-gradient-to-r from-brand-600/40 to-brand-600/5 font-medium text-white ring-1 ring-inset ring-brand-500/30"
-                  : "text-slate-400 hover:bg-white/5 hover:text-white"
-              }`}
-            >
-              <NavIcon name={t.id} />
-              {t.label}
-              {t.id === "approvals" && pendingApprovals > 0 && (
-                <span
-                  className="tg-nums ml-auto rounded-full bg-brand-600 px-1.5 py-0.5 text-[11px] font-medium leading-none text-white"
-                  aria-label={`${pendingApprovals} pending`}
-                >
-                  {pendingApprovals}
-                </span>
-              )}
-            </button>
+
+        <nav className="flex flex-col gap-[17px]" aria-label="Primary">
+          {NAV_GROUPS.map((group) => (
+            <div key={group.label}>
+              <div className="px-2.5 pb-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-ink-400">
+                {group.label}
+              </div>
+              <div className="flex flex-col gap-0.5">
+                {group.tabs.map((id) => {
+                  const label = tabLabel(id);
+                  const active = tab === id && !openRun;
+                  return (
+                    <button
+                      key={id}
+                      onClick={() => go(id)}
+                      aria-current={active ? "page" : undefined}
+                      className={`relative flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] transition-colors ${
+                        active
+                          ? "bg-brand-50 font-semibold text-brand-700 dark:bg-brand-500/15 dark:text-brand-300"
+                          : "text-ink-600 hover:bg-ink-100 hover:text-ink-900"
+                      }`}
+                    >
+                      <NavIcon name={id} className="h-[17px] w-[17px]" />
+                      {label}
+                      {id === "approvals" && pendingApprovals > 0 && (
+                        <span
+                          className="tg-nums ml-auto rounded-full bg-bad-700 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-white"
+                          aria-label={`${pendingApprovals} pending`}
+                        >
+                          {pendingApprovals}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           ))}
         </nav>
-        <div className="mt-auto p-4">
+
+        <div className="mt-auto flex flex-col gap-2.5">
           <button
             onClick={() => setDrawer(true)}
-            className="flex w-full items-center gap-2 rounded-md border border-white/10 px-3 py-2 text-left text-xs text-slate-400 hover:bg-white/5"
+            aria-label="Open connection settings"
+            className="flex w-full items-center gap-2.5 rounded-lg border border-ink-200 bg-surface px-2.5 py-2 text-left text-[11.5px] text-ink-500 hover:border-ink-300"
           >
             <span
-              className={`inline-block h-2 w-2 rounded-full ${
-                connected === null ? "bg-slate-500" : connected ? "bg-green-400" : "bg-red-400"
+              className={`h-2 w-2 shrink-0 rounded-full ${
+                connected === null ? "bg-ink-300" : connected ? "bg-ok-700" : "bg-bad-700"
               }`}
               aria-hidden="true"
             />
-            <span className="truncate">
-              {connected === null ? "checking API..." : connected ? settings.url : "API unreachable"}
+            <span className="min-w-0">
+              <span className="block font-medium text-ink-700">
+                {connected === null ? "Checking API" : connected ? "API connected" : "API unreachable"}
+              </span>
+              <span className="block truncate text-[10.5px] text-ink-400">{settings.url}</span>
             </span>
           </button>
+          <div className="flex items-center gap-2 px-1.5 py-1">
+            <span className="flex h-[29px] w-[29px] items-center justify-center rounded-full border border-ink-200 bg-ink-100 text-[10.5px] font-semibold text-ink-600">
+              TG
+            </span>
+            <div className="min-w-0">
+              <div className="text-[12px] font-semibold text-ink-700">Control plane</div>
+              <div className="text-[10.5px] text-ink-400">self-hosted</div>
+            </div>
+          </div>
         </div>
       </aside>
+
       <div className="min-w-0 flex-1">
+        <header className="sticky top-0 z-30 flex h-16 items-center gap-3 border-b border-ink-200 bg-ink-50/85 px-4 backdrop-blur-md lg:px-7">
+          <button
+            type="button"
+            onClick={() => setMobileNav(true)}
+            aria-label="Open navigation"
+            className="flex h-8 w-8 items-center justify-center rounded-lg text-ink-500 hover:bg-ink-100 hover:text-ink-900 lg:hidden"
+          >
+            <NavIcon name="menu" className="h-4 w-4" />
+          </button>
+          <span className="flex items-center gap-2 sm:hidden">
+            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 font-mono text-xs font-bold text-white shadow-sm shadow-brand-600/25">
+              TG
+            </span>
+            <span className="text-[13px] font-semibold tracking-tight text-ink-900">TraceGuard</span>
+          </span>
+          <div className="hidden items-center gap-1.5 text-[12.5px] text-ink-400 sm:flex">
+            <span>Workspace</span>
+            <NavIcon name="chevronRight" className="h-3 w-3" />
+            {openRun ? (
+              <>
+                <span>Runs</span>
+                <NavIcon name="chevronRight" className="h-3 w-3" />
+                <span className="font-mono font-semibold text-ink-800">{short(openRun)}</span>
+              </>
+            ) : (
+              <strong className="font-semibold text-ink-800">{tabLabel(tab)}</strong>
+            )}
+          </div>
+          <div className="flex-1" />
+          <button
+            type="button"
+            onClick={() => setPalette(true)}
+            aria-label="Open command palette"
+            className="flex h-8 items-center gap-2 rounded-lg border border-ink-200 bg-surface px-2.5 text-[12px] text-ink-400 hover:border-ink-300 hover:text-ink-600"
+          >
+            <NavIcon name="search" className="h-4 w-4" />
+            <span className="hidden md:inline">Search or jump to…</span>
+            <kbd className="ml-2 hidden rounded border border-ink-200 bg-surface-3 px-1.5 py-0.5 font-mono text-[10px] text-ink-400 md:inline">
+              Ctrl K
+            </kbd>
+          </button>
+          <ThemeToggle />
+        </header>
+
         <main>
           {tab === "overview" ? (
-            <OverviewView />
+            <OverviewView
+              onNavigate={go}
+              onOpenRun={(id) => navigate({ tab: "runs", runId: id, approvalId: null })}
+              onOpenApproval={(id) => navigate({ tab: "approvals", runId: null, approvalId: id })}
+            />
           ) : tab === "evals" ? (
             <EvalsView onOpenRun={(id) => navigate({ tab: "runs", runId: id, approvalId: null })} />
           ) : tab === "policy" ? (
@@ -714,15 +366,20 @@ export default function App() {
               runId={openRun}
               onBack={() => navigate({ tab: "runs", runId: null, approvalId: null })}
               onOpenApproval={(id) => navigate({ tab: "approvals", runId: null, approvalId: id })}
+              onOpenPolicy={() => navigate({ tab: "policy", runId: null, approvalId: null })}
             />
           ) : (
-            <RunsList onOpen={(id) => navigate({ tab: "runs", runId: id, approvalId: null })} />
+            <RunsView onOpen={(id) => navigate({ tab: "runs", runId: id, approvalId: null })} />
           )}
         </main>
       </div>
+
       <Palette open={palette} onClose={() => setPalette(false)} items={paletteItems} />
-      <ConnectionDrawer open={drawer} onClose={() => setDrawer(false)}
-        onSaved={() => queryClient.invalidateQueries()} />
+      <ConnectionDrawer
+        open={drawer}
+        onClose={() => setDrawer(false)}
+        onSaved={() => queryClient.invalidateQueries()}
+      />
     </div>
   );
 }

@@ -11,7 +11,7 @@ const TABS: readonly string[] = ["overview", "runs", "evals", "policy", "approva
 
 export function parseRoute(hash: string): Route {
   const parts = hash.replace(/^#\/?/, "").split("/").filter(Boolean);
-  const tab = (TABS.includes(parts[0] ?? "") ? parts[0] : "runs") as Tab;
+  const tab = (TABS.includes(parts[0] ?? "") ? parts[0] : "overview") as Tab;
   return {
     tab,
     runId: tab === "runs" && parts[1] ? decodeURIComponent(parts[1]) : null,
@@ -28,7 +28,7 @@ export function formatRoute(route: Route): string {
 
 export function useHashRoute(): [Route, (route: Route) => void] {
   const [route, setRoute] = useState<Route>(() =>
-    typeof window === "undefined" ? { tab: "runs", runId: null, approvalId: null } : parseRoute(window.location.hash)
+    typeof window === "undefined" ? { tab: "overview", runId: null, approvalId: null } : parseRoute(window.location.hash)
   );
   useEffect(() => {
     const onChange = () => setRoute(parseRoute(window.location.hash));

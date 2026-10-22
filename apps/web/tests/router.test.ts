@@ -4,9 +4,9 @@ import { formatRoute, parseRoute, type Route } from "../src/router";
 // Hash routes are the app's only deep-link surface: a wrong parse silently
 // drops the user on the wrong screen, so every shape gets a case.
 describe("hash routes", () => {
-  it("defaults to the runs list on an empty hash", () => {
-    expect(parseRoute("")).toEqual({ tab: "runs", runId: null, approvalId: null });
-    expect(parseRoute("#")).toEqual({ tab: "runs", runId: null, approvalId: null });
+  it("defaults to the overview on an empty hash", () => {
+    expect(parseRoute("")).toEqual({ tab: "overview", runId: null, approvalId: null });
+    expect(parseRoute("#")).toEqual({ tab: "overview", runId: null, approvalId: null });
   });
 
   it("parses every top-level tab", () => {
@@ -23,8 +23,8 @@ describe("hash routes", () => {
     expect(parseRoute("#/approvals/appr_abc123")).toEqual({ tab: "approvals", runId: null, approvalId: "appr_abc123" });
   });
 
-  it("falls back to runs for an unknown tab", () => {
-    expect(parseRoute("#/nope")).toEqual({ tab: "runs", runId: null, approvalId: null });
+  it("falls back to the overview for an unknown tab", () => {
+    expect(parseRoute("#/nope")).toEqual({ tab: "overview", runId: null, approvalId: null });
   });
 
   it("formats routes back into hashes", () => {

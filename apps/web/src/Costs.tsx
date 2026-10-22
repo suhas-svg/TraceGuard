@@ -76,7 +76,7 @@ function BudgetUtilization() {
     >
       <div className="flex flex-col gap-3">
         {items.map((b) => {
-          const used = b.spent_micro + b.reserved_micro;
+          const used = Number(b.spent_micro) + Number(b.reserved_micro);
           const pct = b.limit_micro > 0 ? used / b.limit_micro : 0;
           const color = pct >= 1 ? "var(--color-bad-700)" : pct >= 0.8 ? "var(--color-warn-700)" : "var(--color-ok-700)";
           return (

@@ -22,7 +22,7 @@ export function Button({ variant = "secondary", size = "md", className = "", ...
   const sizes = { sm: "px-2.5 py-1 text-xs", md: "px-3 py-1.5 text-sm" };
   return (
     <button
-      className={`inline-flex items-center gap-1.5 rounded-md font-medium transition-colors disabled:cursor-not-allowed ${variants[variant]} ${sizes[size]} ${className}`}
+      className={`inline-flex items-center gap-1.5 rounded-lg font-medium transition-colors disabled:cursor-not-allowed ${variants[variant]} ${sizes[size]} ${className}`}
       {...rest}
     />
   );
@@ -73,7 +73,7 @@ export function StatusBadge({ status }: { status: string }) {
 // ---------- Forms ----------
 
 const inputCls =
-  "rounded-md border border-ink-200 bg-surface px-2.5 py-1.5 text-sm text-ink-800 placeholder:text-ink-300 focus:border-brand-400";
+  "rounded-lg border border-ink-200 bg-surface px-2.5 py-1.5 text-sm text-ink-800 placeholder:text-ink-400 focus:border-brand-400 focus:outline-none focus:ring-2 focus:ring-brand-500/15";
 
 export function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
   return <input {...props} className={`${inputCls} ${props.className ?? ""}`} />;
@@ -94,18 +94,24 @@ export function Field({ label, children }: { label: string; children: ReactNode 
 
 // ---------- Layout ----------
 
-export function Page({ title, sub, actions, children }: {
-  title: string;
+export function Page({ title, sub, eyebrow, actions, children }: {
+  title: ReactNode;
   sub?: string;
+  eyebrow?: string;
   actions?: ReactNode;
   children: ReactNode;
 }) {
   return (
-    <div className="mx-auto max-w-6xl p-6">
-      <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
+    <div className="mx-auto max-w-[1480px] px-6 py-7 lg:px-8 lg:py-9">
+      <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h2 className="text-xl font-semibold tracking-tight text-ink-900">{title}</h2>
-          {sub && <p className="mt-0.5 text-sm text-ink-500">{sub}</p>}
+          {eyebrow && (
+            <div className="mb-1.5 text-[10.5px] font-semibold uppercase tracking-[0.09em] text-ink-400">
+              {eyebrow}
+            </div>
+          )}
+          <h1 className="text-[30px] font-semibold leading-[1.12] tracking-[-0.035em] text-ink-900">{title}</h1>
+          {sub && <p className="mt-1.5 max-w-2xl text-[13.5px] leading-5 text-ink-500">{sub}</p>}
         </div>
         {actions && <div className="flex items-center gap-2">{actions}</div>}
       </div>
@@ -116,7 +122,7 @@ export function Page({ title, sub, actions, children }: {
 
 export function Card({ children, className = "" }: { children: ReactNode; className?: string }) {
   return (
-    <div className={`rounded-lg border border-ink-200 bg-surface shadow-[0_1px_2px_rgba(20,24,36,0.05)] ${className}`}>
+    <div className={`rounded-xl border border-ink-200 bg-surface shadow-[0_1px_2px_rgba(20,22,18,0.04)] ${className}`}>
       {children}
     </div>
   );
@@ -132,7 +138,7 @@ export function Alert({ children }: { children: ReactNode }) {
 
 export function Empty({ hint, action }: { hint: string; action?: ReactNode }) {
   return (
-    <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed border-ink-200 bg-surface px-6 py-10 text-center">
+    <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-ink-200 bg-surface px-6 py-10 text-center">
       <p className="text-sm text-ink-500">{hint}</p>
       {action}
     </div>
@@ -177,22 +183,24 @@ const statTones: Record<string, string> = {
 
 // Overview number. Pass onClick and it becomes a filter button with a pressed
 // state, so a KPI can drive the list beneath it.
-export function Stat({ label, value, hint, tone = "default", active = false, onClick }: {
+export function Stat({ label, value, hint, tone = "default", active = false, onClick, children }: {
   label: string;
   value: ReactNode;
   hint?: string;
   tone?: keyof typeof statTones;
   active?: boolean;
   onClick?: () => void;
+  children?: ReactNode;
 }) {
   const body = (
     <>
-      <div className="text-xs font-medium text-ink-500">{label}</div>
-      <div className={`tg-nums mt-1 text-2xl font-semibold tracking-tight ${statTones[tone]}`}>{value}</div>
-      {hint && <div className="mt-0.5 text-xs text-ink-500">{hint}</div>}
+      <div className="text-[11.5px] font-medium text-ink-500">{label}</div>
+      <div className={`tg-nums mt-1.5 text-[27px] font-semibold leading-[1.1] tracking-[-0.04em] ${statTones[tone]}`}>{value}</div>
+      {hint && <div className="mt-1 text-[11px] text-ink-500">{hint}</div>}
+      {children && <div className="mt-auto pt-2">{children}</div>}
     </>
   );
-  const base = "rounded-lg border bg-surface px-4 py-3 text-left shadow-[0_1px_2px_rgba(20,24,36,0.05)]";
+  const base = "flex h-full flex-col rounded-xl border bg-surface px-4 py-4 text-left shadow-[0_1px_2px_rgba(20,22,18,0.04)]";
   if (!onClick) return <div className={`${base} border-ink-200`}>{body}</div>;
   return (
     <button
@@ -216,14 +224,14 @@ export function Segmented<T extends string>({ options, value, onChange, label }:
 }) {
   return (
     <div role="group" aria-label={label}
-      className="inline-flex rounded-md border border-ink-200 bg-surface p-0.5 shadow-sm">
+      className="inline-flex rounded-lg border border-ink-200 bg-surface-3 p-0.5">
       {options.map((o) => (
         <button
           key={o.value}
           onClick={() => onChange(o.value)}
           aria-pressed={value === o.value}
-          className={`rounded-[5px] px-3 py-1.5 text-xs font-medium transition-colors ${
-            value === o.value ? "bg-ink-800 text-ink-50 shadow-sm" : "text-ink-500 hover:text-ink-800"
+          className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+            value === o.value ? "bg-surface text-ink-900 shadow-sm ring-1 ring-ink-200/70" : "text-ink-500 hover:text-ink-900"
           }`}
         >
           {o.label}
@@ -236,7 +244,7 @@ export function Table({ children }: { children: ReactNode }) {
   return (
     <Card className="overflow-hidden">
       {/* Own scroll region so the header row stays put while a long table scrolls. */}
-      <div className="max-h-[70vh] overflow-auto overscroll-contain">
+      <div className="max-h-[72vh] overflow-auto overscroll-contain">
         <table className="tg-nums w-full border-collapse text-sm">{children}</table>
       </div>
     </Card>
@@ -252,7 +260,7 @@ export function Th({ children, className = "", onSort, sorted }: {
   return (
     <th
       aria-sort={onSort ? (sorted === "asc" ? "ascending" : sorted === "desc" ? "descending" : "none") : undefined}
-      className={`sticky top-0 z-10 border-b border-ink-200 bg-ink-50 px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-ink-500 ${className}`}
+      className={`sticky top-0 z-10 border-b border-ink-200 bg-surface-2 px-3 py-2 text-left text-[10.5px] font-semibold uppercase tracking-[0.07em] text-ink-500 ${className}`}
     >
       {onSort ? (
         <button
@@ -272,7 +280,7 @@ export function Th({ children, className = "", onSort, sorted }: {
 }
 
 export function Td({ children, className = "", title }: { children?: ReactNode; className?: string; title?: string }) {
-  return <td title={title} className={`border-b border-ink-100 px-3 py-2 align-top last:border-0 ${className}`}>{children}</td>;
+  return <td title={title} className={`border-b border-ink-100 px-3 py-2.5 align-middle last:border-0 ${className}`}>{children}</td>;
 }
 
 export function LinkButton({ children, onClick }: { children: ReactNode; onClick: () => void }) {
@@ -295,7 +303,27 @@ const paths: Record<string, string> = {
   retention: "M4 7h16M9 7V5h6v2m-8 0l1 13h8l1-13",
   costs: "M12 3v18M7 7h7a3 3 0 010 6H9a3 3 0 000 6h8",
   users: "M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8M22 21v-2a4 4 0 00-3-3.9M16 3.1a4 4 0 010 7.8",
-  connect: "M9 17a4 4 0 010-8 6 6 0 0111.6 1.6A4 4 0 0118 17H9z"
+  connect: "M9 17a4 4 0 010-8 6 6 0 0111.6 1.6A4 4 0 0118 17H9z",
+  search: "M21 21l-4.3-4.3M11 18a7 7 0 100-14 7 7 0 000 14z",
+  menu: "M4 6h16M4 12h16M4 18h16",
+  close: "M18 6L6 18M6 6l12 12",
+  chevronRight: "M9 18l6-6-6-6",
+  chevronDown: "M6 9l6 6 6-6",
+  clock: "M12 21a9 9 0 100-18 9 9 0 000 18zM12 7v5l3 2",
+  alert: "M12 3l9.5 17H2.5L12 3zM12 9v4M12 17h.01",
+  check: "M20 6L9 17l-5-5",
+  bell: "M18 8a6 6 0 00-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M13.7 21a2 2 0 01-3.4 0",
+  refresh: "M20 11a8 8 0 10-2.3 5.7M20 4v7h-7",
+  download: "M12 3v12M7 10l5 5 5-5M5 21h14",
+  filter: "M3 5h18M6 12h12M10 19h4",
+  arrowRight: "M5 12h14M12 5l7 7-7 7",
+  arrowLeft: "M19 12H5M12 19l-7-7 7-7",
+  tool: "M14.7 6.3a4 4 0 00-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 005.4-5.4l-2.5 2.5-3-3 2.5-2.5z",
+  calendar: "M3 5h18v16H3zM16 3v4M8 3v4M3 11h18",
+  more: "M5 12h.01M12 12h.01M19 12h.01",
+  eye: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 15a3 3 0 100-6 3 3 0 000 6z",
+  copy: "M9 9h11v11H9zM5 15H4V4h11v1",
+  model: "M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3zM12 12l8-4.5M12 12v9M12 12L4 7.5"
 };
 
 export function NavIcon({ name, className = "h-4 w-4" }: { name: string; className?: string }) {
