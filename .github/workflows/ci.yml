@@ -88,7 +88,7 @@ jobs:
         run: node tests/faults/run.mjs
       - name: OAuth clean-clone run
         run: node tests/oauth/clean-run.mjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: sbom.cdx.json
@@ -154,7 +154,7 @@ jobs:
       - run: ./node_modules/.bin/tsc -p packages/audit-chain/tsconfig.json
       - run: npm run build -w apps/api -w apps/web
       - run: npx playwright test --config tests/e2e/playwright.config.ts
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: playwright-report
