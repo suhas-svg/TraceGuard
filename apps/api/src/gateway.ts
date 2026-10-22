@@ -622,8 +622,12 @@ export function buildGateway() {
       // re-evaluation, the claim and the execution-intent audit event.
       if (parsed.data.approval_id) {
         await client.query("BEGIN");
+        // No SELECT ... FOR UPDATE here: PostgreSQL requires UPDATE privilege
+        // for that lock, and the gateway deliberately has none on approvals.
+        // The claim/execute CAS inside approval_transition is the serialization
+        // point, so concurrent retries still cannot both dispatch.
         const ap = await client.query(
-          "SELECT *, (expires_at < now()) AS ttl_expired FROM approvals WHERE id = $1 FOR UPDATE",
+          "SELECT *, (expires_at < now()) AS ttl_expired FROM approvals WHERE id = $1",
           [parsed.data.approval_id]
         );
         if (!ap.rows[0]) {
@@ -1356,9 +1360,11 @@ export function registerApprovalControlRoutes(app: FastifyInstance): void {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      // Locked for the rest of the decision: the expiry check and the status
-      // transition cannot be interleaved with a concurrent decide or consume.
-      const ap = await client.query("SELECT * FROM approvals WHERE id = $1 FOR UPDATE", [id]);
+      // The read is unlocked because gateway_runtime has SELECT but not UPDATE
+      // on approvals, and PostgreSQL requires UPDATE privilege for
+      // SELECT ... FOR UPDATE. approval_decide below performs the compare-and-
+      // swap from pending, so a concurrent decision still loses cleanly.
+      const ap = await client.query("SELECT * FROM approvals WHERE id = $1", [id]);
       if (!ap.rows[0]) {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "approval_not_found" });
