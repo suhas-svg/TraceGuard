@@ -26,16 +26,16 @@ export function registerUserRoutes(app: FastifyInstance) {
       // The bootstrap is first-come-only, so the check and the insert have to
       // be one serialized unit: without the lock two concurrent registrations
       // on a fresh install both read an empty table and both become admin.
-      await client.query("LOCK TABLE users IN EXCLUSIVE MODE");
-      const count = await client.query("SELECT COUNT(*) AS n FROM users");
-      if (Number(count.rows[0].n) > 0) {
+      // The lock and insert live in a SECURITY DEFINER procedure because
+      // api_runtime no longer has direct write access to identity tables.
+      const created = await client.query(
+        "SELECT * FROM identity_bootstrap($1, $2)",
+        [parsed.data.email.toLowerCase(), hashPassword(parsed.data.password)]
+      );
+      if (!created.rows[0]) {
         await client.query("ROLLBACK");
         return reply.code(403).send({ error: "registration_closed" });
       }
-      const created = await client.query(
-        "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, 'admin') RETURNING id, email, role",
-        [parsed.data.email.toLowerCase(), hashPassword(parsed.data.password)]
-      );
       await client.query("COMMIT");
       await audit(pool, { actor_type: "system", action: "user.bootstrap",
         resource_type: "user", resource_id: created.rows[0].id, result: "success", metadata: {} });
@@ -65,8 +65,7 @@ export function registerUserRoutes(app: FastifyInstance) {
     const { plaintext, hash } = newKey();
     const expires = new Date(Date.now() + 24 * 3600000);
     await pool.query(
-      `INSERT INTO api_keys (user_id, name, key_hash, scopes, expires_at)
-       VALUES ($1, 'login', $2, $3, $4)`,
+      "SELECT identity_create_login_key($1, $2, $3::jsonb, $4)",
       [user.id, hash, JSON.stringify(ROLE_SCOPES[user.role] ?? []), expires.toISOString()]
     );
     return { token: plaintext, expires_at: expires.toISOString(), role: user.role };
@@ -103,10 +102,12 @@ export function registerUserRoutes(app: FastifyInstance) {
     }
     const presented = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
     const keyHash = createHash("sha256").update(presented).digest("hex");
-    const deleted = await pool.query("DELETE FROM api_keys WHERE key_hash = $1 RETURNING id", [keyHash]);
+    const deleted = await pool.query(
+      "SELECT identity_revoke_key_by_hash($1) AS id", [keyHash]);
+    const revokedId = deleted.rows[0]?.id ?? null;
     await audit(pool, { actor_type: "user", actor_id: p.userId ?? undefined, action: "key.logout",
-      resource_type: "api_key", resource_id: deleted.rows[0]?.id ?? "", result: "success", metadata: {} });
-    return { ok: true, revoked: (deleted.rowCount ?? 0) > 0 };
+      resource_type: "api_key", resource_id: revokedId ?? "", result: "success", metadata: {} });
+    return { ok: true, revoked: revokedId !== null };
   });
 
   app.post("/v1/users", async (req, reply) => {
@@ -121,7 +122,7 @@ export function registerUserRoutes(app: FastifyInstance) {
     }
     try {
       const created = await pool.query(
-        "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role, created_at",
+        "SELECT * FROM identity_create_user($1, $2, $3)",
         [parsed.data.email.toLowerCase(), hashPassword(parsed.data.password), parsed.data.role]
       );
       await audit(pool, { actor_type: "user",
@@ -187,8 +188,7 @@ export function registerUserRoutes(app: FastifyInstance) {
     const { plaintext, hash } = newKey();
     const expires = new Date(Date.now() + parsed.data.expires_days * 86400000);
     const created = await pool.query(
-      `INSERT INTO api_keys (user_id, name, key_hash, scopes, workspace_id, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, scopes, workspace_id, expires_at, created_at`,
+      `SELECT * FROM identity_create_key($1, $2, $3, $4::jsonb, $5, $6)`,
       [owner.rows[0].id, parsed.data.name, hash,
        JSON.stringify(scopes), pin, expires.toISOString()]
     );
@@ -202,9 +202,9 @@ export function registerUserRoutes(app: FastifyInstance) {
 
   app.delete("/v1/users/:id/keys/:keyId", async (req, reply) => {
     const p = req.params as { id: string; keyId: string };
-    const del = await pool.query("DELETE FROM api_keys WHERE id = $1 AND user_id = $2",
+    const del = await pool.query("SELECT identity_revoke_key($1, $2) AS found",
       [p.keyId, p.id]);
-    if (del.rowCount === 0) return reply.code(404).send({ error: "no_key" });
+    if (!del.rows[0]?.found) return reply.code(404).send({ error: "no_key" });
     await audit(pool, { actor_type: "user",
       actor_id: req.principal?.userId ?? undefined, action: "key.revoke",
       resource_type: "api_key", resource_id: p.keyId, result: "success", metadata: {} });
@@ -221,7 +221,7 @@ export function registerUserRoutes(app: FastifyInstance) {
       [parsed.data.workspace_id]);
     if (!ws.rows[0]) return reply.code(404).send({ error: "no_workspace" });
     try {
-      await pool.query("INSERT INTO memberships (user_id, workspace_id) VALUES ($1, $2)",
+      await pool.query("SELECT identity_grant_membership($1, $2)",
         [p.id, parsed.data.workspace_id]);
     } catch {
       return reply.code(409).send({ error: "already_member" });
@@ -236,8 +236,8 @@ export function registerUserRoutes(app: FastifyInstance) {
   app.delete("/v1/users/:id/memberships/:workspaceId", async (req, reply) => {
     const p = req.params as { id: string; workspaceId: string };
     const del = await pool.query(
-      "DELETE FROM memberships WHERE user_id = $1 AND workspace_id = $2", [p.id, p.workspaceId]);
-    if (del.rowCount === 0) return reply.code(404).send({ error: "no_membership" });
+      "SELECT identity_revoke_membership($1, $2) AS found", [p.id, p.workspaceId]);
+    if (!del.rows[0]?.found) return reply.code(404).send({ error: "no_membership" });
     await audit(pool, { actor_type: "user",
       actor_id: req.principal?.userId ?? undefined, action: "membership.revoke",
       resource_type: "user", resource_id: p.id,

@@ -14,7 +14,7 @@ afterAll(async () => {
   await pool.end();
 });
 
-const ROLES = ["api_runtime", "gateway_runtime", "policy_publisher", "retention_job", "approval_owner", "policy_owner", "audit_owner", "migration_owner"];
+const ROLES = ["api_runtime", "gateway_runtime", "policy_publisher", "retention_job", "approval_owner", "policy_owner", "audit_owner", "identity_owner", "migration_owner"];
 
 async function asRole<T>(role: string, fn: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
@@ -48,7 +48,7 @@ async function attempt(client: PoolClient, db: () => Promise<unknown>): Promise<
 const DENIED = "42501";
 
 describe("least-privilege database roles", () => {
-  it("creates all eight roles, none privileged, and the owner roles can never log in", async () => {
+  it("creates all nine roles, none privileged, and the owner roles can never log in", async () => {
     const res = await pool.query<{ rolname: string; rolcanlogin: boolean; rolsuper: boolean }>(
       "SELECT rolname, rolcanlogin, rolsuper FROM pg_roles WHERE rolname = ANY($1)",
       [ROLES]
@@ -60,7 +60,8 @@ describe("least-privilege database roles", () => {
     // asserts only what must always hold: the owner identities cannot connect.
     for (const row of res.rows) {
       if (row.rolname === "audit_owner" || row.rolname === "migration_owner" ||
-          row.rolname === "approval_owner" || row.rolname === "policy_owner") {
+          row.rolname === "approval_owner" || row.rolname === "policy_owner" ||
+          row.rolname === "identity_owner") {
         expect(row.rolcanlogin).toBe(false);
       }
     }
@@ -78,6 +79,43 @@ describe("least-privilege database roles", () => {
       "SELECT pg_get_userbyid(proowner) AS owner FROM pg_proc WHERE proname = 'append_audit_event'"
     );
     expect(fn.rows[0]?.owner).toBe("audit_owner");
+  });
+
+  it("owns the identity procedures from a non-login role", async () => {
+    const fns = await pool.query<{ proname: string; owner: string }>(
+      `SELECT proname, pg_get_userbyid(proowner) AS owner
+         FROM pg_proc
+        WHERE proname LIKE 'identity_%'
+        ORDER BY proname`
+    );
+    expect(fns.rows.map((r) => r.proname)).toEqual([
+      "identity_bootstrap", "identity_create_key", "identity_create_login_key",
+      "identity_create_user", "identity_grant_membership", "identity_revoke_key",
+      "identity_revoke_key_by_hash", "identity_revoke_membership", "identity_touch_key"
+    ]);
+    for (const fn of fns.rows) expect(fn.owner).toBe("identity_owner");
+  });
+
+  it("api_runtime cannot mint identity rows but can execute the narrow procedures", async () => {
+    await asRole("api_runtime", async (c) => {
+      expect(await attempt(c, () => c.query(
+        "INSERT INTO users (email, password_hash, role) VALUES ('nfr008@example.invalid', 'h', 'admin')"
+      ))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("UPDATE users SET role = role WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("DELETE FROM users WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query(
+        "INSERT INTO api_keys (user_id, name, key_hash) VALUES (gen_random_uuid(), 'k', 'h')"
+      ))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("UPDATE api_keys SET scopes = scopes WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("DELETE FROM api_keys WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query(
+        "INSERT INTO memberships (user_id, workspace_id) VALUES (gen_random_uuid(), gen_random_uuid())"
+      ))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("DELETE FROM memberships WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query(
+        "SELECT identity_bootstrap('probe@example.invalid', 'h')"
+      ))).toBe("ok");
+    });
   });
 
   it("api_runtime cannot alter signed policy, trust state, audit, or approvals", async () => {
@@ -107,7 +145,6 @@ describe("least-privilege database roles", () => {
       expect(await attempt(c, () => c.query("UPDATE policies SET name = name WHERE false"))).toBe("ok");
       expect(await attempt(c, () => c.query("UPDATE mcp_servers SET name = name WHERE false"))).toBe("ok");
       expect(await attempt(c, () => c.query("UPDATE server_tools SET quarantined = quarantined WHERE false"))).toBe("ok");
-      expect(await attempt(c, () => c.query("UPDATE users SET role = role WHERE false"))).toBe("ok");
     });
   });
 

@@ -971,6 +971,29 @@ describe("integration and security", () => {
     expect(row.rows[0].reserved).toBe(0);
   });
 
+  it("caps a measured settlement at the reserved maximum", async () => {
+    const budget = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: randomUUID(), limit_micro: 1000000, effect: "block" } });
+    const budgetId = budget.json().id;
+    const reserve = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+      payload: { budget_id: budgetId, max_cost_micro: 500 } });
+    expect(reserve.statusCode).toBe(200);
+    const settled = await api.inject({ method: "POST", url: "/v1/budgets/settle", headers: key,
+      payload: { reservation_id: reserve.json().reservation_id, actual_cost_micro: 5000 } });
+    expect(settled.statusCode).toBe(200);
+    // The reservation authorized 500; a larger reported cost cannot move more.
+    expect(settled.json().actual_cost_micro).toBe(500);
+    const row = await pool.query(
+      `SELECT b.spent_micro::float8 AS spent, b.reserved_micro::float8 AS reserved,
+              COALESCE(SUM(l.amount_micro), 0)::float8 AS ledger
+         FROM budgets b LEFT JOIN budget_ledger l ON l.budget_id = b.id
+        WHERE b.id = $1 GROUP BY b.id`,
+      [budgetId]);
+    expect(row.rows[0].spent).toBe(500);
+    expect(row.rows[0].reserved).toBe(0);
+    expect(row.rows[0].ledger).toBe(500);
+  });
+
   it("redacts secrets at ingest and withholds raw content unless capture is on", async () => {
     const secret = `sk-live-${randomUUID().replace(/-/g, "")}`;
     const runId = randomUUID();
@@ -1376,6 +1399,12 @@ describe("integration and security", () => {
     expect(mine.statusCode).toBe(200);
     expect(mine.json()).toMatchObject({ kind: "user", email });
     expect(mine.json().scopes).toEqual(expect.arrayContaining(["read", "ingest", "gateway"]));
+    // Auth still records last use, but through identity_owner rather than a
+    // direct api_runtime UPDATE on api_keys.
+    const touched = await pool.query(
+      `SELECT k.last_used_at FROM api_keys k JOIN users u ON u.id = k.user_id
+        WHERE u.email = $1 ORDER BY k.created_at DESC LIMIT 1`, [email]);
+    expect(touched.rows[0]?.last_used_at).not.toBeNull();
     const out = await api.inject({ method: "POST", url: "/v1/auth/logout", headers: bearer });
     expect(out.statusCode).toBe(200);
     expect(out.json().ok).toBe(true);

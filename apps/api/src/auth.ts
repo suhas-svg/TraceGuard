@@ -279,7 +279,7 @@ export async function resolvePrincipal(
   const projects = row.role === "admin"
     ? "all"
     : await projectIdsForWorkspaces(pool, workspaces);
-  await pool.query("UPDATE api_keys SET last_used_at = now() WHERE key_hash = $1", [hash])
+  await pool.query("SELECT identity_touch_key($1)", [hash])
     .catch(() => undefined);
   return {
     kind: "user", userId: row.user_id, scopes, workspaces, projects,
