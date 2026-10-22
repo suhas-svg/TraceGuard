@@ -359,10 +359,16 @@ export async function authHook(req: FastifyRequest, reply: FastifyReply): Promis
   // §7.3: in production the gateway maps an OAuth subject to a provisioned,
   // project-scoped AgentPrincipal. A valid token that was never provisioned
   // authenticates as a person elsewhere but cannot act as an MCP caller.
+  // Server discovery stays available; tool listing and execution do not.
+  const mcpBody = req.body && typeof req.body === "object" && !Array.isArray(req.body)
+    ? req.body as { method?: unknown }
+    : null;
+  const mcpMethod = req.headers["mcp-method"] ?? mcpBody?.method;
+  const mcpAction = req.url.startsWith("/mcp") && mcpMethod !== "server/discover";
   if (
     principal.kind === "oauth" &&
     process.env.NODE_ENV === "production" &&
-    (req.url.startsWith("/mcp") || req.url.startsWith("/v1/gateway")) &&
+    (mcpAction || req.url.startsWith("/v1/gateway")) &&
     !principal.agentPrincipalId
   ) {
     return reply.code(403).send({ error: "agent_principal_required" }) as unknown as void;

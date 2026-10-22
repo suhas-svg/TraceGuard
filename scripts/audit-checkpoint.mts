@@ -18,7 +18,6 @@
 // that anchor was signed by a different key (key rotation needs a trusted key
 // history first).
 import { readFileSync, writeFileSync } from "node:fs";
-import { createPublicKey, type KeyObject } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
 import {
   appendAuditEvent, checkpointKeyId, signCheckpoint, verifyAuditChain,
@@ -67,11 +66,6 @@ function publicKey(): string {
   if (pem) return pem;
   console.error("provide --public-key <public.pem> or AUDIT_CHECKPOINT_PUBLIC_KEY_FILE");
   process.exit(2);
-}
-
-function publicPemFromPrivate(pem: string): string {
-  const key: KeyObject = createPublicKey(pem);
-  return key.export({ type: "spki", format: "pem" }).toString();
 }
 
 const SELECT_EVENTS = `

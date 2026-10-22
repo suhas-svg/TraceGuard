@@ -7,7 +7,6 @@ import { pool } from "./db.js";
 import { audit, type AuditEntry } from "./audit.js";
 import { projectAllowed, projectClause } from "./project-scope.js";
 import { verifyAuditChain, verifyCheckpoint, type CheckpointPayload } from "@traceguard/audit-chain";
-import { argConditionsSchema, hasPathWithin } from "@traceguard/schemas";
 import {
   argsHash,
   evaluate,
@@ -17,11 +16,11 @@ import {
   stableStringify
 } from "./policy.js";
 import { loadActivePolicy, rulesFromBundle } from "./policy-bundle.js";
-import { callUpstreamTool, checkUpstreamUrlResolved, definitionHash, definitionIssue, discoverTools, pinnedDefinition } from "./upstream.js";
+import { callUpstreamTool, checkUpstreamUrlResolved } from "./upstream.js";
 import { hashesEqual, parseKey, seal, tryOpen } from "./seal.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
 import { assertProductionAuth, oauthConfigFromEnv, protectedResourceMetadata } from "./oauth.js";
-import { gatewayAlias, registerMcpRoutes } from "./mcp.js";
+import { registerMcpRoutes } from "./mcp.js";
 import { notify } from "./notify.js";
 import { captureRawEnabled, redactDeep, summarizeArgs } from "./redact.js";
 

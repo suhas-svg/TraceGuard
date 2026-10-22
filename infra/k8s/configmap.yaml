@@ -8,12 +8,12 @@ data:
   GATEWAY_PORT: "8091"
   # §9: human approval queue/decisions listen here, away from the agent port.
   GATEWAY_CONTROL_PORT: "8093"
-  APPROVAL_TTL_SECONDS: "300"
+  CONTROL_API_URL: "http://api:8080"
+  APPROVAL_TTL_SECONDS: "900"
   APPROVAL_CLAIM_LEASE_SECONDS: "30"
-  # §10.3/FR-019: checkpoint signing material for the gateway. Empty by
-  # default; fill from the operator host. Unset -> checkpoint endpoints
-  # answer 503 and pruning is refused.
-  AUDIT_CHECKPOINT_KEY: ""
+  # §10.2/FR-019: the gateway verifies operator-signed checkpoints but never
+  # signs them. The private key stays on the operator host and is used by
+  # `npm run audit:checkpoint`; only the public key is mounted here.
   AUDIT_CHECKPOINT_PUBLIC_KEY: ""
   ALLOW_PRIVATE_UPSTREAMS: "false"
   DASHBOARD_ORIGIN: "http://localhost:5173"

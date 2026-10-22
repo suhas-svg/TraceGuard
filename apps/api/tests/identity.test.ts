@@ -248,12 +248,13 @@ describe("identity model", () => {
       expect(afterDisable.statusCode).toBe(200);
       expect(afterDisable.json().agent_principal_id).toBeNull();
 
-      // Production refuses a valid token with no active principal on the MCP
-      // surface instead of treating it as a person or an unprovisioned agent.
+      // Production refuses a valid token with no active principal before it
+      // can list or call tools, instead of treating it as a person or an
+      // unprovisioned agent. Discovery remains available.
       process.env.NODE_ENV = "production";
       const blocked = await api.inject({
         method: "POST", url: "/mcp", headers: oauth,
-        payload: { jsonrpc: "2.0", id: 1, method: "server/discover", params: {} }
+        payload: { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }
       });
       expect(blocked.statusCode).toBe(403);
       expect(blocked.json().error).toBe("agent_principal_required");
