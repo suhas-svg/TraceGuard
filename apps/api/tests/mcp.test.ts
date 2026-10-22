@@ -72,7 +72,7 @@ describe("MCP streamable HTTP gateway", () => {
     await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
     const port = (httpServer.address() as { port: number }).port;
 
-    const reg = await gw.inject({
+    const reg = await api.inject({
       method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `mcp-${tag}`, base_url: `http://127.0.0.1:${port}/mcp` }
     });
@@ -81,12 +81,12 @@ describe("MCP streamable HTTP gateway", () => {
     alias = reg.json().gateway_alias as string;
     expect(alias).toMatch(/^[a-z0-9_]+$/);
 
-    const disc = await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     expect(disc.statusCode).toBe(200);
     expect(hits.echo).toBe(0);
 
     for (const [tool, effect] of [["echo", "allow"], ["hold", "require_approval"], ["wipe", "deny"]] as const) {
-      const r = await gw.inject({
+      const r = await api.inject({
         method: "POST", url: "/v1/policies", headers: key,
         payload: { name: `mcp-${tool}-${tag}`, server_id: serverId, tool_name: tool, effect }
       });
@@ -353,7 +353,7 @@ describe("MCP streamable HTTP gateway", () => {
       await new Promise<void>((resolve) => rawHttp.listen(0, "127.0.0.1", resolve));
       const port = (rawHttp.address() as { port: number }).port;
 
-      const reg = await gw.inject({
+      const reg = await api.inject({
         method: "POST", url: "/v1/servers", headers: key,
         payload: { name: `raw-${tag}`, base_url: `http://127.0.0.1:${port}/mcp` }
       });
@@ -361,11 +361,11 @@ describe("MCP streamable HTTP gateway", () => {
       rawServerId = reg.json().id as string;
       rawAlias = reg.json().gateway_alias as string;
 
-      const disc = await gw.inject({ method: "POST", url: `/v1/servers/${rawServerId}/discover`, headers: key });
+      const disc = await api.inject({ method: "POST", url: `/v1/servers/${rawServerId}/discover`, headers: key });
       expect(disc.statusCode).toBe(200);
 
       for (const name of [...shapes.map((s) => s.tool), "workflow"]) {
-        const r = await gw.inject({
+        const r = await api.inject({
           method: "POST", url: "/v1/policies", headers: key,
           payload: { name: `raw-${name}-${tag}`, server_id: rawServerId, tool_name: name, effect: "allow" }
         });
@@ -413,7 +413,7 @@ describe("MCP streamable HTTP gateway", () => {
     // §7.1/FR-026: the gateway is an HTTP boundary. There is no transport
     // selector to abuse, and a registration that names a stdio command is
     // rejected at the URL gate rather than spawned.
-    const stdio = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+    const stdio = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `stdio-${tag}`, base_url: "stdio://localhost/mcp" } });
     expect(stdio.statusCode).toBe(400);
     expect(stdio.json().error).toBe("unsafe_upstream");

@@ -3,6 +3,7 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 import { pool } from "./db.js";
 import { oauthConfigFromEnv, resourceMetadataUrl, verifyAccessToken } from "./oauth.js";
 import { audit } from "./audit.js";
+import { projectIdsForWorkspaces } from "./project-scope.js";
 
 // Scoped credentials. Roles map to scope sets; keys carry a subset of their
 // owner's role scopes. Only the approver role (and an OAuth token the trusted
@@ -22,11 +23,17 @@ export const ROLE_SCOPES: Record<string, string[]> = {
 };
 
 export interface Principal {
-  kind: "env" | "user" | "oauth";
+  kind: "env" | "user" | "oauth" | "ingest";
   userId: string | null;
   scopes: string[];
   // Workspaces this principal may write into. "all" is env keys and admins.
   workspaces: "all" | string[];
+  // Projects this principal may write into. Agent and ingestion credentials
+  // are always pinned to a project; humans inherit their memberships.
+  projects: "all" | string[];
+  // Set when an OAuth token matched an active, provisioned AgentPrincipal.
+  agentPrincipalId?: string | null;
+  issuer?: string | null;
 }
 
 // Writes that non-admin actors may perform. Everything else that mutates
@@ -80,6 +87,8 @@ const ROUTES: [string, string][] = [
   ["/v1/admin/", "admin"],
   ["/v1/users", "admin"],
   ["/v1/workspaces", "read"],
+  ["/v1/projects", "read"],
+  ["/v1/whoami", "read"],
   ["/v1/auth/me", "read"],
   ["/v1/auth/", "admin"]
 ];
@@ -121,7 +130,21 @@ export function newKey(): { plaintext: string; hash: string } {
   return { plaintext, hash };
 }
 
-export async function resolvePrincipal(authHeader: string): Promise<Principal | null> {
+// Ingestion keys are deliberately a different credential type and prefix:
+// they authenticate OTLP/trace ingestion only and are never accepted on the
+// MCP gateway (§7.3).
+export function newIngestKey(): { plaintext: string; hash: string } {
+  const plaintext = `tgi_${randomBytes(24).toString("hex")}`;
+  const hash = createHash("sha256").update(plaintext).digest("hex");
+  return { plaintext, hash };
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export async function resolvePrincipal(
+  authHeader: string,
+  options: { allowIngest?: boolean } = {}
+): Promise<Principal | null> {
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
   if (!token) return null;
   const oauth = oauthConfigFromEnv();
@@ -129,23 +152,99 @@ export async function resolvePrincipal(authHeader: string): Promise<Principal | 
   // deployment even if their environment variables are still set.
   const staticKeysAllowed = !(oauth && process.env.NODE_ENV === "production");
   if (staticKeysAllowed && process.env.API_KEY && token === process.env.API_KEY) {
-    return { kind: "env", userId: null, scopes: ADMIN_SCOPES, workspaces: "all" };
+    return { kind: "env", userId: null, scopes: ADMIN_SCOPES, workspaces: "all", projects: "all" };
   }
   if (staticKeysAllowed && process.env.APPROVER_KEY && token === process.env.APPROVER_KEY) {
-    return { kind: "env", userId: null, scopes: ["approve", "read"], workspaces: "all" };
+    return {
+      kind: "env", userId: null, scopes: ["approve", "read"],
+      workspaces: "all", projects: "all"
+    };
+  }
+  // Ingestion keys are not MCP credentials. They are only resolved on the
+  // telemetry routes; on every other listener/path this branch is skipped
+  // before any database lookup.
+  if (token.startsWith("tgi_")) {
+    if (options.allowIngest === false) return null;
+    const hash = createHash("sha256").update(token).digest("hex");
+    const res = await pool.query(
+      `SELECT k.id, k.project_id, k.scopes, k.expires_at, k.revoked_at,
+              p.workspace_id
+         FROM ingest_api_keys k
+         JOIN projects p ON p.id = k.project_id
+        WHERE k.key_hash = $1`,
+      [hash]
+    );
+    const row = res.rows[0];
+    if (!row) return null;
+    if (row.revoked_at) return null;
+    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) return null;
+    await pool.query("UPDATE ingest_api_keys SET last_used_at = now() WHERE id = $1", [row.id])
+      .catch(() => undefined);
+    return {
+      kind: "ingest",
+      userId: null,
+      scopes: ["ingest"],
+      workspaces: [row.workspace_id],
+      projects: [row.project_id],
+      issuer: null,
+      agentPrincipalId: null
+    };
   }
   // A token shaped like a JWT is validated as an OAuth access token and is
   // never retried down another path; a rejection is a rejection.
   if (oauth && token.split(".").length === 3) {
     try {
       const claims = await verifyAccessToken(token, oauth);
+      const projectIds = claims.projects.filter((p) => UUID_RE.test(p));
+      let scopes = claims.scopes.filter((s) => ALL_SCOPES.includes(s));
+      let agentPrincipalId: string | null = null;
+      let agentPrincipalProject: string | null = null;
+      if (projectIds.length > 0) {
+        const principalRows = await pool.query(
+          `SELECT id, project_id, allowed_scopes FROM agent_principals
+            WHERE project_id = ANY($1::uuid[]) AND issuer = $2 AND subject = $3
+              AND status = 'active'`,
+          [projectIds, oauth.issuer, claims.sub]
+        );
+        // A validated token maps to one project-scoped AgentPrincipal. If the
+        // issuer names several projects, take the first provisioned project in
+        // the token's own order and narrow the principal to it. Retaining the
+        // whole claim here would let a token act in a project where no
+        // principal was ever provisioned.
+        const byProject = new Map(
+          principalRows.rows.map((r) => [r.project_id as string, r])
+        );
+        const chosen = projectIds.map((id) => byProject.get(id)).find(Boolean);
+        if (chosen) {
+          agentPrincipalId = chosen.id as string;
+          agentPrincipalProject = chosen.project_id as string;
+          const allowed = new Set((chosen.allowed_scopes ?? []) as string[]);
+          scopes = scopes.filter((s) => allowed.has(s));
+        }
+      }
+      // Legacy tokens name workspaces instead of projects. Only UUID-shaped
+      // workspace ids can be resolved against the database; the original
+      // claim is preserved on the principal for compatibility with old
+      // deployments.
+      let projects: "all" | string[] = agentPrincipalProject
+        ? [agentPrincipalProject]
+        : projectIds;
+      if (projectIds.length === 0) {
+        const workspaceIds = claims.workspaces.filter((w) => UUID_RE.test(w));
+        if (workspaceIds.length > 0) {
+          projects = await projectIdsForWorkspaces(pool, workspaceIds);
+        }
+      }
       return {
         kind: "oauth",
         userId: claims.sub,
-        scopes: claims.scopes.filter((s) => ALL_SCOPES.includes(s)),
+        scopes,
         // The issuer names the workspaces this principal may act in; a token
         // without them authenticates but can write nowhere.
-        workspaces: claims.workspaces
+        workspaces: claims.workspaces,
+        projects,
+        agentPrincipalId,
+        issuer: oauth.issuer
       };
     } catch (err) {
       console.warn(`oauth access token rejected: ${(err as Error).message}`);
@@ -177,9 +276,15 @@ export async function resolvePrincipal(authHeader: string): Promise<Principal | 
       ? (mine.includes(row.key_workspace) ? [row.key_workspace] : [])
       : mine;
   }
+  const projects = row.role === "admin"
+    ? "all"
+    : await projectIdsForWorkspaces(pool, workspaces);
   await pool.query("UPDATE api_keys SET last_used_at = now() WHERE key_hash = $1", [hash])
     .catch(() => undefined);
-  return { kind: "user", userId: row.user_id, scopes, workspaces };
+  return {
+    kind: "user", userId: row.user_id, scopes, workspaces, projects,
+    issuer: null, agentPrincipalId: null
+  };
 }
 
 export function forbidden(reply: FastifyReply, scope: string) {
@@ -215,8 +320,22 @@ export async function authHook(req: FastifyRequest, reply: FastifyReply): Promis
   if (!req.url.startsWith("/v1/") && !req.url.startsWith("/mcp") && !req.url.startsWith("/_control/")) return;
   const scope = requiredScope(req.url, req.method);
   if (scope === "public") return;
-  const principal = await resolvePrincipal(req.headers.authorization ?? "");
+  const presented = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+  const ingestRoute = req.url.startsWith("/v1/ingest") || req.url.startsWith("/v1/traces");
+  const principal = await resolvePrincipal(req.headers.authorization ?? "", {
+    // Ingestion keys are only looked up on the telemetry routes. The gateway
+    // listener therefore cannot turn one into an MCP principal.
+    allowIngest: ingestRoute
+  });
   if (!principal) {
+    // A well-formed ingestion credential presented to any other surface is a
+    // scope error, not an anonymous request. No lookup is needed here: the
+    // prefix is deliberately distinct from user and OAuth credentials. On the
+    // ingest surface a missing principal means revoked or expired, which is a
+    // plain 401.
+    if (!ingestRoute && presented.startsWith("tgi_")) {
+      return reply.code(403).send({ error: "ingest_key_scope" }) as unknown as void;
+    }
     // RFC 9728: point a challenged client at the resource metadata document
     // so it can discover the authorization server.
     const oauth = oauthConfigFromEnv();
@@ -231,6 +350,22 @@ export async function authHook(req: FastifyRequest, reply: FastifyReply): Promis
         metadata: { method: req.method, required_scope: scope } }).catch(() => undefined);
     }
     return reply.code(401).send({ error: "unauthorized" }) as unknown as void;
+  }
+  // An OTLP key is a telemetry credential, not a general API key. It cannot
+  // reach MCP, approvals, administration, or even reads.
+  if (principal.kind === "ingest" && scope !== "ingest") {
+    return reply.code(403).send({ error: "ingest_key_scope" }) as unknown as void;
+  }
+  // §7.3: in production the gateway maps an OAuth subject to a provisioned,
+  // project-scoped AgentPrincipal. A valid token that was never provisioned
+  // authenticates as a person elsewhere but cannot act as an MCP caller.
+  if (
+    principal.kind === "oauth" &&
+    process.env.NODE_ENV === "production" &&
+    (req.url.startsWith("/mcp") || req.url.startsWith("/v1/gateway")) &&
+    !principal.agentPrincipalId
+  ) {
+    return reply.code(403).send({ error: "agent_principal_required" }) as unknown as void;
   }
   // The approval control surface takes the approve scope itself; "admin"
   // does not shortcut it, so a plain admin key cannot decide in place of the

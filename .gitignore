@@ -14,4 +14,6 @@ policy-keys/
 gateway-state/
 
 demo-policy-keys/
+.demo-keys/
+sbom.cdx.json
 

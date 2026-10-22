@@ -421,20 +421,27 @@ export interface PolicyVersion {
   active: boolean;
 }
 
-export const gwApi = {
-  servers: () => gw<{ items: McpServer[] }>("/v1/servers"),
+export const adminApi = {
+  servers: () => get<{ items: McpServer[] }>("/v1/servers"),
   createServer: (s: { name: string; base_url: string; auth_secret?: string }) =>
-    gw<McpServer>("/v1/servers", { method: "POST", body: JSON.stringify(s) }),
+    postApi<McpServer>("/v1/servers", s),
   discover: (id: string) =>
-    gw<{ tools: { tool_name: string; quarantined: boolean; quarantine_reason?: string | null;
+    postApi<{ tools: { tool_name: string; quarantined: boolean; quarantine_reason?: string | null;
       definition?: Record<string, unknown> | null; previous_definition?: Record<string, unknown> | null;
       definition_hash?: string | null; previous_hash?: string | null }[] }>(
-      `/v1/servers/${id}/discover`, { method: "POST", body: "{}" }),
-  policies: () => gw<{ items: Policy[] }>("/v1/policies"),
-  createPolicy: (p: Record<string, unknown>) =>
-    gw<Policy>("/v1/policies", { method: "POST", body: JSON.stringify(p) }),
+      `/v1/servers/${id}/discover`, {}),
+  policies: () => get<{ items: Policy[] }>("/v1/policies"),
+  createPolicy: (p: Record<string, unknown>) => postApi<Policy>("/v1/policies", p),
   updatePolicy: (id: string, p: Record<string, unknown>) =>
-    gw<Policy>(`/v1/policies/${id}`, { method: "PUT", body: JSON.stringify(p) }),
+    postApi<Policy>(`/v1/policies/${id}`, p, "PUT"),
+  quarantine: (serverId: string, tool: string, quarantined: boolean) =>
+    postApi<{ ok: boolean }>(
+      `/v1/servers/${serverId}/tools/${encodeURIComponent(tool)}/quarantine`,
+      { quarantined }, "PUT"
+    )
+};
+
+export const gwApi = {
   // The queue is fetched from the control listener with the approver key:
   // the control surface never opens sealed arguments for other scopes.
   approvals: (status?: string) =>
@@ -445,11 +452,6 @@ export const gwApi = {
   call: (body: Record<string, unknown>) =>
     gw<{ result?: unknown; approval_id?: string; status?: string; expires_at?: string }>(
       "/v1/gateway/tools/call", { method: "POST", body: JSON.stringify(body) }),
-  quarantine: (serverId: string, tool: string, quarantined: boolean) =>
-    gw<{ ok: boolean }>(
-      `/v1/servers/${serverId}/tools/${encodeURIComponent(tool)}/quarantine`,
-      { method: "PUT", body: JSON.stringify({ quarantined }) }
-    ),
   audit: (action?: string) =>
     gw<{ items: AuditEvent[] }>(`/v1/audit-events${action ? `?action=${encodeURIComponent(action)}` : ""}`),
   // FR-021: every decision recorded for one run, newest first.

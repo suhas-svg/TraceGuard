@@ -2,9 +2,10 @@ import { createHash, generateKeyPairSync } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { canonicalize } from "@traceguard/canonical-json";
 import {
-  auditHash, auditHashFor, auditHashV2, canonicalEventFields, checkpointKeyId,
-  signCheckpoint, stableStringify, verifyAuditChain, verifyCheckpoint,
-  HASH_VERSION_CANONICAL, type AuditRow, type CheckpointPayload
+  auditHash, auditHashFor, auditHashV2, auditHashV3, auditHashV4, canonicalEventFields,
+  checkpointKeyId, signCheckpoint, stableStringify, verifyAuditChain,
+  verifyCheckpoint, HASH_VERSION_CANONICAL, HASH_VERSION_EVENT, HASH_VERSION_PROJECT,
+  type AuditRow, type CheckpointPayload
 } from "../src/index.js";
 
 describe("checkpoint signing", () => {
@@ -230,6 +231,127 @@ describe("audit chain", () => {
         hash: auditHashV2(legacy.hash, ts2, entry)
       };
       expect(verifyAuditChain([legacy, second]).ok).toBe(true);
+    });
+  });
+
+  // §10.1/§10.2: v3 binds the event ID and per-workspace sequence, and the
+  // verifier must report missing ranges instead of accepting a truncated
+  // segment as complete.
+  describe("v3 ID + sequence format", () => {
+    function v3Row(seq: number, id: string, prevHash: string, timestamp = ts1): AuditRow {
+      const metadata = { version: seq };
+      const entry = { ...base, metadata, workspace_id: "ws-1" };
+      return {
+        id,
+        timestamp,
+        ...base,
+        metadata,
+        workspace_id: "ws-1",
+        seq,
+        hash_version: HASH_VERSION_EVENT,
+        prev_hash: prevHash,
+        hash: auditHashV3(prevHash, timestamp, entry, id, seq)
+      };
+    }
+
+    function v3Chain(): AuditRow[] {
+      const first = v3Row(1, "66666666-6666-6666-6666-666666666666", "");
+      const second = v3Row(2, "77777777-7777-7777-7777-777777777777", first.hash, ts2);
+      return [first, second];
+    }
+
+    it("hashes the event ID and sequence, and verifies an intact v3 chain", () => {
+      const entry = { ...base, metadata: { version: 1 }, workspace_id: "ws-1" };
+      expect(auditHashV3("", ts1, entry, "66666666-6666-6666-6666-666666666666", 1))
+        .not.toBe(auditHashV3("", ts1, entry, "88888888-8888-8888-8888-888888888888", 1));
+      expect(auditHashV3("", ts1, entry, "66666666-6666-6666-6666-666666666666", 1))
+        .not.toBe(auditHashV3("", ts1, entry, "66666666-6666-6666-6666-666666666666", 2));
+      expect(auditHashFor(HASH_VERSION_EVENT, "", ts1, entry,
+        "66666666-6666-6666-6666-666666666666", 1))
+        .toBe(auditHashV3("", ts1, entry, "66666666-6666-6666-6666-666666666666", 1));
+      expect(verifyAuditChain(v3Chain()).ok).toBe(true);
+    });
+
+    it("reports a missing sequence inside a retained segment", () => {
+      const first = v3Row(1, "66666666-6666-6666-6666-666666666666", "");
+      const third = v3Row(3, "99999999-9999-9999-9999-999999999999", first.hash, ts2);
+      const result = verifyAuditChain([first, third]);
+      expect(result.ok).toBe(false);
+      expect(result.gaps).toEqual([{ workspace_id: "ws-1", from: 2, to: 2 }]);
+      expect(result.problems[0].problem).toMatch(/sequence gap/);
+    });
+
+    it("anchors a pruned segment at the signed workspace sequence", () => {
+      const [first, second] = v3Chain();
+      const opts = {
+        anchorHash: first.hash,
+        expectedSequences: [{ workspace_id: "ws-1", up_to_sequence: 1 }]
+      };
+      expect(verifyAuditChain([second], opts).ok).toBe(true);
+      const withoutAnchor = verifyAuditChain([second]);
+      expect(withoutAnchor.ok).toBe(false);
+      expect(withoutAnchor.problems.some((p) => /without a signed checkpoint anchor/.test(p.problem))).toBe(true);
+    });
+
+    it("detects a renumbered sequence and a duplicate event ID", () => {
+      const first = v3Row(1, "66666666-6666-6666-6666-666666666666", "");
+      const duplicateId = v3Row(2, first.id, first.hash, ts2);
+      expect(verifyAuditChain([first, duplicateId]).problems
+        .some((p) => /duplicate event id/.test(p.problem))).toBe(true);
+
+      const sameSequence = v3Row(1, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", first.hash, ts2);
+      const result = verifyAuditChain([first, sameSequence]);
+      expect(result.ok).toBe(false);
+      expect(result.problems.some((p) => /duplicate sequence 1/.test(p.problem))).toBe(true);
+    });
+  });
+
+  // Project attribution is part of the v4 hash. Changing it without
+  // re-signing the chain changes the digest, and the verifier catches that.
+  describe("v4 project attribution format", () => {
+    const projectId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    function v4Row(
+      seq: number, id: string, prevHash: string, project: string | null, timestamp = ts1
+    ): AuditRow {
+      const metadata = { version: seq };
+      const entry = { ...base, metadata, workspace_id: "ws-1", project_id: project };
+      return {
+        id,
+        timestamp,
+        ...base,
+        metadata,
+        workspace_id: "ws-1",
+        project_id: project,
+        seq,
+        hash_version: HASH_VERSION_PROJECT,
+        prev_hash: prevHash,
+        hash: auditHashV4(prevHash, timestamp, entry, id, seq)
+      };
+    }
+
+    it("hashes the project and verifies an intact v4 chain", () => {
+      const first = v4Row(1, "66666666-6666-6666-6666-666666666666", "", projectId);
+      const second = v4Row(2, "77777777-7777-7777-7777-777777777777", first.hash, projectId, ts2);
+      expect(verifyAuditChain([first, second]).ok).toBe(true);
+
+      const entry = { ...base, metadata: { version: 1 }, workspace_id: "ws-1" };
+      expect(auditHashV4("", ts1, { ...entry, project_id: projectId },
+        "66666666-6666-6666-6666-666666666666", 1))
+        .not.toBe(auditHashV4("", ts1, { ...entry, project_id: null },
+          "66666666-6666-6666-6666-666666666666", 1));
+      expect(auditHashFor(HASH_VERSION_PROJECT, "", ts1, { ...entry, project_id: projectId },
+        "66666666-6666-6666-6666-666666666666", 1))
+        .toBe(auditHashV4("", ts1, { ...entry, project_id: projectId },
+          "66666666-6666-6666-6666-666666666666", 1));
+    });
+
+    it("rejects a v4 row whose stored project no longer matches the hash", () => {
+      const first = v4Row(1, "66666666-6666-6666-6666-666666666666", "", projectId);
+      const second = v4Row(2, "77777777-7777-7777-7777-777777777777", first.hash, projectId, ts2);
+      const tampered = { ...second, project_id: "cccccccc-cccc-cccc-cccc-cccccccccccc" };
+      const result = verifyAuditChain([first, tampered]);
+      expect(result.ok).toBe(false);
+      expect(result.problems.some((p) => /modified/.test(p.problem))).toBe(true);
     });
   });
 });

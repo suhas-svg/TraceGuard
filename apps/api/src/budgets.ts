@@ -4,6 +4,7 @@ import type { Pool, PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
 import { scopeClause, workspaceAllowed } from "./auth.js";
+import { ensureDefaultProject, projectAllowed } from "./project-scope.js";
 import { notify } from "./notify.js";
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
@@ -78,9 +79,9 @@ async function periodSpentMicro(
 // headroom that is not there. Unpriced spans contribute nothing, the same as
 // everywhere else cost is estimated.
 async function projectSpentMicro(
-  client: Pool | PoolClient, workspaceId: string, period: string
+  client: Pool | PoolClient, projectId: string, period: string
 ): Promise<number> {
-  const params: unknown[] = [workspaceId];
+  const params: unknown[] = [projectId];
   let windowSql = "TRUE";
   if (period !== "lifetime") {
     params.push(period);
@@ -101,7 +102,7 @@ async function projectSpentMicro(
          WHERE provider = s.provider AND model = s.model AND effective_from <= s.started_at
          ORDER BY effective_from DESC LIMIT 1
        ) p ON true
-      WHERE r.workspace_id = $1 AND ${windowSql}`,
+      WHERE r.project_id = $1 AND ${windowSql}`,
     params
   );
   return Number(r.rows[0].spent);
@@ -161,8 +162,9 @@ export function registerBudgetRoutes(app: FastifyInstance) {
   });
 
   const budgetSchema = z.object({
-    // 'project' is the spec's name for a workspace (§9.1); ref_id carries the
-    // workspace id and the cap covers what that project actually spent.
+    // A project budget's ref_id is a project id. A workspace id is still
+    // accepted as the legacy spelling and maps to that workspace's default
+    // project, so existing callers keep working after the identity split.
     scope: z.enum(["run", "agent", "project"]),
     ref_id: z.string().uuid(),
     limit_micro: z.number().int().min(0),
@@ -178,23 +180,37 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     try {
       const workspaceId = await defaultWorkspaceId(client);
       const b = parsed.data;
-      // A project budget names a workspace, so an arbitrary uuid must not be
-      // accepted: it would create a cap that governs nothing and can never be
-      // satisfied or read back.
+      let budgetWorkspace = workspaceId;
+      let projectId: string;
+      // A project budget names a project. The old spelling named the
+      // workspace, so accept that too and map it to the default project.
       if (b.scope === "project") {
-        const ws = await client.query("SELECT id FROM workspaces WHERE id = $1", [b.ref_id]);
-        if (!ws.rows[0]) return reply.code(400).send({ error: "unknown_workspace" });
-        if (!workspaceAllowed(req.principal, b.ref_id)) {
-          return reply.code(403).send({ error: "workspace_forbidden" });
+        const project = await client.query(
+          "SELECT id, workspace_id FROM projects WHERE id = $1", [b.ref_id]);
+        if (project.rows[0]) {
+          projectId = project.rows[0].id;
+          budgetWorkspace = project.rows[0].workspace_id;
+        } else {
+          const ws = await client.query("SELECT id FROM workspaces WHERE id = $1", [b.ref_id]);
+          if (!ws.rows[0]) return reply.code(400).send({ error: "unknown_workspace" });
+          budgetWorkspace = b.ref_id;
+          projectId = await ensureDefaultProject(client, b.ref_id);
         }
+        if (!workspaceAllowed(req.principal, budgetWorkspace) ||
+            !projectAllowed(req.principal, projectId)) {
+          return reply.code(403).send({ error: "project_forbidden" });
+        }
+      } else {
+        projectId = await ensureDefaultProject(client, workspaceId);
       }
       const res = await client.query(
-        `INSERT INTO budgets (workspace_id, scope, ref_id, limit_micro, effect, period)
-         VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-        [workspaceId, b.scope, b.ref_id, b.limit_micro, b.effect, b.period]
+        `INSERT INTO budgets (workspace_id, project_id, scope, ref_id, limit_micro, effect, period)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+        [budgetWorkspace, projectId, b.scope, b.ref_id, b.limit_micro, b.effect, b.period]
       );
       await audit(pool, { actor_type: "admin", action: "budget.create",
         resource_type: "budget", resource_id: res.rows[0].id, result: "success",
+        workspace_id: res.rows[0].workspace_id, project_id: res.rows[0].project_id,
         metadata: { scope: b.scope, limit_micro: b.limit_micro, effect: b.effect, period: b.period } });
       return reply.code(201).send(res.rows[0]);
     } finally {
@@ -234,13 +250,13 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     if (projects.length > 0) {
       const spent = new Map<string, number>();
       for (const b of projects) {
-        const key = `${b.ref_id}\0${b.period ?? "lifetime"}`;
+        const key = `${b.project_id}\0${b.period ?? "lifetime"}`;
         if (!spent.has(key)) {
-          spent.set(key, await projectSpentMicro(pool, b.ref_id, b.period ?? "lifetime"));
+          spent.set(key, await projectSpentMicro(pool, b.project_id, b.period ?? "lifetime"));
         }
       }
       for (const b of projects) {
-        b.spent_micro = spent.get(`${b.ref_id}\0${b.period ?? "lifetime"}`) ?? 0;
+        b.spent_micro = spent.get(`${b.project_id}\0${b.period ?? "lifetime"}`) ?? 0;
         b.remaining_micro = Number(b.limit_micro) - b.spent_micro - Number(b.reserved_micro);
       }
     }
@@ -276,6 +292,7 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     if (!res.rows[0]) return reply.code(404).send({ error: "budget_not_found" });
     await audit(pool, { actor_type: "admin", action: "budget.update",
       resource_type: "budget", resource_id: id, result: "success",
+      workspace_id: res.rows[0].workspace_id, project_id: res.rows[0].project_id,
       metadata: parsed.data as Record<string, unknown> });
     return res.rows[0];
   });
@@ -310,16 +327,14 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         return reply.code(404).send({ error: "budget_not_found" });
       }
       const budget = b.rows[0];
-      // A project budget governs its target workspace, so that is the workspace
-      // the caller has to be allowed in; the row's own workspace_id only says
-      // who created it.
-      const governed = budget.scope === "project" ? budget.ref_id : budget.workspace_id;
-      if (!workspaceAllowed(req.principal, governed)) {
+      // The row's workspace_id is the authoritative boundary for both legacy
+      // workspace-named project budgets and real project ids.
+      if (!workspaceAllowed(req.principal, budget.workspace_id)) {
         await client.query("ROLLBACK");
         return reply.code(403).send({ error: "workspace_forbidden" });
       }
       const spent = budget.scope === "project"
-        ? await projectSpentMicro(client, budget.ref_id, budget.period ?? "lifetime")
+        ? await projectSpentMicro(client, budget.project_id, budget.period ?? "lifetime")
         : (await periodSpentMicro(client, budget.id, budget.period ?? "lifetime")) ??
           Number(budget.spent_micro);
       const used = spent + Number(budget.reserved_micro);
@@ -329,6 +344,7 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         await client.query("ROLLBACK");
         await audit(pool, { actor_type: "agent", action: "budget.exceeded",
           resource_type: "budget", resource_id: budget.id, result: "blocked",
+          workspace_id: budget.workspace_id, project_id: budget.project_id,
           metadata: { spent_micro: spent, limit_micro: budget.limit_micro, period: budget.period ?? "lifetime" } });
         void notify(budget.workspace_id, "budget.exceeded",
           { budget_id: budget.id, scope: budget.scope, spent_micro: spent, limit_micro: Number(budget.limit_micro) });
@@ -350,6 +366,7 @@ export function registerBudgetRoutes(app: FastifyInstance) {
       // §10.3: the reservation is a money-moving event; the chain gets it.
       await audit(pool, { actor_type: "agent", action: "budget.reserved",
         resource_type: "budget", resource_id: r.rows[0].budget_id, result: "reserved",
+        workspace_id: budget.workspace_id, project_id: budget.project_id,
         metadata: { reservation_id: r.rows[0].id, amount_micro: parsed.data.max_cost_micro,
           expires_at: r.rows[0].expires_at } });
       return { ok: true, reservation_id: r.rows[0].id, expires_at: r.rows[0].expires_at,
@@ -389,7 +406,9 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         await client.query("ROLLBACK");
         return reply.code(409).send({ error: "reservation_not_held", status: res.status });
       }
-      const bw = await client.query("SELECT workspace_id FROM budgets WHERE id = $1", [res.budget_id]);
+      const bw = await client.query(
+        "SELECT workspace_id, project_id FROM budgets WHERE id = $1", [res.budget_id]
+      );
       if (!workspaceAllowed(req.principal, bw.rows[0]?.workspace_id ?? "")) {
         await client.query("ROLLBACK");
         return reply.code(403).send({ error: "workspace_forbidden" });
@@ -412,6 +431,8 @@ export function registerBudgetRoutes(app: FastifyInstance) {
       // §10.3: settlement closes the money loop; record what it settled at.
       await audit(pool, { actor_type: "agent", action: "budget.settled",
         resource_type: "budget", resource_id: res.budget_id, result: "settled",
+        workspace_id: bw.rows[0]?.workspace_id ?? null,
+        project_id: bw.rows[0]?.project_id ?? null,
         metadata: { reservation_id: res.id, settled_micro: actual,
           basis: parsed.data.actual_cost_micro == null ? "reserved_max" : "measured",
           settle_reason: parsed.data.actual_cost_micro == null ? "usage_unavailable" : "usage_known" } });

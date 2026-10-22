@@ -15,7 +15,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm install --ignore-scripts
+      - run: npm ci --ignore-scripts
       - run: npx eslint .
 
   # NFR-006: a floor against committed credentials. Runs on the tracked tree
@@ -58,7 +58,13 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm install --ignore-scripts
+      - run: npm ci --ignore-scripts
+      # §20: dependency and license review over the pinned lockfile, plus a
+      # production advisory gate. The SBOM is uploaded for release evidence.
+      - name: Dependency and license review
+        run: node scripts/dependency-audit.mjs --sbom sbom.cdx.json
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
       - run: ./node_modules/.bin/tsc -p packages/schemas/tsconfig.json
       - run: ./node_modules/.bin/tsc -p packages/canonical-json/tsconfig.json
       - run: ./node_modules/.bin/tsc -p packages/policy-signing/tsconfig.json
@@ -82,6 +88,11 @@ jobs:
         run: node tests/faults/run.mjs
       - name: OAuth clean-clone run
         run: node tests/oauth/clean-run.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 7
 
   python:
     runs-on: ubuntu-latest
@@ -133,7 +144,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm install --ignore-scripts
+      - run: npm ci --ignore-scripts
       - run: npx playwright install --with-deps chromium
       # apps/api imports these workspaces, so their dist/ must exist before
       # the api build - the e2e job does not inherit build-and-test's output.
@@ -161,7 +172,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm install --ignore-scripts
+      - run: npm ci --ignore-scripts
       - name: Bring up the boundary
         run: |
           printf 'APPROVAL_ARGS_KEY=%s\n' "$(openssl rand -hex 32)" > .env

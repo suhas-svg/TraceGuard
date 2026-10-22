@@ -6,6 +6,8 @@ export const eventEnvelopeSchema = z.object({
   event_id: z.string().min(1).max(128),
   workspace_id: z.string().uuid().optional(),
   workspace_name: z.string().min(1).max(128).optional(),
+  project_id: z.string().uuid().optional(),
+  project_name: z.string().min(1).max(128).optional(),
   agent_id: z.string().uuid().optional(),
   agent_name: z.string().min(1).max(128).optional(),
   run_id: z.string().uuid(),
@@ -158,6 +160,9 @@ export const policyBundleSchema = z.object({
   bundle_version: z.literal(BUNDLE_VERSION),
   protocol_profile: z.literal(PROTOCOL_PROFILE),
   workspace_id: z.string().uuid(),
+  // Legacy bundles predate project-scoped publication. New bundles always
+  // carry it; the gateway only accepts a legacy bundle for the default project.
+  project_id: z.string().uuid().optional(),
   version: z.number().int().positive(),
   previous_version_hash: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
   rules: z.array(bundleRuleSchema).max(500),

@@ -334,6 +334,20 @@ test("scenario H: a case runs through a live adapter from the dashboard", async 
   }
 });
 
+// The agent network can reach only the gateway (FR-004), so telemetry written
+// to the gateway's fixed ingest path must materialise as a visible run.
+test("scenario J: the gateway forwards agent telemetry to the API", async ({ request }) => {
+  const runId = randomUUID();
+  const forwarded = await request.post(`${GATEWAY_URL}/v1/ingest/events`, {
+    headers: { authorization: `Bearer ${API_KEY}` },
+    data: { events: [event({ run_id: runId, agent_name: `e2e-ingest-${tag}`, event_type: "run.started" })] }
+  });
+  expect(forwarded.status()).toBe(200);
+  const trace = await apiGet(request, `/v1/runs/${runId}/trace`);
+  expect(trace.status()).toBe(200);
+  expect((await trace.json()).run.id).toBe(runId);
+});
+
 // Must run last: it ends by creating a path_within draft the publisher must
 // refuse, and every later publish would fail on that draft.
 test("scenario I: path constraints are enforced by the executor, not by string comparison", async ({ request }) => {

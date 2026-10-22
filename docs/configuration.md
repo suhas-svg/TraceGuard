@@ -13,10 +13,12 @@ variable, which is how the compose file reads them.
 | APPROVAL_ARGS_KEY_PREVIOUS | gateway | (optional) | previous key kept during rotation until old rows expire |
 | GATEWAY_PORT | gateway | 8091 | agent-facing listener |
 | GATEWAY_CONTROL_PORT | gateway | 8093 | human approval control listener; agent credentials are rejected there |
-| APPROVAL_TTL_SECONDS | gateway | 300 | pending approvals die after this |
+| CONTROL_API_URL | gateway | http://127.0.0.1:8090 | API base the gateway forwards the fixed `/v1/ingest/events` telemetry path to; set to `http://api:8080` in compose |
+| APPROVAL_TTL_SECONDS | gateway | 900 | pending approvals die after this (hard max 3600) |
 | APPROVAL_CLAIM_LEASE_SECONDS | gateway | 30 | how long a consume attempt holds the CLAIMED lease before the sweep returns it to APPROVED |
-| AUDIT_CHECKPOINT_KEY | gateway | — | ed25519 PEM private key enabling POST /v1/audit/checkpoints; unset answers 503 |
-| AUDIT_CHECKPOINT_PUBLIC_KEY | gateway | — | ed25519 PEM public key the prune route and the verifier use to validate checkpoints; unset answers 503 on prune and skips anchoring on verify |
+| AUDIT_CHECKPOINT_PUBLIC_KEY | gateway | — | ed25519 PEM public key used only to verify operator-signed checkpoints; unset skips anchoring on verify |
+| AUDIT_CHECKPOINT_KEY_FILE | operator CLI | — | path to the ed25519 private key; used by `npm run audit:checkpoint` on the operator host, never mounted in a container |
+| AUDIT_CHECKPOINT_PUBLIC_KEY_FILE | operator CLI | — | path to the public key for `audit:checkpoint prune` and `npm run audit:verify` |
 | APPROVAL_EXECUTION_TIMEOUT_SECONDS | gateway | 300 | how long an EXECUTING row may stay unresolved before the sweep finalizes it as OUTCOME_UNKNOWN |
 | APPROVAL_MAX_PENDING_PER_CALLER | gateway | 10 | spec hard maximum; set lower only |
 | APPROVAL_MAX_PENDING_PER_WORKSPACE | gateway | 100 | spec hard maximum; set lower only |

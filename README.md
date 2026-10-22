@@ -20,13 +20,45 @@ against a running stack; see the file header for the commands.
 
 ## Run it
 
+One command from a clean checkout:
+
+```bash
+npm install
+npm run demo
+```
+
+`npm run demo` creates `.env` from `.env.example` if it is missing, generates
+the approval seal key and an ed25519 audit-checkpoint key pair under
+`.demo-keys/` (gitignored), builds and starts the compose stack, waits for the
+api, gateway, approval control listener, and dashboard, then runs the demo agent
+through the boundary and prints the live trace URL. No key is committed and no
+key is printed.
+
+```bash
+npm run demo:audit   # signed checkpoint -> export -> offline verify -> refused prune
+npm run demo:reset   # remove demo/bench fixtures, keep history
+```
+
+`demo:audit` exercises §21.16 directly: it invokes the operator CLI to create
+and sign a checkpoint over the exact current prefix, verifies the artifact
+offline with `scripts/verify-audit.mts`, then proves the CLI refuses a tampered
+artifact and prints the operator-only prune command. It never deletes audit
+events. The gateway receives only the public key and can verify, not sign or
+prune. Artifacts produced after a prune carry the prior signed checkpoint as
+their `anchor`; the offline verifier checks it before using its workspace heads.
+
 Dev ports: API 8090, gateway 8091, approval control listener 8093, mock tools
 8092 (internal only), web 5173. The demo agent runs as the `agent` container
 on `agent_edge`: the gateway is the only container it can reach, and
 `npm run test:security` proves that from inside it (upstream, api and postgres
-must all refuse the agent).
+must all refuse the agent). Agent telemetry goes to the gateway's fixed
+`/v1/ingest/events` path, which forwards it to the API; the agent never talks
+to the API directly.
 
-1. Copy `.env.example` to `.env` and set `API_KEY` and `APPROVER_KEY`.
+### Manual path
+
+1. Copy `.env.example` to `.env`, set `API_KEY` and `APPROVER_KEY`, and set
+   `APPROVAL_ARGS_KEY` to 32 random bytes as hex.
 2. `docker compose up --build`
 3. The `db-roles` service applies the migrations and enables the
    least-privilege role logins (`api_runtime`, `gateway_runtime`,
@@ -41,6 +73,11 @@ must all refuse the agent).
    examples/demo-agent/main.py`.)
 5. Open http://localhost:5173, set the API URL and key in the header, browse runs.
 
+Starting compose by hand does not set `AUDIT_CHECKPOINT_PUBLIC_KEY`; export it
+yourself (or use `npm run demo`) if you want the gateway to verify anchored
+history. The private key stays on the operator host and is used only by
+`npm run audit:checkpoint`.
+
 ## Signed policy: the operator flow
 
 The control surface edits **drafts** — rules in `policies`, server registrations, and reviewed tool pins. Nothing enforces a draft. Enforcement reads the active signed bundle, and only the operator's key can sign one:
@@ -52,17 +89,18 @@ npm run policy:keygen                      # writes ./policy-keys/{signing-key.p
 # 2. Trust the public key for a workspace (once; audited).
 npm run policy:trust -- --workspace default
 
-# 3. Sign and publish the current drafts as the new active version.
-#    Inside the compose deployment the publisher connects with its own
-#    least-privilege role (the password is PUBLISHER_DB_PASSWORD in .env):
-npm run policy:publish -- --workspace default \
+# 3. Sign and publish a project's current drafts as its new active version.
+#    --project accepts a name or id and defaults to the workspace's "default"
+#    project. Inside the compose deployment the publisher connects with its
+#    own least-privilege role (the password is PUBLISHER_DB_PASSWORD in .env):
+npm run policy:publish -- --workspace default --project default \
   --database-url postgres://policy_publisher:publisher_dev_pw@localhost:5432/traceguard
 
 # What would be published, without publishing:
-npm run policy:publish -- --workspace default --dry-run
+npm run policy:publish -- --workspace default --project default --dry-run
 ```
 
-Every publish is a new immutable `policy_versions` row carrying the rule set, the server manifest, the tool-pin manifest, the protocol profile, the version, and the previous version's hash, with an Ed25519 signature. The gateway refuses to enforce anything if the content hash, signature, key id, version, or history does not check out, and it remembers the highest version it accepted (the `gateway_state` volume in compose) so pointing the database back at an older signed bundle is detected as a rollback.
+Every publish is a new immutable `policy_versions` row carrying the rule set, the server manifest, the tool-pin manifest, the protocol profile, the version, and the previous version's hash, with an Ed25519 signature. The gateway refuses to enforce anything if the content hash, signature, key id, version, project/workspace binding, or history does not check out. It remembers the highest version it accepted for each project (the `gateway_state` volume in compose), so pointing the database back at an older signed bundle is detected as a rollback.
 
 Consequences worth knowing:
 

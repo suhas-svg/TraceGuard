@@ -61,7 +61,7 @@ describe("trace correlation on policy decisions", () => {
   }
 
   async function createRule(payload: Record<string, unknown>): Promise<void> {
-    const res = await gw.inject({
+    const res = await api.inject({
       method: "POST", url: "/v1/policies", headers: key,
       payload: { enabled: true, priority: 0, ...payload }
     });
@@ -70,13 +70,13 @@ describe("trace correlation on policy decisions", () => {
 
   beforeAll(async () => {
     await startMock();
-    const reg = await gw.inject({
+    const reg = await api.inject({
       method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `corr-${tag}`, base_url: `http://127.0.0.1:${port}/mcp` }
     });
     expect(reg.statusCode).toBe(201);
     serverId = reg.json().id as string;
-    const disc = await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     expect(disc.statusCode).toBe(200);
     await createRule({ name: `corr-allow-${tag}`, effect: "allow" });
     await createRule({ name: `corr-deny-${tag}`, server_id: serverId, tool_name: "blocked_tool", effect: "deny" });

@@ -4,6 +4,7 @@ import { audit } from "./audit.js";
 import { evaluate } from "./policy.js";
 import { loadActivePolicy, rulesFromBundle } from "./policy-bundle.js";
 import type { Principal } from "./auth.js";
+import { resolveProject } from "./project-scope.js";
 
 // The agent-facing boundary is the MCP Streamable HTTP profile of the
 // 2026-07-28 revision: stateless requests, per-request metadata, and only
@@ -181,9 +182,13 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
   if (!workspaceId) {
     return rpcError(env.id, -32003, "Tool not found", { error: "workspace_not_found" });
   }
+  const resolved = await resolveProject(pool, req.principal, { workspaceId });
+  if (!resolved) {
+    return rpcError(env.id, -32003, "Tool not found", { error: "unknown_server_alias", name });
+  }
   const serverRow = await pool.query(
-    "SELECT * FROM mcp_servers WHERE workspace_id = $1 AND gateway_alias = $2",
-    [workspaceId, alias]
+    "SELECT * FROM mcp_servers WHERE project_id = $1 AND gateway_alias = $2",
+    [resolved.project.id, alias]
   );
   const server = serverRow.rows[0];
   if (!server) {
@@ -210,7 +215,7 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
   // §9.5: an approval needing call without the shim's stable logical id is
   // refused explicitly rather than silently creating an unmatchable hold.
   if (!logicalId) {
-    const loaded = await loadActivePolicy(pool, workspaceId);
+    const loaded = await loadActivePolicy(pool, resolved.project.id);
     if (!loaded.ok) {
       return rpcError(env.id, -32008, "Policy unavailable", {
         error: "POLICY_UNAVAILABLE", reason: loaded.reason
@@ -232,8 +237,9 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
   let approvalId: string | undefined;
   if (logicalId) {
     const ap = await pool.query(
-      "SELECT id FROM approvals WHERE request_id = $1 AND caller = $2 AND workspace_id = $3",
-      [logicalId, caller, workspaceId]
+      `SELECT id FROM approvals
+        WHERE request_id = $1 AND caller = $2 AND workspace_id = $3 AND project_id = $4`,
+      [logicalId, caller, workspaceId, server.project_id]
     );
     approvalId = ap.rows[0]?.id as string | undefined;
   }
@@ -341,10 +347,16 @@ export function registerMcpRoutes(app: FastifyInstance): void {
             tools: [], ttlMs: TOOLS_TTL_MS, cacheScope: "workspace", resultType: "complete"
           });
         }
+        const resolved = await resolveProject(pool, req.principal, { workspaceId });
+        if (!resolved) {
+          return rpcResult(env.id, {
+            tools: [], ttlMs: TOOLS_TTL_MS, cacheScope: "workspace", resultType: "complete"
+          });
+        }
         // Listing is gated by the signed manifests: only servers the active
         // policy carries, and only tools whose exact pinned definition it
         // activated, are ever shown to a client (§7.2, §13.3).
-        const loaded = await loadActivePolicy(pool, workspaceId);
+        const loaded = await loadActivePolicy(pool, resolved.project.id);
         if (!loaded.ok) {
           return rpcError(env.id, -32008, "Policy unavailable", {
             error: "POLICY_UNAVAILABLE", reason: loaded.reason
@@ -357,9 +369,9 @@ export function registerMcpRoutes(app: FastifyInstance): void {
         const rows = await pool.query(
           `SELECT s.id AS server_id, s.gateway_alias, t.tool_name, t.definition, t.definition_hash
              FROM mcp_servers s JOIN server_tools t ON t.server_id = s.id
-            WHERE s.workspace_id = $1 AND t.quarantined = false
+            WHERE s.project_id = $1 AND t.quarantined = false
             ORDER BY s.gateway_alias, t.tool_name`,
-          [workspaceId]
+          [resolved.project.id]
         );
         const rules = rulesFromBundle(loaded.policy.bundle);
         return rpcResult(env.id, {

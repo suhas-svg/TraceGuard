@@ -11,8 +11,11 @@ import { attrsToObject, mapOtlpSpan, otlpLimits, otlpRateLimited, type OtlpSpan 
 import { decodeTraceRequest, encodeTraceResponse } from "./otlp_proto.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
 import { assertProductionAuth } from "./oauth.js";
+import { resolveProject } from "./project-scope.js";
 import { audit } from "./audit.js";
 import { registerUserRoutes } from "./users.js";
+import { registerAdminRoutes } from "./admin.js";
+import { registerProjectRoutes } from "./projects.js";
 import { captureRawEnabled, redactDeep } from "./redact.js";
 import { computeWarnings, thresholdsFromEnv } from "./diagnostics.js";
 
@@ -109,6 +112,19 @@ export function buildApp() {
           await client.query("ROLLBACK");
           return reply.code(403).send({ error: "workspace_forbidden", workspace_id: workspaceId });
         }
+        // §7.1/§13.1: every run belongs to a project. An ingestion key is
+        // pinned to one; humans default to their allowed project inside the
+        // workspace and may name another project they are allowed to use.
+        const projectContext = await resolveProject(client, req.principal, {
+          workspaceId,
+          projectId: e.project_id ?? null,
+          projectName: e.project_name ?? null
+        });
+        if (!projectContext) {
+          await client.query("ROLLBACK");
+          return reply.code(403).send({ error: "project_forbidden" });
+        }
+        const projectId = projectContext.project.id;
 
         // Resolve agent: explicit id wins, else per-workspace named agent.
         let agentId = e.agent_id;
@@ -130,10 +146,10 @@ export function buildApp() {
 
         // Run upsert is idempotent on run_id: first event creates, later events update status.
         await client.query(
-          `INSERT INTO runs (id, workspace_id, agent_id, status, started_at)
-           VALUES ($1, $2, $3, 'running', $4)
+          `INSERT INTO runs (id, workspace_id, project_id, agent_id, status, started_at)
+           VALUES ($1, $2, $3, $4, 'running', $5)
            ON CONFLICT (id) DO NOTHING`,
-          [e.run_id, workspaceId, agentId, e.timestamp]
+          [e.run_id, workspaceId, projectId, agentId, e.timestamp]
         );
 
         if (e.event_type === "run.completed" || e.event_type === "run.failed") {
@@ -483,6 +499,8 @@ export function buildApp() {
     };
   });
 
+  registerAdminRoutes(app);
+  registerProjectRoutes(app);
   registerBudgetRoutes(app);
   registerEvalRoutes(app);
   registerWebhookRoutes(app);
@@ -583,6 +601,15 @@ export function buildApp() {
             await client.query("ROLLBACK");
             return reply.code(403).send({ error: "workspace_forbidden", workspace: m.workspaceName });
           }
+          const projectContext = await resolveProject(client, req.principal, {
+            workspaceId: workspace.rows[0].id,
+            projectId: m.projectId,
+            projectName: m.projectName
+          });
+          if (!projectContext) {
+            await client.query("ROLLBACK");
+            return reply.code(403).send({ error: "project_forbidden", project: m.projectName });
+          }
           let agent = await client.query(
             "SELECT id FROM agents WHERE workspace_id = $1 AND name = $2",
             [workspace.rows[0].id, m.agentName]
@@ -594,9 +621,9 @@ export function buildApp() {
             );
           }
           await client.query(
-            `INSERT INTO runs (id, workspace_id, agent_id, status, started_at)
-             VALUES ($1, $2, $3, 'running', $4) ON CONFLICT (id) DO NOTHING`,
-            [m.runId, workspace.rows[0].id, agent.rows[0].id, m.startedAt]
+            `INSERT INTO runs (id, workspace_id, project_id, agent_id, status, started_at)
+             VALUES ($1, $2, $3, $4, 'running', $5) ON CONFLICT (id) DO NOTHING`,
+            [m.runId, workspace.rows[0].id, projectContext.project.id, agent.rows[0].id, m.startedAt]
           );
           const endedAt =
             m.durationMs != null

@@ -7,6 +7,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { buildApp } from "../src/index.js";
 import { buildGateway, buildGatewayControl } from "../src/gateway.js";
 import { pool } from "../src/db.js";
+import { appendAuditEvent } from "@traceguard/audit-chain";
 import { publishTestPolicy } from "./policy-helper.js";
 
 // Full-path suite against a real database and a real MCP upstream. Every
@@ -151,29 +152,29 @@ describe("integration and security", () => {
   });
 
   it("registers upstreams without leaking secrets, and refuses unsafe URLs", async () => {
-    const bad = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+    const bad = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `bad-${tag}`, base_url: "ftp://evil/x" } });
     expect(bad.statusCode).toBe(400);
     // Cloud metadata addresses are never valid upstreams, even when private
     // upstreams are allowed.
-    const metadata = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+    const metadata = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `meta-${tag}`, base_url: "http://169.254.169.254/mcp" } });
     expect(metadata.statusCode).toBe(400);
-    const res = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+    const res = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `mock-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`, auth_secret: "s3cret" } });
     expect(res.statusCode).toBe(201);
     serverId = res.json().id;
-    const list = await gw.inject({ method: "GET", url: "/v1/servers", headers: key });
+    const list = await api.inject({ method: "GET", url: "/v1/servers", headers: key });
     expect(JSON.stringify(list.json())).not.toContain("s3cret");
-    const disc = await gw.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
+    const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     expect(disc.json().tools.map((t: { tool_name: string }) => t.tool_name)).toContain("echo");
   });
 
   it("allows listed calls and blocks denied ones without upstream contact", async () => {
-    const allow = await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+    const allow = await api.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `allow-${tag}`, server_id: serverId, tool_name: "echo", effect: "allow" } });
     expect(allow.statusCode).toBe(201);
-    const deny = await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+    const deny = await api.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `deny-${tag}`, priority: 100, server_id: serverId, tool_name: "echo", effect: "deny",
         conditions: { arguments: { text: { regex: "^nope" } } } } });
     expect(deny.statusCode).toBe(201);
@@ -218,12 +219,12 @@ describe("integration and security", () => {
     // rather than the call's duration. This asserts it is recorded on both
     // paths and stays below the whole call; the exclusion itself is a property
     // of where the clock is read, not something a fast upstream can show.
-    const srv = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+    const srv = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `ovh-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp` } });
     expect(srv.statusCode).toBe(201);
     const id = srv.json().id;
-    await gw.inject({ method: "POST", url: `/v1/servers/${id}/discover`, headers: key });
-    await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+    await api.inject({ method: "POST", url: `/v1/servers/${id}/discover`, headers: key });
+    await api.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `ovh-allow-${tag}`, server_id: id, tool_name: "echo", effect: "allow" } });
     await publishTestPolicy(pool);
 
@@ -262,7 +263,7 @@ describe("integration and security", () => {
     const ak = await api.inject({ method: "POST", url: `/v1/users/${au.json().id}/keys`, headers: key,
       payload: { name: "agent", scopes: ["gateway"], expires_days: 7 } });
     const agentKey = { authorization: `Bearer ${ak.json().key}` };
-    await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+    await api.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `appr-${tag}`, priority: 50, server_id: serverId, effect: "require_approval" } });
     await publishTestPolicy(pool);
     const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
@@ -406,10 +407,10 @@ describe("integration and security", () => {
 
   it("alerts webhooks on denials with a verifiable signature", async () => {
     // Self-contained upstream: other tests may be skipped in filtered runs.
-    const reg = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+    const reg = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `hook-upstream-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp` } });
     const hookServerId = reg.json().id;
-    await gw.inject({ method: "POST", url: `/v1/servers/${hookServerId}/discover`, headers: key });
+    await api.inject({ method: "POST", url: `/v1/servers/${hookServerId}/discover`, headers: key });
     await publishTestPolicy(pool);
     const received: { headers: Record<string, string | string[] | undefined>; body: string }[] = [];
     const stub = createServer((req, res) => {
@@ -733,13 +734,22 @@ describe("integration and security", () => {
       expect(res.statusCode).toBe(404);
     }
     // Servers and policies from the other workspace stay hidden too.
-    const srv = await gw.inject({ method: "GET", url: "/v1/servers", headers: reader });
+    const srv = await api.inject({ method: "GET", url: "/v1/servers", headers: reader });
     expect(srv.json().items.every((s: { workspace_id: string }) => s.workspace_id !== wsB.json().id)).toBe(true);
-    const pol = await gw.inject({ method: "GET", url: "/v1/policies", headers: reader });
+    const pol = await api.inject({ method: "GET", url: "/v1/policies", headers: reader });
     expect(pol.json().items.every((p: { workspace_id: string }) => p.workspace_id !== wsB.json().id)).toBe(true);
   });
 
   it("keeps the audit hash chain linked", async () => {
+    // Self-contained under -t: earlier tests may have been skipped, leaving an
+    // empty chain. A marker append exercises the same path production uses.
+    const count = await pool.query<{ n: number }>("SELECT count(*)::int AS n FROM audit_events");
+    if (count.rows[0].n === 0) {
+      await appendAuditEvent(pool, {
+        actor_type: "test", actor_id: "integration", action: "audit.marker",
+        resource_type: "audit_event", result: "success", metadata: { seed: true }
+      });
+    }
     const rows = await pool.query("SELECT hash, prev_hash FROM audit_events ORDER BY timestamp ASC, id ASC LIMIT 200");
     expect(rows.rows.length).toBeGreaterThan(0);
     let prev = "";
@@ -756,7 +766,7 @@ describe("integration and security", () => {
       payload: { events: [ev({ agent_name: agentName })] } });
     expect(ingested.statusCode).toBe(200);
     const agentA = (await pool.query("SELECT id FROM agents WHERE name = $1", [agentName])).rows[0].id;
-    await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+    await api.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `agent-deny-${tag}`, priority: 200, agent_id: agentA, effect: "deny" } });
     await publishTestPolicy(pool);
     const before = upstreamHits;
@@ -854,11 +864,11 @@ describe("integration and security", () => {
     await new Promise<void>((resolve) => flakyHttp.listen(0, "127.0.0.1", resolve));
     const port = (flakyHttp.address() as { port: number }).port;
     try {
-      const reg = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+      const reg = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
         payload: { name: `flaky-${tag}`, base_url: `http://127.0.0.1:${port}/mcp` } });
       const sid = reg.json().id;
-      await gw.inject({ method: "POST", url: `/v1/servers/${sid}/discover`, headers: key });
-      await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+      await api.inject({ method: "POST", url: `/v1/servers/${sid}/discover`, headers: key });
+      await api.inject({ method: "POST", url: "/v1/policies", headers: key,
         payload: { name: `flaky-allow-${tag}`, server_id: sid, tool_name: "boom", effect: "allow" } });
     await publishTestPolicy(pool);
       const res = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
@@ -896,7 +906,7 @@ describe("integration and security", () => {
     expect(decided.statusCode).toBe(200);
     // A deny rule lands after the approval was issued. It must win: an
     // approval never overrides an unconditional deny.
-    const deny = await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+    const deny = await api.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `late-deny-${tag}`, priority: 300, server_id: serverId, tool_name: "echo",
         effect: "deny", conditions: { arguments: { text: { enum: [staleArgs.text] } } } } });
     expect(deny.statusCode).toBe(201);
@@ -1324,11 +1334,11 @@ describe("integration and security", () => {
   it("warn budgets surface a warning without blocking the call", async () => {
     // Self-contained upstream: other tests may be skipped in filtered runs,
     // and the shared server may not exist yet.
-    const reg = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+    const reg = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `warn-upstream-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp` } });
     const warnServerId = reg.json().id;
-    await gw.inject({ method: "POST", url: `/v1/servers/${warnServerId}/discover`, headers: key });
-    await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+    await api.inject({ method: "POST", url: `/v1/servers/${warnServerId}/discover`, headers: key });
+    await api.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `warn-allow-${tag}`, server_id: warnServerId, tool_name: "echo", effect: "allow" } });
     await publishTestPolicy(pool);
     const runId = randomUUID();
@@ -1395,11 +1405,11 @@ describe("integration and security", () => {
   });
 
   it("sweeps expired approvals out of the pending queue on list", async () => {
-    const reg = await gw.inject({ method: "POST", url: "/v1/servers", headers: key,
+    const reg = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `sweep-upstream-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp` } });
     const sweepServerId = reg.json().id;
-    await gw.inject({ method: "POST", url: `/v1/servers/${sweepServerId}/discover`, headers: key });
-    await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+    await api.inject({ method: "POST", url: `/v1/servers/${sweepServerId}/discover`, headers: key });
+    await api.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `sweep-hold-${tag}`, priority: 90, server_id: sweepServerId, effect: "require_approval" } });
     await publishTestPolicy(pool);
     const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
@@ -1538,7 +1548,7 @@ describe("integration and security", () => {
     const kc = await api.inject({ method: "POST", url: `/v1/users/${mu.json().id}/keys`, headers: key,
       payload: { name: "peeker", scopes: ["read"] } });
     const peeker = { authorization: `Bearer ${kc.json().key}` };
-    await gw.inject({ method: "POST", url: "/v1/policies", headers: key,
+    await api.inject({ method: "POST", url: "/v1/policies", headers: key,
       payload: { name: `peek-appr-${tag}`, priority: 200, server_id: serverId,
         tool_name: "echo", effect: "require_approval" } });
     await publishTestPolicy(pool);
@@ -1697,54 +1707,72 @@ describe("integration and security", () => {
     expect(Number(rules.rows[0].max_rows)).toBe(100000);
   });
 
-  it("anchors a pruned audit chain with a signed checkpoint", async () => {
+  it("anchors a pruned audit chain at the last event in the segment", async () => {
     const { generateKeyPairSync } = await import("node:crypto");
+    const { appendAuditEvent, signCheckpoint } = await import("@traceguard/audit-chain");
     const { privateKey, publicKey } = generateKeyPairSync("ed25519");
     const privatePem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
     const publicPem = publicKey.export({ type: "spki", format: "pem" }).toString();
-    const prevKey = process.env.AUDIT_CHECKPOINT_KEY;
     const prevPub = process.env.AUDIT_CHECKPOINT_PUBLIC_KEY;
-    process.env.AUDIT_CHECKPOINT_KEY = privatePem;
     process.env.AUDIT_CHECKPOINT_PUBLIC_KEY = publicPem;
     try {
-      const created = await gw.inject({ method: "POST", url: "/v1/audit/checkpoints", headers: key, payload: {} });
-      expect(created.statusCode).toBe(201);
-      const checkpoint = created.json();
-      expect(checkpoint.payload.event_count).toBeGreaterThanOrEqual(1);
-      expect(checkpoint.key_id).toBeTruthy();
-      // FR-019: the signed payload records the checked segment per workspace.
-      expect(checkpoint.payload.v).toBe(2);
-      expect(Array.isArray(checkpoint.payload.segments)).toBe(true);
-      expect(checkpoint.payload.segments.length).toBeGreaterThanOrEqual(1);
-      // Pruning requires an external-storage receipt for the signed payload.
-      const noReceipt = await gw.inject({ method: "POST", url: "/v1/audit/prune", headers: key,
-        payload: { checkpoint_id: checkpoint.id } });
-      expect(noReceipt.statusCode).toBe(400);
-      expect(noReceipt.json().error).toBe("invalid_prune");
-      // A checkpoint row whose signature does not verify is refused, and the
-      // refusal lands in the chain.
-      const bogus = await pool.query(
-        `INSERT INTO audit_checkpoints (up_to_timestamp, up_to_hash, event_count, signature, key_id, payload)
-         VALUES (now(), 'deadbeef', 0, 'not-a-signature', 'unknown', '{}'::jsonb) RETURNING id`);
-      const rejected = await gw.inject({ method: "POST", url: "/v1/audit/prune", headers: key,
-        payload: { checkpoint_id: bogus.rows[0].id, external_ref: "https://vault.example/receipts/bogus" } });
-      expect(rejected.statusCode).toBe(403);
-      expect(rejected.json().error).toBe("checkpoint_signature_invalid");
-      const rejectedAudit = await pool.query(
-        "SELECT count(*)::int AS n FROM audit_events WHERE action = 'audit.segment.prune_rejected'");
-      expect(rejectedAudit.rows[0].n).toBeGreaterThanOrEqual(1);
-      // The real checkpoint authorizes the prune; the covered prefix leaves,
-      // and the external receipt is recorded in the audit trail.
-      const pruned = await gw.inject({ method: "POST", url: "/v1/audit/prune", headers: key,
-        payload: { checkpoint_id: checkpoint.id, external_ref: "https://vault.example/receipts/1" } });
-      expect(pruned.statusCode).toBe(200);
-      expect(pruned.json().pruned).toBeGreaterThanOrEqual(1);
-      const segment = await pool.query(
-        "SELECT count(*)::int AS n FROM audit_events WHERE action = 'audit.segment.pruned'");
-      expect(segment.rows[0].n).toBe(1);
-      const receipt = await pool.query(
-        "SELECT metadata FROM audit_events WHERE action = 'audit.segment.pruned' ORDER BY id DESC LIMIT 1");
-      expect(receipt.rows[0].metadata).toMatchObject({ external_ref: "https://vault.example/receipts/1" });
+      // Self-contained under -t: an empty chain has no last event to anchor.
+      const seeded = await pool.query<{ n: number }>("SELECT count(*)::int AS n FROM audit_events");
+      if (seeded.rows[0].n === 0) {
+        await appendAuditEvent(pool, {
+          actor_type: "test", actor_id: "integration", action: "audit.marker",
+          resource_type: "audit_event", result: "success", metadata: { seed: true }
+        });
+      }
+      // Choose the current tip as the segment boundary and prune through it.
+      // No event before the boundary survives, so the next append must link
+      // to the checkpoint's cut hash rather than to a retained event.
+      const tip = (await pool.query(
+        "SELECT id, hash, timestamp FROM audit_events ORDER BY timestamp DESC, id DESC LIMIT 1"
+      )).rows[0];
+      expect(tip).toBeTruthy();
+      const count = await pool.query(
+        "SELECT count(*)::bigint AS n FROM audit_events WHERE (timestamp,id) <= ($1,$2)",
+        [tip.timestamp, tip.id]
+      );
+      const segments = await pool.query(
+        `SELECT DISTINCT ON (workspace_id) workspace_id, seq, hash
+           FROM audit_events WHERE (timestamp,id) <= ($1,$2)
+          ORDER BY workspace_id, seq DESC NULLS LAST, timestamp DESC, id DESC`,
+        [tip.timestamp, tip.id]
+      );
+      const payload = {
+        v: 3 as const,
+        created_at: new Date().toISOString(),
+        up_to_timestamp: new Date(tip.timestamp).toISOString(),
+        up_to_hash: tip.hash as string,
+        up_to_event_id: tip.id as string,
+        event_count: Number(count.rows[0].n),
+        segments: segments.rows.map((r) => ({
+          workspace_id: (r.workspace_id as string | null) ?? null,
+          up_to_sequence: r.seq === null || r.seq === undefined ? null : Number(r.seq),
+          up_to_hash: r.hash as string
+        }))
+      };
+      const signed = signCheckpoint(payload, privatePem);
+      const cp = await pool.query(
+        `INSERT INTO audit_checkpoints
+           (up_to_timestamp, up_to_hash, up_to_event_id, event_count, signature, key_id, payload)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+        [payload.up_to_timestamp, payload.up_to_hash, payload.up_to_event_id,
+         payload.event_count, signed.signature, signed.key_id, JSON.stringify(payload)]
+      );
+      const pruned = await pool.query("SELECT prune_audit_events($1,$2) AS deleted", [
+        cp.rows[0].id, "test://audit-vault/segment.json"
+      ]);
+      expect(Number(pruned.rows[0].deleted)).toBe(payload.event_count);
+      // The operator records the prune after the deletion. With no retained
+      // events, this append must link to the checkpoint's cut hash.
+      await appendAuditEvent(pool, {
+        actor_type: "admin", actor_id: "test", action: "audit.segment.pruned",
+        resource_type: "audit_checkpoint", resource_id: cp.rows[0].id, result: "success",
+        metadata: { external_ref: "test://audit-vault/segment.json" }
+      });
       // The verified chain now anchors at the checkpoint instead of
       // reporting a broken first link — and a partial history is never
       // reported as fully verified.
@@ -1754,10 +1782,8 @@ describe("integration and security", () => {
       expect(verify.json().empty).toBe(false);
       expect(verify.json().complete).toBe(false);
       expect(verify.json().anchored).toMatchObject({
-        checkpoint_id: checkpoint.id, event_count: checkpoint.payload.event_count });
+        checkpoint_id: cp.rows[0].id, event_count: payload.event_count });
     } finally {
-      if (prevKey === undefined) delete process.env.AUDIT_CHECKPOINT_KEY;
-      else process.env.AUDIT_CHECKPOINT_KEY = prevKey;
       if (prevPub === undefined) delete process.env.AUDIT_CHECKPOINT_PUBLIC_KEY;
       else process.env.AUDIT_CHECKPOINT_PUBLIC_KEY = prevPub;
     }

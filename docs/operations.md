@@ -100,31 +100,41 @@ curl -fsS -X POST "$API/v1/admin/sweep-budget-holds" \
 # Apply every enabled retention rule and report per-rule deletion counts.
 curl -fsS -X POST "$API/v1/retention/run" -H "Authorization: Bearer $API_KEY"
 
-# Before any audit pruning: create a signed checkpoint over the chain head,
-# export it, and keep the export outside the database and containers
-# (§10.2/FR-019). The signed payload records the last sequence and hash of
-# every workspace covered by the segment. Checkpoints and pruning live on the
-# gateway listener; pruning stays deliberate, never scheduled.
-curl -fsS -X POST "http://localhost:8091/v1/audit/checkpoints" \
-  -H "Authorization: Bearer $API_KEY"
-curl -fsS "http://localhost:8091/v1/audit/checkpoints/<checkpoint-id>/export" \
-  -H "Authorization: Bearer $API_KEY" > checkpoint-export.json
-# Verify the export offline — signature, chain links, per-workspace segments —
-# before trusting the copy you are about to prune against:
+# Checkpoint creation and pruning are operator-side commands, not gateway
+# routes. The signing key stays on this host; the gateway receives only the
+# public key. `create` reads the exact prefix through the cutoff event, signs
+# the v3 payload, stores a working copy, writes the external artifact, and
+# audits the creation. Run it with DATABASE_URL_RETENTION (or DATABASE_URL).
+npm run audit:checkpoint -- create --cutoff latest \
+  --out checkpoint-export.json --key checkpoint.key.pem
+# Verify the artifact offline — signature, event ids/hashes, and per-workspace
+# sequence continuity — before trusting the copy you will prune against:
 npm run audit:verify -- --export checkpoint-export.json --public-key checkpoint.pub.pem
-# Only then prune. external_ref is required: it names the external copy of the
-# signed checkpoint and lands in the audit trail as the receipt for the
-# removed segment.
-curl -fsS -X POST "http://localhost:8091/v1/audit/prune" \
-  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-  -d '{"checkpoint_id":"<checkpoint-id>","external_ref":"s3://audit-vault/2026-10-20/checkpoint.json"}'
+# Only then prune. The CLI verifies the same signature and that the database
+# prefix exactly matches the signed artifact; it refuses an unsigned, tampered,
+# or mismatched checkpoint. --receipt names the external copy kept outside the
+# database and containers and lands in the audit trail. The database function
+# also rejects a null/blank receipt, so a direct retention-role call cannot
+# bypass the external-copy requirement.
+npm run audit:checkpoint -- prune --artifact checkpoint-export.json \
+  --public-key checkpoint.pub.pem \
+  --receipt s3://audit-vault/2026-10-20/checkpoint.json
 ```
+
+An artifact produced after a prior prune carries that prior signed checkpoint
+under `anchor`; the offline verifier checks the anchor signature and uses its
+workspace heads to prove the retained segment continues without a gap. Both
+`create` and `prune` refuse if the latest pruned checkpoint was signed by a
+different key. This build does not implement key rotation with a trusted key
+history, so keep the checkpoint key stable; rotating it would require extending
+the verifier to accept a chain of trusted public keys first.
 
 Suggested schedule: finalize every 15 minutes, retention nightly. Retention
 can age out whole traces by age and by a span-count cap (the seeded
 `default-span-retention` keeps 7 days or 100,000 spans, whichever comes
 first). Policies, decisions, pending approvals, the audit log, and the
-money tables are never deletion targets — the API refuses them.
+money tables are never normal retention targets — the API refuses them. Audit
+rows leave only through the operator checkpoint/prune command described above.
 
 ## Approval operations
 
@@ -164,10 +174,12 @@ npm run policy:keygen                                   # ./policy-keys/
 # is already live unless --rotate is passed (rotation retires the old key).
 npm run policy:trust -- --workspace default
 
-# Publish the current drafts as the new active version (monotonic).
-npm run policy:publish -- --workspace default
-npm run policy:publish -- --workspace default --dry-run # inspect without publishing
-npm run policy:status -- --workspace default            # active version + draft summary
+# Publish a project's current drafts as its new active version (monotonic).
+# --project accepts a project name or id; it defaults to the workspace's
+# project named "default".
+npm run policy:publish -- --workspace default --project default
+npm run policy:publish -- --workspace default --project default --dry-run
+npm run policy:status -- --workspace default --project default
 ```
 
 Key rotation order matters: `trust --rotate` retires the old key, and the
@@ -175,11 +187,13 @@ gateway refuses versions signed by a retired key, so **publish immediately
 after rotating** or tool calls fail closed in between. A previously retired
 key that is re-trusted is re-activated in place, never duplicated.
 
-The gateway remembers the highest version it accepted in
+The gateway remembers the highest version it accepted for each project in
 `GATEWAY_STATE_DIR` (compose: the `gateway_state` volume). That anchor is
 what turns "someone pointed the database at an older signed bundle" into a
-detected rollback instead of a silent downgrade — it must persist across
-restarts, and a forked anchor is treated as tampering.
+detected rollback instead of a silent downgrade. It must persist across
+restarts, and a forked anchor is treated as tampering. Existing
+workspace-keyed anchors are read once for a workspace's default project so
+the upgrade does not mask a rollback.
 
 ## Verifying the audit chain
 
@@ -188,18 +202,21 @@ curl -fsS -X POST "$GATEWAY/v1/audit/verify" -H "Authorization: Bearer $API_KEY"
 # -> { ok, checked, truncated, problems: [{ id, problem }], anchored, empty, complete }
 ```
 
-The verifier recomputes every event hash and checks every link. Since
-migration 022 the table is append-only at the database layer (UPDATE and
-DELETE are rejected), so a detected mutation means something with schema
-rights disabled the trigger — the party only an externally stored checkpoint
+The verifier recomputes every event hash and checks every link. New events
+use v4 hashes that cover workspace and project attribution; v1–v3 rows keep
+their original formulas. Since migration 022 the table is append-only at the
+database layer (UPDATE and DELETE are rejected), so a detected mutation means
+something with schema rights disabled the trigger — the party only an externally stored checkpoint
 anchors against. A bounded read reports `truncated: true`, and `complete` is
 true only when the whole chain is read, intact, and unpruned — an `anchored`
 prefix or a truncated read is reported as partial, never as fully verified.
-Since FR-019 pruning itself refuses without a valid externally stored
-checkpoint and an `external_ref` receipt. `npm run audit:verify -- --export
-<file> --public-key <pem>` runs the same checks offline against an exported
-checkpoint, without the live database or gateway. The dashboard's Policy tab
-has the same check behind the `Verify chain` button.
+Pruning is the only way audit rows leave the database: the operator CLI
+refuses to prune without a valid externally stored checkpoint and an explicit
+`--receipt`, and only `retention_job` can execute the prune function. The
+gateway cannot create, sign, or prune checkpoints. `npm run audit:verify --
+--export <file> --public-key <pem>` runs the same checks offline against an
+exported checkpoint, without the live database or gateway. The dashboard's
+Policy tab has the same check behind the `Verify chain` button.
 
 Upgrade note: as of the signed-policy change, approval binding hashes
 (`request_hash`, `args_hash`) are computed over RFC 8785 canonical JSON and
@@ -227,12 +244,14 @@ issuer's public keys. Operationally:
 
 ## Least-privilege roles
 
-Migration `023` creates six roles, all `NOLOGIN`. Development runs
-everything as the database owner and is unaffected. **Compose does the
-switch for you**: the `db-roles` service applies the migrations and then
-enables the logins with the passwords in `.env` (`API_DB_PASSWORD`,
-`GATEWAY_DB_PASSWORD`, `RETENTION_DB_PASSWORD`, `PUBLISHER_DB_PASSWORD`),
-and the api, gateway and retention sweep connect as their own roles. In a
+Migrations `023` and `035`–`039` create eight roles, all `NOLOGIN`.
+Development runs everything as the database owner and is unaffected.
+**Compose does the switch for you**: the `db-roles` service applies the
+migrations and then enables the four service logins with the passwords in
+`.env` (`API_DB_PASSWORD`, `GATEWAY_DB_PASSWORD`, `RETENTION_DB_PASSWORD`,
+`PUBLISHER_DB_PASSWORD`), and the api, gateway and retention sweep connect as
+their own roles. The approval, policy, audit, and migration owner roles stay
+non-login. In a
 deployment assembled by hand, enable only the logins you need, each with its
 own password from the secret store:
 

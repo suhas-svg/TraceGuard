@@ -88,7 +88,8 @@ export function registerUserRoutes(app: FastifyInstance) {
       email,
       role,
       scopes: p.scopes,
-      workspaces: p.workspaces
+      workspaces: p.workspaces,
+      projects: p.projects
     };
   });
 
