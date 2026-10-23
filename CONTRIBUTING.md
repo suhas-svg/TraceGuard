@@ -11,10 +11,10 @@ Run the suites that match what you touched; a PR that changes enforcement
 code is expected to show all of them green.
 
 ```bash
-npm install
-npm test                                  # unit tests, all workspaces
-npm run test:security                     # container bypass test (needs the compose stack)
-npm run test:e2e                          # Playwright scenarios (recreates its own database)
+pnpm install
+pnpm test                                 # unit tests, all workspaces
+pnpm test:security                        # container bypass test (needs the compose stack)
+pnpm test:e2e                             # Playwright scenarios (recreates its own database)
 python infra/k8s/check.py                 # Kubernetes manifests
 node scripts/bench.mjs                    # performance table (record results in docs/PERFORMANCE.md)
 ```

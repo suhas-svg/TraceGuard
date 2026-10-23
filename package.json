@@ -3,21 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "license": "Apache-2.0",
-  "workspaces": [
-    "apps/api",
-    "apps/web",
-    "examples/demo-agent-ts",
-    "packages/audit-chain",
-    "packages/canonical-json",
-    "packages/mcp-client-shim",
-    "packages/policy-signing",
-    "packages/schemas",
-    "sdks/typescript",
-    "tools/policy-publisher"
-  ],
+  "packageManager": "pnpm@9.15.4",
   "scripts": {
-    "build": "npm run build -w packages/canonical-json && npm run build -w packages/schemas && npm run build -w packages/audit-chain && npm run build -w packages/policy-signing && npm run build -w packages/mcp-client-shim && npm run build -w apps/api && npm run build -w apps/web && npm run build -w sdks/typescript && npm run build -w tools/policy-publisher && npm run build -w examples/demo-agent-ts",
-    "test": "npm run test --workspaces --if-present",
+    "build": "pnpm -r build",
+    "test": "pnpm -r --if-present test",
     "test:e2e": "playwright test --config tests/e2e/playwright.config.ts",
     "test:security": "node tests/security/bypass.mjs",
     "test:faults": "node tests/faults/run.mjs",
@@ -42,6 +31,7 @@
     "eslint": "^9.39.5",
     "globals": "^17.13.0",
     "tsx": "^4.16.0",
-    "typescript-eslint": "^8.71.2"
+    "typescript-eslint": "^8.71.2",
+    "yaml": "^2.8.1"
   }
 }

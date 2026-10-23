@@ -9,7 +9,7 @@
 // Prerequisites (see README.md in this directory):
 //   1. the compose stack is up and the gateway has a pinned server whose
 //      tool is covered by a require_approval policy;
-//   2. the shim package is built (npm run build -w @traceguard/mcp-client-shim).
+//   2. the shim package is built (pnpm --filter @traceguard/mcp-client-shim build).
 //
 // Usage:
 //   TRACEGUARD_TOOL=<alias>__<tool> node examples/certified-agent/run.mjs

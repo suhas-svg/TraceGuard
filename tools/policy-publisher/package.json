@@ -12,9 +12,9 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@traceguard/audit-chain": "0.1.0",
-    "@traceguard/policy-signing": "0.1.0",
-    "@traceguard/schemas": "0.1.0",
+    "@traceguard/audit-chain": "workspace:*",
+    "@traceguard/policy-signing": "workspace:*",
+    "@traceguard/schemas": "workspace:*",
     "pg": "^8.12.0"
   },
   "devDependencies": {

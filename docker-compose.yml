@@ -88,7 +88,7 @@ services:
       APPROVAL_CLAIM_LEASE_SECONDS: ${APPROVAL_CLAIM_LEASE_SECONDS:-30}
       # §10.2/FR-019: the gateway may verify a checkpoint, never sign one. The
       # private key stays on the operator host and is used by
-      # `npm run audit:checkpoint`; only the public key is mounted here.
+      # `pnpm audit:checkpoint`; only the public key is mounted here.
       AUDIT_CHECKPOINT_PUBLIC_KEY: ${AUDIT_CHECKPOINT_PUBLIC_KEY:-}
       # Demo upstream (mock-tools) lives on the private `tools` network, so
       # the reference deployment opts in explicitly. FR-005: production

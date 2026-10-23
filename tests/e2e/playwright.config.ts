@@ -65,7 +65,7 @@ export default defineConfig({
       env: { MOCK_TOOLS_PORT: "8092" }
     },
     {
-      command: "npm run preview --workspace apps/web -- --port 5173 --strictPort",
+      command: "pnpm --filter @traceguard/web preview --port 5173 --strictPort",
       cwd: "../..",
       url: "http://localhost:5173",
       reuseExistingServer: !process.env.CI,

@@ -1,18 +1,18 @@
 # Dependencies and licenses
 
 TraceGuard ships under Apache-2.0 (see `LICENSE` and `NOTICE`). Third-party
-dependencies are pinned in `package-lock.json`; CI installs with `npm ci`, so a
-lockfile that disagrees with `package.json` fails the build instead of silently
-resolving a different tree.
+dependencies are pinned in `pnpm-lock.yaml`; CI installs with
+`pnpm install --frozen-lockfile`, so a lockfile that disagrees with a
+`package.json` fails the build instead of silently resolving a different tree.
 
 ## Review commands
 
 | Command | What it does |
 | --- | --- |
-| `npm ci --ignore-scripts` | Reproducible install from the pinned lockfile. |
-| `npm run deps:check` | Reads `package-lock.json`, classifies every package as production or development, and checks its SPDX license against the allowlist below. Production violations exit non-zero; development-only warnings do not. |
-| `npm run deps:sbom` | Writes a CycloneDX 1.5 SBOM to `sbom.cdx.json` (gitignored, uploaded by CI). |
-| `npm audit --omit=dev --audit-level=high` | Fails on high or critical advisories in production dependencies. |
+| `pnpm install --frozen-lockfile --ignore-scripts` | Reproducible install from the pinned lockfile. |
+| `pnpm run deps:check` | Reads the installed pnpm tree, classifies every package as production or development, and checks its SPDX license against the allowlist below. Production violations exit non-zero; development-only warnings do not. |
+| `pnpm run deps:sbom` | Writes a CycloneDX 1.5 SBOM to `sbom.cdx.json` (gitignored, uploaded by CI). |
+| `pnpm audit --prod --audit-level high` | Fails on high or critical advisories in production dependencies. |
 
 The license checker is `scripts/dependency-audit.mjs`. It evaluates SPDX
 expressions conservatively: an `OR` branch passes when at least one side is
@@ -41,10 +41,11 @@ file with the reason, then change `ALLOWED` in `scripts/dependency-audit.mjs`.
 
 ## CI gates
 
-The `build-and-test` job runs, after `npm ci --ignore-scripts`:
+The `build-and-test` job runs, after
+`pnpm install --frozen-lockfile --ignore-scripts`:
 
 1. `node scripts/dependency-audit.mjs --sbom sbom.cdx.json`
-2. `npm audit --omit=dev --audit-level=high`
+2. `pnpm audit --prod --audit-level high`
 
 and uploads `sbom.cdx.json` as a build artifact. These are folded into an
 existing required check rather than a new job, so branch protection stays on the
@@ -53,22 +54,23 @@ seven established checks.
 ## Automation
 
 `.github/dependabot.yml` opens weekly pull requests for npm and GitHub Actions
-updates. Minor and patch npm updates are grouped into one PR; major updates stay
-separate. Every update runs the same CI gates, including the license check,
-`npm audit`, the full test suite, and the Playwright e2e run.
+updates. Dependabot reads the pnpm lockfile through the npm ecosystem. Minor and
+patch npm updates are grouped into one PR; major updates stay separate. Every
+update runs the same CI gates, including the license check, `pnpm audit`, the
+full test suite, and the Playwright e2e run.
 
 Dependabot PRs are reviewed like any other change: check the changelog for
 license changes, confirm the SBOM diff, and merge only when every required check
 is green.
 
-## Current snapshot (2026-10-20)
+## Current snapshot (2026-10-23)
 
-`npm run deps:check` against the committed lockfile:
+`pnpm run deps:check` against the installed workspace:
 
 ```
-Scanned 464 packages from package-lock.json
+Scanned 369 packages from the installed pnpm workspace
   production: 159
-  development: 305
+  development: 210
 Production licenses:
    140  MIT
     11  ISC
@@ -77,9 +79,9 @@ Production licenses:
      1  BSD-2-Clause
 
 Development warnings (not shipped): 1
-  caniuse-lite@1.0.30001816 — CC-BY-4.0 — not-in-allowlist
+  caniuse-lite@1.0.30001819 — CC-BY-4.0 — not-in-allowlist
 ```
 
-`npm audit --omit=dev --audit-level=high` reports 0 vulnerabilities at this
+`pnpm audit --prod --audit-level high` reports 0 vulnerabilities at this
 revision. Re-run both commands when the lockfile changes; the snapshot here is
 evidence for the review, not a substitute for the gates.

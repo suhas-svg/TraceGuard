@@ -60,9 +60,9 @@ trap cleanup EXIT INT TERM
 node apps/api/dist/index.js > /tmp/stack-api.log 2>&1 & pids+=($!)
 node apps/api/dist/gateway.js > /tmp/stack-gw.log 2>&1 & pids+=($!)
 node examples/mock-tools/server.mjs > /tmp/stack-mock.log 2>&1 & pids+=($!)
-# Started directly rather than through `npm run preview`: npm spawns vite as a
+# Started directly rather than through `pnpm preview`: pnpm spawns vite as a
 # child, so the recorded pid is the wrapper and stopping it orphans the server.
-(cd apps/web && exec node node_modules/vite/bin/vite.js preview --port 5173 --strictPort) \
+(cd apps/web && exec node ../../node_modules/vite/bin/vite.js preview --port 5173 --strictPort) \
   > /tmp/stack-web.log 2>&1 & pids+=($!)
 printf '%s\n' "${pids[@]}" > "$PIDFILE"
 

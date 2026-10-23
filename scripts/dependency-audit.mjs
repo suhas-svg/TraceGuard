@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// Dependency and license review for the pinned lockfile (§20).
+// Dependency and license review for the pinned pnpm workspace (§20).
 //
-// Reads package-lock.json (lockfile v3), classifies every installed package as
-// production or development, and checks its declared SPDX license against the
-// allowlist in docs/dependencies.md. Production violations fail the run;
-// development-only violations are reported as warnings because they never ship
-// in an image or a release artifact.
+// Reads the installed tree that `pnpm install --frozen-lockfile` produced,
+// classifies every package as production or development, and checks its
+// declared SPDX license against the allowlist in docs/dependencies.md.
+// Production violations fail the run; development-only violations are reported
+// as warnings because they never ship in an image or a release artifact.
 //
 //   node scripts/dependency-audit.mjs
 //   node scripts/dependency-audit.mjs --json
@@ -13,8 +13,8 @@
 //
 // The CycloneDX output is a build artifact; sbom.cdx.json is gitignored.
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
 
 // Permissive licenses accepted for shipped dependencies. MPL-2.0 is allowed
 // for unmodified dependencies (file-level copyleft); do not vendor or modify
@@ -78,39 +78,41 @@ function classify(expression) {
   return denied ? `denied (${denied.label})` : "not-in-allowlist";
 }
 
-function readLicenseFromPackage(key) {
-  const file = join(key, "package.json");
-  if (!existsSync(file)) return null;
-  try {
-    const pkg = JSON.parse(readFileSync(file, "utf8"));
-    if (typeof pkg.license === "string") return pkg.license;
-    if (pkg.license && typeof pkg.license.type === "string") return pkg.license.type;
-    if (Array.isArray(pkg.licenses) && pkg.licenses.length > 0) {
-      return pkg.licenses.map((l) => (typeof l === "string" ? l : l.type)).filter(Boolean).join(" OR ");
-    }
-  } catch {
-    return null;
-  }
-  return null;
+function readInstalledLicenses(prodOnly) {
+  const command = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+  const args = ["licenses", "list", "--json", ...(prodOnly ? ["--prod"] : [])];
+  return JSON.parse(
+    execFileSync(command, args, {
+      encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024,
+      shell: process.platform === "win32",
+    }),
+  );
 }
 
-export function collect(lockfile = "package-lock.json") {
-  const lock = JSON.parse(readFileSync(lockfile, "utf8"));
-  const packages = lock.packages ?? {};
+export function collect() {
+  const all = readInstalledLicenses(false);
+  const production = readInstalledLicenses(true);
+  const productionRefs = new Set();
+  for (const entries of Object.values(production)) {
+    for (const entry of entries) {
+      for (const version of entry.versions) productionRefs.add(`${entry.name}@${version}`);
+    }
+  }
+
   const found = [];
-  for (const [key, meta] of Object.entries(packages)) {
-    if (!key.startsWith("node_modules/")) continue;
-    if (meta.link === true) continue;
-    if (!meta.version) continue;
-    const name = meta.name || key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length);
-    const license = meta.license || readLicenseFromPackage(key);
-    found.push({
-      name,
-      version: meta.version,
-      license: typeof license === "string" ? license : null,
-      dev: meta.dev === true || meta.devOptional === true,
-      path: key,
-    });
+  for (const [licenseGroup, entries] of Object.entries(all)) {
+    for (const entry of entries) {
+      for (const version of entry.versions) {
+        found.push({
+          name: entry.name,
+          version,
+          license: entry.license ?? (licenseGroup === "Unknown" ? null : licenseGroup),
+          dev: !productionRefs.has(`${entry.name}@${version}`),
+          path: entry.paths?.[0] ?? "",
+        });
+      }
+    }
   }
   return found;
 }
@@ -191,7 +193,7 @@ function main(argv) {
     return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   };
 
-  console.log(`Scanned ${components.length} packages from package-lock.json`);
+  console.log(`Scanned ${components.length} packages from the installed pnpm workspace`);
   console.log(`  production: ${prod.length}`);
   console.log(`  development: ${dev.length}`);
   console.log("Production licenses:");

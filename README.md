@@ -23,11 +23,11 @@ against a running stack; see the file header for the commands.
 One command from a clean checkout:
 
 ```bash
-npm install
-npm run demo
+pnpm install
+pnpm demo
 ```
 
-`npm run demo` creates `.env` from `.env.example` if it is missing, generates
+`pnpm demo` creates `.env` from `.env.example` if it is missing, generates
 the approval seal key and an ed25519 audit-checkpoint key pair under
 `.demo-keys/` (gitignored), builds and starts the compose stack, waits for the
 api, gateway, approval control listener, and dashboard, then runs the demo agent
@@ -35,8 +35,8 @@ through the boundary and prints the live trace URL. No key is committed and no
 key is printed.
 
 ```bash
-npm run demo:audit   # signed checkpoint -> export -> offline verify -> refused prune
-npm run demo:reset   # remove demo/bench fixtures, keep history
+pnpm demo:audit   # signed checkpoint -> export -> offline verify -> refused prune
+pnpm demo:reset   # remove demo/bench fixtures, keep history
 ```
 
 `demo:audit` exercises §21.16 directly: it invokes the operator CLI to create
@@ -50,7 +50,7 @@ their `anchor`; the offline verifier checks it before using its workspace heads.
 Dev ports: API 8090, gateway 8091, approval control listener 8093, mock tools
 8092 (internal only), web 5173. The demo agent runs as the `agent` container
 on `agent_edge`: the gateway is the only container it can reach, and
-`npm run test:security` proves that from inside it (upstream, api and postgres
+`pnpm test:security` proves that from inside it (upstream, api and postgres
 must all refuse the agent). Agent telemetry goes to the gateway's fixed
 `/v1/ingest/events` path, which forwards it to the API; the agent never talks
 to the API directly.
@@ -74,9 +74,9 @@ to the API directly.
 5. Open http://localhost:5173, set the API URL and key in the header, browse runs.
 
 Starting compose by hand does not set `AUDIT_CHECKPOINT_PUBLIC_KEY`; export it
-yourself (or use `npm run demo`) if you want the gateway to verify anchored
+yourself (or use `pnpm demo`) if you want the gateway to verify anchored
 history. The private key stays on the operator host and is used only by
-`npm run audit:checkpoint`.
+`pnpm audit:checkpoint`.
 
 ## Signed policy: the operator flow
 
@@ -84,20 +84,20 @@ The control surface edits **drafts** — rules in `policies`, server registratio
 
 ```bash
 # 1. Create the signing key pair (once). Keep the private key on this host.
-npm run policy:keygen                      # writes ./policy-keys/{signing-key.pem,.pub.pem}
+pnpm policy:keygen                      # writes ./policy-keys/{signing-key.pem,.pub.pem}
 
 # 2. Trust the public key for a workspace (once; audited).
-npm run policy:trust -- --workspace default
+pnpm policy:trust -- --workspace default
 
 # 3. Sign and publish a project's current drafts as its new active version.
 #    --project accepts a name or id and defaults to the workspace's "default"
 #    project. Inside the compose deployment the publisher connects with its
 #    own least-privilege role (the password is PUBLISHER_DB_PASSWORD in .env):
-npm run policy:publish -- --workspace default --project default \
+pnpm policy:publish -- --workspace default --project default \
   --database-url postgres://policy_publisher:publisher_dev_pw@localhost:5432/traceguard
 
 # What would be published, without publishing:
-npm run policy:publish -- --workspace default --project default --dry-run
+pnpm policy:publish -- --workspace default --project default --dry-run
 ```
 
 Every publish is a new immutable `policy_versions` row carrying the rule set, the server manifest, the tool-pin manifest, the protocol profile, the version, and the previous version's hash, with an Ed25519 signature. The gateway refuses to enforce anything if the content hash, signature, key id, version, project/workspace binding, or history does not check out. It remembers the highest version it accepted for each project (the `gateway_state` volume in compose), so pointing the database back at an older signed bundle is detected as a rollback.
@@ -209,9 +209,9 @@ The dashboard's Policy tab shows the active signed version and its history, and 
 - The dashboard has an Evaluations tab: suite list, per-case results with
   failure reasons, links back to traces, and a two-run comparison.
 
-Unit checks: `npm install && npm test`. The Python SDK suite runs separately
+Unit checks: `pnpm install && pnpm test`. The Python SDK suite runs separately
 (`pip install "./sdks/python[dev]" && python -m pytest sdks/python`), the
-browser scenarios with `npm run test:e2e`, the Kubernetes manifests with
+browser scenarios with `pnpm test:e2e`, the Kubernetes manifests with
 `python infra/k8s/check.py`, and the performance table with
 `node scripts/bench.mjs`.
 
@@ -235,7 +235,7 @@ browser scenarios with `npm run test:e2e`, the Kubernetes manifests with
   exchanged for short-lived HttpOnly sessions and are never stored in
   localStorage. Policy and approval actions live on their own tabs; run views
   stay read-only.
-- Run it: `npm run dev --workspace=@traceguard/web` (port 5173) against the
+- Run it: `pnpm --filter @traceguard/web dev` (port 5173) against the
   API on 8090, or `docker compose up web` for the built bundle.
 
 ## Phase 2: gateway and policy

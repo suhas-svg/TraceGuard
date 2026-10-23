@@ -6,9 +6,9 @@
 // the signed artifact outside the database, and (separately) prunes only after
 // re-verifying that artifact and matching it against the rows still present.
 //
-//   npm run audit:checkpoint -- create --cutoff <event-id> --out checkpoint.json \
+//   pnpm audit:checkpoint -- create --cutoff <event-id> --out checkpoint.json \
 //     --key checkpoint.key.pem
-//   npm run audit:checkpoint -- prune --artifact checkpoint.json \
+//   pnpm audit:checkpoint -- prune --artifact checkpoint.json \
 //     --public-key checkpoint.pub.pem --receipt s3://audit-vault/checkpoint.json
 //
 // `create` needs the retention role (SELECT audit events/checkpoints, INSERT

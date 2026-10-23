@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 // One-command demo (§22) and the §21.16 checkpoint walk.
 //
-//   npm run demo          # .env + keys, build the stack, wait, run the agent,
-//                         # print the live trace URL
-//   npm run demo:audit    # signed checkpoint -> export -> offline verify ->
-//                         # prove retention refuses an unsigned prune
-//   npm run demo:reset    # remove demo/bench fixtures, keep history
+//   pnpm demo          # .env + keys, build the stack, wait, run the agent,
+//                      # print the live trace URL
+//   pnpm demo:audit    # signed checkpoint -> export -> offline verify ->
+//                      # prove retention refuses an unsigned prune
+//   pnpm demo:reset    # remove demo/bench fixtures, keep history
 //
 // The script only uses Node built-ins and the docker CLI. It never prints a
 // private key. The checkpoint key pair lives in .demo-keys/ (gitignored); only
@@ -201,8 +201,8 @@ async function up(argv) {
   log(`  api:       ${API_URL}`);
   log(`  gateway:   ${GATEWAY_URL}  (control listener ${CONTROL_URL})`);
   log("\nnext:");
-  log("  npm run demo:audit   # checkpoint -> export -> offline verify -> refused prune");
-  log("  npm run demo:reset   # remove demo/bench fixtures, keep history");
+  log("  pnpm demo:audit   # checkpoint -> export -> offline verify -> refused prune");
+  log("  pnpm demo:reset   # remove demo/bench fixtures, keep history");
 }
 
 function reset() {
@@ -227,16 +227,16 @@ function shellQuote(part) {
   return /\s/.test(part) ? `"${part}"` : part;
 }
 
-function npx(args, options = {}) {
+function pnpmExec(args, options = {}) {
   if (process.platform === "win32") {
-    return spawnSync(`npx ${args.map(shellQuote).join(" ")}`, {
+    return spawnSync(`pnpm exec ${args.map(shellQuote).join(" ")}`, {
       cwd: ROOT,
       encoding: "utf8",
       shell: true,
       ...options,
     });
   }
-  return spawnSync("npx", args, { cwd: ROOT, encoding: "utf8", ...options });
+  return spawnSync("pnpm", ["exec", ...args], { cwd: ROOT, encoding: "utf8", ...options });
 }
 
 function operatorDatabaseUrl(env) {
@@ -254,7 +254,7 @@ function operatorDatabaseUrl(env) {
 }
 
 function checkpointCli(args, env) {
-  return npx(
+  return pnpmExec(
     ["tsx", "scripts/audit-checkpoint.mts", ...args,
       "--database-url", operatorDatabaseUrl(env)],
     { stdio: "inherit" },
@@ -267,7 +267,7 @@ async function audit() {
     ? readFileSync(PUBLIC_KEY_FILE, "utf8")
     : process.env.AUDIT_CHECKPOINT_PUBLIC_KEY || env.AUDIT_CHECKPOINT_PUBLIC_KEY;
   if (!publicPem) {
-    fail("no checkpoint public key; run `npm run demo` first (or set AUDIT_CHECKPOINT_PUBLIC_KEY)");
+    fail("no checkpoint public key; run `pnpm demo` first (or set AUDIT_CHECKPOINT_PUBLIC_KEY)");
   }
 
   log("1. create a signed checkpoint over the exact prefix ending at the current tip");
@@ -285,11 +285,11 @@ async function audit() {
   log(`   wrote ${EXPORT_FILE} (${artifact.events?.length ?? 0} events)`);
 
   log("\n2. verify the checkpoint and chain offline (no API or database trust)");
-  const build = npx(["tsc", "-p", "packages/canonical-json/tsconfig.json"]);
+  const build = pnpmExec(["tsc", "-p", "packages/canonical-json/tsconfig.json"]);
   if (build.status !== 0) fail("could not build packages/canonical-json");
-  const buildChain = npx(["tsc", "-p", "packages/audit-chain/tsconfig.json"]);
+  const buildChain = pnpmExec(["tsc", "-p", "packages/audit-chain/tsconfig.json"]);
   if (buildChain.status !== 0) fail("could not build packages/audit-chain");
-  const verify = npx(
+  const verify = pnpmExec(
     ["tsx", "scripts/verify-audit.mts", "--export", EXPORT_FILE, "--public-key", PUBLIC_KEY_FILE],
     { stdio: "inherit" },
   );
@@ -312,7 +312,7 @@ async function audit() {
   log(`  export:   ${EXPORT_FILE}`);
   log("  receipt:  store the export outside PostgreSQL and the api/gateway containers.");
   log("  to prune (operator step, not run by the demo):");
-  log(`    npm run audit:checkpoint -- prune \\`);
+  log(`    pnpm audit:checkpoint -- prune \\`);
   log(`      --artifact ${EXPORT_FILE} --public-key ${PUBLIC_KEY_FILE} \\`);
   log(`      --receipt s3://audit-vault/${checkpoint.id}.json`);
 }

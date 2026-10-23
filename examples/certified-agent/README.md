@@ -16,7 +16,7 @@ telemetry side; this one shows enforcement-side client behaviour only.
 
    ```bash
    docker compose up -d
-   npm run build -w @traceguard/mcp-client-shim
+   pnpm --filter @traceguard/mcp-client-shim build
    ```
 
 2. A registered, pinned server and a `require_approval` policy for the tool

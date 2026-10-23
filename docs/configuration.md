@@ -17,8 +17,8 @@ variable, which is how the compose file reads them.
 | APPROVAL_TTL_SECONDS | gateway | 900 | pending approvals die after this (hard max 3600) |
 | APPROVAL_CLAIM_LEASE_SECONDS | gateway | 30 | how long a consume attempt holds the CLAIMED lease before the sweep returns it to APPROVED |
 | AUDIT_CHECKPOINT_PUBLIC_KEY | gateway | — | ed25519 PEM public key used only to verify operator-signed checkpoints; unset skips anchoring on verify |
-| AUDIT_CHECKPOINT_KEY_FILE | operator CLI | — | path to the ed25519 private key; used by `npm run audit:checkpoint` on the operator host, never mounted in a container |
-| AUDIT_CHECKPOINT_PUBLIC_KEY_FILE | operator CLI | — | path to the public key for `audit:checkpoint prune` and `npm run audit:verify` |
+| AUDIT_CHECKPOINT_KEY_FILE | operator CLI | — | path to the ed25519 private key; used by `pnpm audit:checkpoint` on the operator host, never mounted in a container |
+| AUDIT_CHECKPOINT_PUBLIC_KEY_FILE | operator CLI | — | path to the public key for `audit:checkpoint prune` and `pnpm audit:verify` |
 | APPROVAL_EXECUTION_TIMEOUT_SECONDS | gateway | 300 | how long an EXECUTING row may stay unresolved before the sweep finalizes it as OUTCOME_UNKNOWN |
 | APPROVAL_MAX_PENDING_PER_CALLER | gateway | 10 | spec hard maximum; set lower only |
 | APPROVAL_MAX_PENDING_PER_WORKSPACE | gateway | 100 | spec hard maximum; set lower only |
@@ -54,7 +54,7 @@ Ports on a dev machine: API 8090, gateway 8091, approval control listener
 the boundary real: `front` (api, gateway, postgres, web), `tools` (gateway,
 mock-tools; `internal: true`, so the upstream has no route off the host),
 `agent_edge` (gateway, agent) and the agent's lack of everything else.
-`npm run test:security` asserts that from inside the agent container.
+`pnpm test:security` asserts that from inside the agent container.
 
 ## Users and scoped keys
 

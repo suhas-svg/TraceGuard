@@ -9,7 +9,7 @@
     "start": "node dist/main.js"
   },
   "dependencies": {
-    "@traceguard/sdk": "0.1.0"
+    "@traceguard/sdk": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.5.0"

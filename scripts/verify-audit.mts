@@ -16,8 +16,8 @@
 // and the per-workspace sequences. A partial or truncated history is
 // reported as partial — never as fully verified (§10.2).
 //
-// Build first (`npm run build`), then:
-//   npm run audit:verify -- --export export.json --public-key checkpoint.pub.pem
+// Build first (`pnpm build`), then:
+//   pnpm audit:verify -- --export export.json --public-key checkpoint.pub.pem
 import { readFileSync } from "node:fs";
 import {
   verifyAuditChain, verifyCheckpoint, checkpointKeyId,

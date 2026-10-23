@@ -11,7 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@traceguard/canonical-json": "0.1.0"
+    "@traceguard/canonical-json": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.5.0",

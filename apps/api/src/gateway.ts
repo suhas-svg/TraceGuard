@@ -1191,7 +1191,7 @@ export function buildGateway() {
   // exactly the party an operator-controlled checkpoint exists to catch.
   // Â§10.3: a checkpoint signs the chain head with a key held outside the
   // §10.2/FR-019: checkpoint creation, export, and pruning are operator-side
-  // (`npm run audit:checkpoint`). The gateway holds only the public key and
+  // (`pnpm audit:checkpoint`). The gateway holds only the public key and
   // can verify an imported checkpoint; it cannot sign or prune one.
 
 
