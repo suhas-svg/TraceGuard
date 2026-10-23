@@ -19,7 +19,6 @@ function ApprovalCard({
 }) {
   const [reason, setReason] = useState("");
   const [error, setError] = useState("");
-  const [result, setResult] = useState("");
 
   const decide = async (approved: boolean) => {
     setError("");
@@ -28,25 +27,6 @@ function ApprovalCard({
       onChanged();
     } catch (e) {
       setError(e instanceof Error ? e.message : "decision failed");
-    }
-  };
-
-  // Run now retries the exact bound call through the gateway. The approval is
-  // consumed by the execution, so a replay afterwards gets a 410.
-  const runNow = async () => {
-    setError("");
-    setResult("");
-    try {
-      const r = await gwApi.call({
-        server_id: a.server_id, tool: a.tool_name, arguments: a.args,
-        caller: a.caller, request_id: a.request_id, approval_id: a.id,
-        ...(a.run_id ? { run_id: a.run_id } : {}),
-        ...(a.span_id ? { span_id: a.span_id } : {})
-      });
-      setResult(r.result !== undefined ? `executed: ${JSON.stringify(r.result).slice(0, 200)}` : `status: ${r.status}`);
-      onChanged();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "call failed");
     }
   };
 
@@ -87,7 +67,6 @@ function ApprovalCard({
         </p>
       )}
       {error && <div className="mt-2"><Alert>{error}</Alert></div>}
-      {result && <p className="mt-2 text-sm text-ok-800">{result}</p>}
       {a.status === "pending" && (
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <Input aria-label="Decision reason" className="w-64"
@@ -97,9 +76,10 @@ function ApprovalCard({
         </div>
       )}
       {a.status === "approved" && (
-        <div className="mt-3">
-          <Button onClick={runNow}>Run now</Button>
-        </div>
+        <p className="mt-3 text-sm text-ink-500">
+          Approved. The calling agent retries the original request with the same
+          logical request id; the dashboard cannot dispatch it.
+        </p>
       )}
     </Card>
   );

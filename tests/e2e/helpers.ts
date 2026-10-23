@@ -98,15 +98,25 @@ export async function upstreamInfo(request: APIRequestContext): Promise<{ hits: 
 // The dashboard reads its connection settings from localStorage; every page
 // must be seeded before its first navigation in the test.
 export async function setKeys(page: Page) {
+  // The dashboard keeps only URLs in localStorage. Privileged keys are
+  // exchanged once for HttpOnly session cookies in the shared context jar.
   await page.addInitScript(
-    ([apiKey, approverKey, apiUrl, gwUrl]) => {
-      localStorage.setItem("tg_key", apiKey);
-      localStorage.setItem("tg_approver_key", approverKey);
+    ([apiUrl, gwUrl]) => {
+      localStorage.removeItem("tg_key");
+      localStorage.removeItem("tg_approver_key");
       localStorage.setItem("tg_url", apiUrl);
       localStorage.setItem("tg_gw_url", gwUrl);
     },
-    [API_KEY, APPROVER_KEY, API_URL, GATEWAY_URL] as const
+    [API_URL, GATEWAY_URL] as const
   );
+  for (const key of [API_KEY, APPROVER_KEY]) {
+    const res = await page.context().request.post(`${API_URL}/v1/auth/session`, {
+      headers: auth(key)
+    });
+    if (!res.ok()) {
+      throw new Error(`session setup failed: HTTP ${res.status()} ${await res.text()}`);
+    }
+  }
 }
 
 // Seeds a complete run through the public ingest API: started, one model

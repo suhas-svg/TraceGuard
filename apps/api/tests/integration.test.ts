@@ -10,6 +10,18 @@ import { pool } from "../src/db.js";
 import { appendAuditEvent } from "@traceguard/audit-chain";
 import { publishTestPolicy } from "./policy-helper.js";
 
+function setCookieHeader(headers: Record<string, unknown>): string {
+  const raw = headers["set-cookie"];
+  const values = Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [];
+  return values.map((value) => String(value).split(";")[0]).join("; ");
+}
+
+function cookieFrom(header: string, name: string): string {
+  const part = header.split(";").map((value) => value.trim())
+    .find((value) => value.startsWith(`${name}=`));
+  return part ? decodeURIComponent(part.slice(name.length + 1)) : "";
+}
+
 // Full-path suite against a real database and a real MCP upstream. Every
 // denial test asserts both the error AND that the upstream saw nothing.
 describe("integration and security", () => {
@@ -1419,6 +1431,86 @@ describe("integration and security", () => {
     expect(after.statusCode).toBe(401);
     const unauth = await api.inject({ method: "GET", url: "/v1/auth/me" });
     expect(unauth.statusCode).toBe(401);
+  });
+
+  it("exchanges bearer keys for CSRF-protected dashboard sessions", async () => {
+    const created = await api.inject({ method: "POST", url: "/v1/auth/session", headers: key });
+    expect(created.statusCode).toBe(200);
+    expect(created.json().role).toBe("admin");
+    const cookies = setCookieHeader(created.headers);
+    expect(cookies).toContain("tg_session=");
+    expect(cookies).toContain("tg_csrf=");
+    const raw = created.headers["set-cookie"] as string[];
+    expect(raw.find((value) => value.startsWith("tg_session="))).toContain("HttpOnly");
+    expect(raw.find((value) => value.startsWith("tg_csrf="))).not.toContain("HttpOnly");
+    const csrf = cookieFrom(cookies, "tg_csrf");
+    expect(csrf).not.toBe("");
+
+    const state = await api.inject({ method: "GET", url: "/v1/auth/session",
+      headers: { cookie: cookies } });
+    expect(state.statusCode).toBe(200);
+    expect(state.json().admin.principal.scopes).toContain("admin");
+    expect(state.json().approver).toBeNull();
+
+    // A session write without the double-submit half is refused before the
+    // route runs; the same write with the CSRF cookie's value succeeds.
+    const email = `session-${tag}@example.com`;
+    const noCsrf = await api.inject({ method: "POST", url: "/v1/users",
+      headers: { cookie: cookies },
+      payload: { email, password: "long-password-777", role: "member" } });
+    expect(noCsrf.statusCode).toBe(403);
+    expect(noCsrf.json().error).toBe("csrf_required");
+    const withCsrf = await api.inject({ method: "POST", url: "/v1/users",
+      headers: { cookie: cookies, "x-csrf-token": csrf },
+      payload: { email, password: "long-password-777", role: "member" } });
+    expect(withCsrf.statusCode).toBe(201);
+
+    // The dashboard session is a read/approve session, never an agent
+    // dispatch credential. The certified shim is the only retry path.
+    const dispatch = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call",
+      headers: { cookie: cookies },
+      payload: { server_id: randomUUID(), tool: "echo", arguments: {}, caller: "dashboard" } });
+    expect(dispatch.statusCode).toBe(403);
+    expect(dispatch.json().error).toBe("APPROVAL_CLIENT_REQUIRED");
+  });
+
+  it("keeps approver sessions separate and requires CSRF to log out", async () => {
+    const adminCreated = await api.inject({ method: "POST", url: "/v1/auth/session", headers: key });
+    const adminCookies = setCookieHeader(adminCreated.headers);
+    const created = await api.inject({ method: "POST", url: "/v1/auth/session", headers: approver });
+    expect(created.statusCode).toBe(200);
+    expect(created.json().role).toBe("approver");
+    const cookies = setCookieHeader(created.headers);
+    expect(cookies).toContain("tg_approver_session=");
+    expect(cookies).toContain("tg_approver_csrf=");
+    const csrf = cookieFrom(cookies, "tg_approver_csrf");
+
+    const state = await api.inject({ method: "GET", url: "/v1/auth/session",
+      headers: { cookie: cookies } });
+    expect(state.json().approver.principal.scopes).toContain("approve");
+    expect(state.json().admin).toBeNull();
+
+    // Admin and approver sessions are distinct on the control listener.
+    const adminOnControl = await ctl.inject({ method: "GET", url: "/_control/v1/approvals",
+      headers: { cookie: adminCookies } });
+    expect(adminOnControl.statusCode).toBe(401);
+    const approverOnControl = await ctl.inject({ method: "GET", url: "/_control/v1/approvals",
+      headers: { cookie: cookies } });
+    expect(approverOnControl.statusCode).toBe(200);
+
+    const noCsrf = await api.inject({ method: "DELETE", url: "/v1/auth/session?role=approver",
+      headers: { cookie: cookies } });
+    expect(noCsrf.statusCode).toBe(403);
+    expect(noCsrf.json().error).toBe("csrf_required");
+    const loggedOut = await api.inject({ method: "DELETE", url: "/v1/auth/session?role=approver",
+      headers: { cookie: cookies, "x-csrf-token": csrf } });
+    expect(loggedOut.statusCode).toBe(200);
+    const after = await api.inject({ method: "GET", url: "/v1/auth/session",
+      headers: { cookie: cookies } });
+    expect(after.json().approver).toBeNull();
+
+    const none = await api.inject({ method: "GET", url: "/v1/auth/session" });
+    expect(none.json()).toMatchObject({ admin: null, approver: null });
   });
 
   it("bills cached tokens at the cached rate and never double", async () => {
