@@ -54,6 +54,9 @@ describe("integration and security", () => {
   };
 
   beforeAll(async () => {
+    // §7.4: the gateway resolves this reference at call time. Only the
+    // reference is stored; the credential stays in the process environment.
+    process.env.TEST_UPSTREAM_TOKEN = "s3cret";
     httpServer = createServer(async (req, res) => {
       if (req.method === "POST") {
         lastUpstreamAuth = req.headers.authorization as string | undefined;
@@ -70,6 +73,7 @@ describe("integration and security", () => {
   });
 
   afterAll(async () => {
+    delete process.env.TEST_UPSTREAM_TOKEN;
     httpServer.close();
     await api.close();
     await gw.close();
@@ -174,14 +178,35 @@ describe("integration and security", () => {
     const metadata = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `meta-${tag}`, base_url: "http://169.254.169.254/mcp" } });
     expect(metadata.statusCode).toBe(400);
+    // A bare value is not a reference: refuse it instead of persisting the
+    // credential in mcp_servers.
+    const inline = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `inline-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`,
+        secret_ref: "s3cret" } });
+    expect(inline.statusCode).toBe(400);
+    expect(inline.json().error).toBe("invalid_secret_ref");
     const res = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
-      payload: { name: `mock-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`, auth_secret: "s3cret" } });
+      payload: { name: `mock-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`,
+        secret_ref: "env:TEST_UPSTREAM_TOKEN" } });
     expect(res.statusCode).toBe(201);
+    expect(res.json().secret_ref).toBe("env:TEST_UPSTREAM_TOKEN");
     serverId = res.json().id;
     const list = await api.inject({ method: "GET", url: "/v1/servers", headers: key });
     expect(JSON.stringify(list.json())).not.toContain("s3cret");
     const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     expect(disc.json().tools.map((t: { tool_name: string }) => t.tool_name)).toContain("echo");
+  });
+
+  it("fails closed when a secret reference cannot be resolved", async () => {
+    const before = upstreamHits;
+    const res = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `missing-secret-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`,
+        secret_ref: "env:TRACEGUARD_MISSING_UPSTREAM_TOKEN" } });
+    expect(res.statusCode).toBe(201);
+    const disc = await api.inject({ method: "POST", url: `/v1/servers/${res.json().id}/discover`, headers: key });
+    expect(disc.statusCode).toBe(503);
+    expect(disc.json().error).toBe("secret_unavailable");
+    expect(upstreamHits).toBe(before);
   });
 
   it("allows listed calls and blocks denied ones without upstream contact", async () => {

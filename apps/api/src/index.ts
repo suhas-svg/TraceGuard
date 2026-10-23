@@ -478,6 +478,52 @@ export function buildApp() {
     return { run: run.rows[0], spans: spans.rows };
   });
 
+  app.get("/v1/runs/:id/spans", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const run = await pool.query("SELECT * FROM runs WHERE id = $1", [id]);
+    if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id)) {
+      return reply.code(404).send({ error: "run_not_found" });
+    }
+    const spans = await pool.query(
+      "SELECT * FROM spans WHERE run_id = $1 ORDER BY started_at ASC", [id]
+    );
+    return { items: spans.rows };
+  });
+
+  // §14: redacted approval summaries for the dashboard. This endpoint cannot
+  // decrypt arguments or transition state; decisions remain on the gateway's
+  // dedicated control listener.
+  app.get("/v1/approvals", async (req, reply) => {
+    reply.header("Cache-Control", "no-store");
+    const q = req.query as { status?: string; limit?: string };
+    const limit = Math.min(Math.max(Number(q.limit ?? 50), 1), 200);
+    const params: unknown[] = [];
+    const where: string[] = [];
+    if (q.status) {
+      params.push(q.status);
+      where.push(`a.status = $${params.length}`);
+    }
+    const scope = scopeClause(req.principal, params, "a.workspace_id");
+    if (scope) where.push(scope);
+    params.push(limit);
+    const res = await pool.query(
+      `SELECT a.id, a.workspace_id, a.project_id, a.server_id, a.tool_name, a.status,
+              a.requested_by, a.requested_at, a.expires_at, a.decided_at, a.terminal_at,
+              a.args_summary, a.outcome_summary, a.execution_started_at,
+              d.run_id, d.span_id, d.request_id
+         FROM approvals a
+         LEFT JOIN LATERAL (
+           SELECT run_id, span_id, request_id FROM policy_decisions
+            WHERE approval_id = a.id
+            ORDER BY timestamp DESC LIMIT 1
+         ) d ON true
+        ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+        ORDER BY a.requested_at DESC LIMIT $${params.length}`,
+      params
+    );
+    return { items: res.rows };
+  });
+
   // FR-010 loop and usage diagnostics. Advisory heuristics over the run's
   // recorded spans; recomputed per request so it always reflects current
   // data and never blocks or mutates anything.

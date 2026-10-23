@@ -490,12 +490,15 @@ export interface PolicyVersion {
 
 export const adminApi = {
   servers: () => get<{ items: McpServer[] }>("/v1/servers"),
-  createServer: (s: { name: string; base_url: string; auth_secret?: string }) =>
+  createServer: (s: { name: string; base_url: string; secret_ref?: string }) =>
     postApi<McpServer>("/v1/servers", s),
   discover: (id: string) =>
     postApi<{ tools: { tool_name: string; quarantined: boolean; quarantine_reason?: string | null;
       definition?: Record<string, unknown> | null; previous_definition?: Record<string, unknown> | null;
-      definition_hash?: string | null; previous_hash?: string | null }[] }>(
+      definition_hash?: string | null; previous_hash?: string | null;
+      active_pin_id?: string | null; active_pin_version?: number | null;
+      candidate_pin_id?: string | null; candidate_pin_version?: number | null;
+      candidate_status?: "candidate" | "pending_review" | "approved" | "superseded" | null }[] }>(
       `/v1/servers/${id}/discover`, {}),
   policies: () => get<{ items: Policy[] }>("/v1/policies"),
   createPolicy: (p: Record<string, unknown>) => postApi<Policy>("/v1/policies", p),
@@ -505,7 +508,12 @@ export const adminApi = {
     postApi<{ ok: boolean }>(
       `/v1/servers/${serverId}/tools/${encodeURIComponent(tool)}/quarantine`,
       { quarantined }, "PUT"
-    )
+    ),
+  submitPinReview: (pinId: string) =>
+    postApi<{ id: string; status: string }>(`/v1/tool-pins/${pinId}/submit-review`, {}),
+  approvePin: (pinId: string) =>
+    postApi<{ id: string; status: string }>(
+      `/v1/tool-pin-candidates/${pinId}/approve-for-publication`, {})
 };
 
 export const gwApi = {

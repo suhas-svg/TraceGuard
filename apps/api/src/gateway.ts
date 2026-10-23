@@ -17,6 +17,7 @@ import {
 } from "./policy.js";
 import { loadActivePolicy, rulesFromBundle } from "./policy-bundle.js";
 import { callUpstreamTool, checkUpstreamUrlResolved } from "./upstream.js";
+import { resolveSecretRef } from "./secret-ref.js";
 import { hashesEqual, parseKey, seal, tryOpen } from "./seal.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
 import { assertProductionAuth, oauthConfigFromEnv, protectedResourceMetadata } from "./oauth.js";
@@ -267,7 +268,7 @@ export function buildGateway() {
   async function forward(
     client: PoolClient,
     server: {
-      id: string; base_url: string; auth_secret: string | null;
+      id: string; base_url: string; secret_ref: string | null;
       workspace_id: string; project_id: string;
     },
     tool: string,
@@ -303,7 +304,11 @@ export function buildGateway() {
     }
     let result: unknown;
     try {
-      result = await callUpstreamTool(server.base_url, server.auth_secret, tool, args);
+      // §7.4: resolve the reference at the last responsible moment. A missing
+      // environment variable or unreadable file aborts the call; it never
+      // falls back to an unauthenticated request.
+      const authSecret = resolveSecretRef(server.secret_ref);
+      result = await callUpstreamTool(server.base_url, authSecret, tool, args);
     } catch (err) {
       // Allow-shaped decision, failed call: the trail keeps both the intent
       // and the failure so the console can explain the eventual 502.
@@ -373,6 +378,19 @@ export function buildGateway() {
       }
       const server = srv.rows[0];
 
+      if (server.disabled_at) {
+        const reason = "server disabled";
+        await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller,
+          server_id, tool_name: tool, args_hash: argsHash(args as Record<string, unknown>),
+          decision: "deny", reason, overhead_ms: overheadMs() });
+        await auditForScope(pool, server, { actor_type: "agent", actor_id: caller,
+          action: "tool.execute", resource_type: "server_tool",
+          resource_id: `${server_id}/${tool}`, result: "denied",
+          metadata: { reason: "server_disabled" } });
+        await recordDeniedSpan(client, parsed.data, server.id, tool, reason);
+        return reply.code(403).send({ error: "server_disabled" });
+      }
+
       if (!workspaceAllowed(req.principal, server.workspace_id)) {
         return reply.code(403).send({ error: "workspace_forbidden", workspace_id: server.workspace_id });
       }
@@ -417,10 +435,10 @@ export function buildGateway() {
       // or as credential-less with a secret still attached â€” fails closed
       // rather than quietly calling the wrong way.
       const wantsSecret = manifestServer.auth_mode === "gateway_secret";
-      if (wantsSecret !== !!server.auth_secret) {
+      if (wantsSecret !== !!server.secret_ref) {
         const reason = wantsSecret
-          ? "server is published with a gateway_secret credential, but no secret is configured"
-          : "server is published credential-less, but a secret is still attached";
+          ? "server is published with a gateway_secret credential, but no secret reference is configured"
+          : "server is published credential-less, but a secret reference is still attached";
         await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: argsHash(args as Record<string, unknown>), decision: "deny", reason,
           policy_version_id: policy.policy_version_id, overhead_ms: overheadMs() });
@@ -489,9 +507,13 @@ export function buildGateway() {
       const pin = policy.bundle.pins.find((p) => p.server_id === server.id && p.tool_name === tool);
       const pinIssue = !pin
         ? "tool is not in the active signed policy"
-        : pin.definition_hash !== toolRow.rows[0].definition_hash
-          ? "tool definition changed since it was published"
-          : null;
+        : pin.pin_id !== undefined && pin.pin_id !== toolRow.rows[0].active_pin_id
+          ? "tool pin changed since it was published"
+          : pin.pin_version !== undefined && pin.pin_version !== toolRow.rows[0].definition_version
+            ? "tool pin version changed since it was published"
+            : pin.definition_hash !== toolRow.rows[0].definition_hash
+              ? "tool definition changed since it was published"
+              : null;
       if (pinIssue) {
         await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: argsHash(args as Record<string, unknown>), decision: "deny",
@@ -723,7 +745,8 @@ export function buildGateway() {
         }
         const freshPolicy = freshLoad.policy;
         const toolNow = await client.query(
-          "SELECT quarantined, definition_hash, definition FROM server_tools WHERE server_id = $1 AND tool_name = $2",
+          `SELECT quarantined, definition_hash, definition, active_pin_id, definition_version
+             FROM server_tools WHERE server_id = $1 AND tool_name = $2`,
           [server_id, tool]
         );
         if (!toolNow.rows[0] || toolNow.rows[0].quarantined) {
@@ -742,7 +765,11 @@ export function buildGateway() {
         const freshPin = freshPolicy.bundle.pins.find(
           (p) => p.server_id === server.id && p.tool_name === tool
         );
-        if (!freshPin || freshPin.definition_hash !== toolNow.rows[0].definition_hash) {
+        if (!freshPin
+            || (freshPin.pin_id !== undefined && freshPin.pin_id !== toolNow.rows[0].active_pin_id)
+            || (freshPin.pin_version !== undefined
+              && freshPin.pin_version !== toolNow.rows[0].definition_version)
+            || freshPin.definition_hash !== toolNow.rows[0].definition_hash) {
           const why = "the tool pin is no longer active in the signed policy";
           await client.query(
             "SELECT * FROM approval_transition($1,'invalidate_approved_policy',NULL,$2,$3)",
@@ -856,7 +883,8 @@ export function buildGateway() {
         }
         const lastPolicy = lastLoad.policy;
         const toolLast = await client.query(
-          "SELECT quarantined, definition_hash, definition FROM server_tools WHERE server_id = $1 AND tool_name = $2",
+          `SELECT quarantined, definition_hash, definition, active_pin_id, definition_version
+             FROM server_tools WHERE server_id = $1 AND tool_name = $2`,
           [server_id, tool]
         );
         const pinLast = lastPolicy.bundle.pins.find(
@@ -873,7 +901,11 @@ export function buildGateway() {
           : pathEnforcementIssue(lastVerdict.rule, toolLast.rows[0]?.definition);
         const lastWhy = !toolLast.rows[0] || toolLast.rows[0].quarantined
           ? "the tool is quarantined"
-          : !pinLast || pinLast.definition_hash !== toolLast.rows[0].definition_hash
+          : !pinLast
+            || (pinLast.pin_id !== undefined && pinLast.pin_id !== toolLast.rows[0].active_pin_id)
+            || (pinLast.pin_version !== undefined
+              && pinLast.pin_version !== toolLast.rows[0].definition_version)
+            || pinLast.definition_hash !== toolLast.rows[0].definition_hash
             ? "the tool pin is no longer active in the signed policy"
             : lastPathIssue
               ? `path enforcement refused: ${lastPathIssue}`

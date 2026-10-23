@@ -1,4 +1,4 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { Pool, PoolClient } from "pg";
 import { pool } from "./db.js";
@@ -263,7 +263,7 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     return { items: res.rows };
   });
 
-  app.put("/v1/budgets/:id", async (req, reply) => {
+  const updateBudget = async (req: FastifyRequest, reply: FastifyReply) => {
     const { id } = req.params as { id: string };
     const parsed = z.object({
       limit_micro: z.number().int().min(0).optional(),
@@ -295,7 +295,10 @@ export function registerBudgetRoutes(app: FastifyInstance) {
       workspace_id: res.rows[0].workspace_id, project_id: res.rows[0].project_id,
       metadata: parsed.data as Record<string, unknown> });
     return res.rows[0];
-  });
+  };
+  // §14 names PATCH; PUT remains for existing dashboard clients.
+  app.patch("/v1/budgets/:id", updateBudget);
+  app.put("/v1/budgets/:id", updateBudget);
 
   const checkSchema = z.object({
     budget_id: z.string().uuid(),
