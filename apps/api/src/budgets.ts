@@ -303,9 +303,10 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     ttl_seconds: z.number().int().min(1).default(300)
   });
 
-  // Reserve-before-call. SELECT ... FOR UPDATE holds the budget row for the
-  // rest of the check, so concurrent calls serialize and cannot both pass an
-  // exhausted budget.
+  // Reserve-before-call. The block-budget check is a single conditional
+  // UPDATE: the limit test and the counter increment happen under the row
+  // lock, so concurrent checks cannot both pass an exhausted budget. A zero
+  // row count is the denial (no read-then-write window).
   app.post("/v1/budgets/check", async (req, reply) => {
     const parsed = checkSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_check" });
@@ -321,7 +322,7 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      const b = await client.query("SELECT * FROM budgets WHERE id = $1 FOR UPDATE", [parsed.data.budget_id]);
+      const b = await client.query("SELECT * FROM budgets WHERE id = $1", [parsed.data.budget_id]);
       if (!b.rows[0]) {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "budget_not_found" });
@@ -337,25 +338,42 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         ? await projectSpentMicro(client, budget.project_id, budget.period ?? "lifetime")
         : (await periodSpentMicro(client, budget.id, budget.period ?? "lifetime")) ??
           Number(budget.spent_micro);
-      const used = spent + Number(budget.reserved_micro);
-      const over = used + parsed.data.max_cost_micro > Number(budget.limit_micro);
 
-      if (over && budget.effect === "block") {
+      // Block budgets reserve only when the current spend plus every live
+      // hold plus this request still fits. Warn budgets deliberately reserve
+      // past the limit so the call can proceed and the warning is surfaced.
+      const updated = budget.effect === "block"
+        ? await client.query(
+          `UPDATE budgets
+              SET reserved_micro = reserved_micro + $2, updated_at = now()
+            WHERE id = $1
+              AND ($3::bigint + reserved_micro + $2) <= limit_micro
+            RETURNING *`,
+          [budget.id, parsed.data.max_cost_micro, spent]
+        )
+        : await client.query(
+          `UPDATE budgets
+              SET reserved_micro = reserved_micro + $2, updated_at = now()
+            WHERE id = $1
+            RETURNING *`,
+          [budget.id, parsed.data.max_cost_micro]
+        );
+
+      if (updated.rowCount === 0) {
         await client.query("ROLLBACK");
         await audit(pool, { actor_type: "agent", action: "budget.exceeded",
           resource_type: "budget", resource_id: budget.id, result: "blocked",
           workspace_id: budget.workspace_id, project_id: budget.project_id,
-          metadata: { spent_micro: spent, limit_micro: budget.limit_micro, period: budget.period ?? "lifetime" } });
+          metadata: { spent_micro: spent, limit_micro: budget.limit_micro,
+            requested_micro: parsed.data.max_cost_micro, period: budget.period ?? "lifetime" } });
         void notify(budget.workspace_id, "budget.exceeded",
           { budget_id: budget.id, scope: budget.scope, spent_micro: spent, limit_micro: Number(budget.limit_micro) });
         return reply.code(409).send({ error: "budget_exceeded",
           spent_micro: spent, limit_micro: Number(budget.limit_micro) });
       }
 
-      const updated = await client.query(
-        "UPDATE budgets SET reserved_micro = reserved_micro + $2 WHERE id = $1 RETURNING *",
-        [budget.id, parsed.data.max_cost_micro]
-      );
+      const reserved = updated.rows[0];
+      const over = spent + Number(reserved.reserved_micro) > Number(reserved.limit_micro);
       const expiresAt = new Date(Date.now() + parsed.data.ttl_seconds * 1000).toISOString();
       const r = await client.query(
         `INSERT INTO budget_reservations (budget_id, amount_micro, expires_at)
@@ -365,13 +383,13 @@ export function registerBudgetRoutes(app: FastifyInstance) {
       await client.query("COMMIT");
       // §10.3: the reservation is a money-moving event; the chain gets it.
       await audit(pool, { actor_type: "agent", action: "budget.reserved",
-        resource_type: "budget", resource_id: r.rows[0].budget_id, result: "reserved",
+        resource_type: "budget", resource_id: budget.id, result: "reserved",
         workspace_id: budget.workspace_id, project_id: budget.project_id,
         metadata: { reservation_id: r.rows[0].id, amount_micro: parsed.data.max_cost_micro,
           expires_at: r.rows[0].expires_at } });
       return { ok: true, reservation_id: r.rows[0].id, expires_at: r.rows[0].expires_at,
         warning: over ? "budget limit reached, warn-only budget" : undefined,
-        remaining_micro: Number(updated.rows[0].limit_micro) - Number(updated.rows[0].spent_micro) - Number(updated.rows[0].reserved_micro) };
+        remaining_micro: Number(reserved.limit_micro) - spent - Number(reserved.reserved_micro) };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw err;
@@ -413,7 +431,13 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         await client.query("ROLLBACK");
         return reply.code(403).send({ error: "workspace_forbidden" });
       }
-      const actual = parsed.data.actual_cost_micro ?? Number(res.amount_micro);
+      // A reservation is the authorized maximum. A caller that reports more
+      // usage than it reserved cannot move more money than the budget check
+      // approved; the excess is capped here and remains visible in the audit.
+      const reservedAmount = Number(res.amount_micro);
+      const actual = parsed.data.actual_cost_micro == null
+        ? reservedAmount
+        : Math.min(parsed.data.actual_cost_micro, reservedAmount);
       await client.query(
         `UPDATE budgets SET reserved_micro = reserved_micro - $2, spent_micro = spent_micro + $3,
            updated_at = now() WHERE id = $1`,
@@ -434,6 +458,8 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         workspace_id: bw.rows[0]?.workspace_id ?? null,
         project_id: bw.rows[0]?.project_id ?? null,
         metadata: { reservation_id: res.id, settled_micro: actual,
+          requested_micro: parsed.data.actual_cost_micro ?? reservedAmount,
+          capped: parsed.data.actual_cost_micro != null && parsed.data.actual_cost_micro > reservedAmount,
           basis: parsed.data.actual_cost_micro == null ? "reserved_max" : "measured",
           settle_reason: parsed.data.actual_cost_micro == null ? "usage_unavailable" : "usage_known" } });
       return { ok: true, actual_cost_micro: actual,
