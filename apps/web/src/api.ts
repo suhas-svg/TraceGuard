@@ -1,5 +1,7 @@
-// Read-only client for the TraceGuard API. The dashboard never writes:
-// policy edits and approvals stay in API clients with the right keys.
+// Dashboard client for the TraceGuard API. Privileged bearer keys are
+// exchanged once for short-lived HttpOnly session cookies; only the
+// non-secret endpoint URLs are persisted in the browser. State-changing
+// requests echo the readable CSRF cookie in X-CSRF-Token (FR-016).
 const stored = (k: string, fallback: string) => {
   try {
     // An empty stored value is unset, not a value: a cleared field used to
@@ -10,12 +12,38 @@ const stored = (k: string, fallback: string) => {
   }
 };
 
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+type SessionRole = "admin" | "approver";
+
+function cookie(name: string): string {
+  for (const part of document.cookie.split(";")) {
+    const [key, ...value] = part.trim().split("=");
+    if (key === name) return decodeURIComponent(value.join("="));
+  }
+  return "";
+}
+
+function csrfToken(role: SessionRole): string {
+  return cookie(role === "approver" ? "tg_approver_csrf" : "tg_csrf");
+}
+
+function writeHeaders(method: string, role: SessionRole, json: boolean): Record<string, string> {
+  const headers: Record<string, string> = json ? { "content-type": "application/json" } : {};
+  if (!SAFE_METHODS.has(method)) headers["x-csrf-token"] = csrfToken(role);
+  return headers;
+}
+
+// Remove keys written by older dashboards. They are never read again.
+try {
+  localStorage.removeItem("tg_key");
+  localStorage.removeItem("tg_approver_key");
+} catch {
+  // A browser that blocks storage still works with the URL defaults.
+}
+
 export const settings = {
   get url() {
     return stored("tg_url", import.meta.env.VITE_API_URL ?? "http://localhost:8090");
-  },
-  get key() {
-    return stored("tg_key", import.meta.env.VITE_API_KEY ?? "dev_key_change_me");
   },
   get gwUrl() {
     return stored("tg_gw_url", import.meta.env.VITE_GATEWAY_URL ?? "http://localhost:8091");
@@ -34,16 +62,55 @@ export const settings = {
       return "http://localhost:8093";
     }
   },
-  get approverKey() {
-    return stored("tg_approver_key", import.meta.env.VITE_APPROVER_KEY ?? "dev_approver_change_me");
-  },
-  save(url: string, key: string, gwUrl: string, approverKey: string) {
+  save(url: string, gwUrl: string) {
     localStorage.setItem("tg_url", url);
-    localStorage.setItem("tg_key", key);
     localStorage.setItem("tg_gw_url", gwUrl);
-    localStorage.setItem("tg_approver_key", approverKey);
   }
 };
+
+export interface SessionView {
+  admin: { principal: { kind: string; userId: string | null; scopes: string[] }; expires_at: string } | null;
+  approver: { principal: { kind: string; userId: string | null; scopes: string[] }; expires_at: string } | null;
+}
+
+export async function getSession(): Promise<SessionView> {
+  const res = await fetch(`${settings.url}/v1/auth/session`, { credentials: "include" });
+  if (!res.ok) throw new ApiError(await explain(res), res.status);
+  return res.json() as Promise<SessionView>;
+}
+
+// Exchange one or both bearer keys for server-side sessions. The keys stay in
+// this function's arguments and are never written to storage or returned.
+export async function connectSession(
+  url: string,
+  adminKey: string,
+  gwUrl: string,
+  approverKey: string
+): Promise<{ admin: boolean; approver: boolean }> {
+  settings.save(url, gwUrl);
+  const roles: SessionRole[] = [];
+  for (const key of [adminKey, approverKey]) {
+    if (!key.trim()) continue;
+    const res = await fetch(`${url}/v1/auth/session`, {
+      method: "POST",
+      credentials: "include",
+      headers: { authorization: `Bearer ${key.trim()}` }
+    });
+    if (!res.ok) throw new ApiError(await explain(res), res.status);
+    const body = (await res.json()) as { role?: SessionRole };
+    if (body.role) roles.push(body.role);
+  }
+  return { admin: roles.includes("admin"), approver: roles.includes("approver") };
+}
+
+export async function logoutSession(role: SessionRole): Promise<void> {
+  const res = await fetch(`${settings.url}/v1/auth/session?role=${role}`, {
+    method: "DELETE",
+    credentials: "include",
+    headers: writeHeaders("DELETE", role, false)
+  });
+  if (!res.ok) throw new ApiError(await explain(res), res.status);
+}
 
 export interface RunItem {
   id: string;
@@ -92,10 +159,8 @@ async function explain(res: Response): Promise<string> {
 }
 
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${settings.url}${path}`, {
-    headers: { Authorization: `Bearer ${settings.key}` }
-  });
-  if (res.status === 401) throw new ApiError("unauthorized: check the API key in settings", 401);
+  const res = await fetch(`${settings.url}${path}`, { credentials: "include" });
+  if (res.status === 401) throw new ApiError("unauthorized: connect a session in settings", 401);
   if (!res.ok) throw new ApiError(await explain(res), res.status);
   return res.json() as Promise<T>;
 }
@@ -224,16 +289,14 @@ export function getUsage(runId: string) {
 async function postApi<T>(path: string, body: unknown, method = "POST"): Promise<T> {
   const res = await fetch(`${settings.url}${path}`, {
     method,
+    credentials: "include",
     // A bodyless call must not declare a JSON body: Fastify answers 400 to
     // Content-Type: application/json with an empty body, which broke every
     // DELETE and revoke the dashboard sends.
-    headers: {
-      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-      Authorization: `Bearer ${settings.key}`
-    },
+    headers: writeHeaders(method, "admin", body !== undefined),
     body: body === undefined ? undefined : JSON.stringify(body)
   });
-  if (res.status === 401) throw new ApiError("unauthorized: check the API key in settings", 401);
+  if (res.status === 401) throw new ApiError("unauthorized: connect a session in settings", 401);
   if (!res.ok) {
     throw new ApiError(await explain(res), res.status);
   }
@@ -309,32 +372,36 @@ export function runSuite(suiteId: string, body: Record<string, unknown>) {
   return postApi<{ eval_run: EvalRun }>(`/v1/evaluations/suites/${suiteId}/runs`, body);
 }
 
-// Gateway calls go to the gateway process with the agent key. Approval
-// decisions are the one call that uses the approver key instead.
-async function gwFetch<T>(base: string, path: string, init: RequestInit | undefined, key: string): Promise<T> {
+// Gateway calls also use the server-side session. The control listener gets
+// the approver session; ordinary gateway reads use the admin session.
+async function gwFetch<T>(
+  base: string, path: string, init: RequestInit | undefined, role: SessionRole
+): Promise<T> {
+  const method = init?.method ?? "GET";
   const res = await fetch(`${base}${path}`, {
     ...init,
+    credentials: "include",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${key}`,
-      ...(init?.headers ?? {})
+      ...(init?.headers ?? {}),
+      ...writeHeaders(method, role, false)
     }
   });
-  if (res.status === 401) throw new ApiError("unauthorized: check the key in settings", 401);
+  if (res.status === 401) throw new ApiError("unauthorized: connect a session in settings", 401);
   if (!res.ok) {
     throw new ApiError(await explain(res), res.status);
   }
   return res.json() as Promise<T>;
 }
 
-function gw<T>(path: string, init?: RequestInit, approver = false): Promise<T> {
-  return gwFetch<T>(settings.gwUrl, path, init, approver ? settings.approverKey : settings.key);
+function gw<T>(path: string, init?: RequestInit): Promise<T> {
+  return gwFetch<T>(settings.gwUrl, path, init, "admin");
 }
 
 // The approval queue and decisions live on the gateway's control listener,
-// which always authenticates with the approver key.
+// which always uses the separate approver session.
 function gwc<T>(path: string, init?: RequestInit): Promise<T> {
-  return gwFetch<T>(settings.gwControlUrl, path, init, settings.approverKey);
+  return gwFetch<T>(settings.gwControlUrl, path, init, "approver");
 }
 
 export interface McpServer {
@@ -442,16 +509,13 @@ export const adminApi = {
 };
 
 export const gwApi = {
-  // The queue is fetched from the control listener with the approver key:
+  // The queue is fetched from the control listener with the approver session:
   // the control surface never opens sealed arguments for other scopes.
   approvals: (status?: string) =>
     gwc<{ items: Approval[] }>(`/_control/v1/approvals${status ? `?status=${status}` : ""}`),
   decide: (id: string, approved: boolean, reason: string) =>
     gwc<Approval>(`/_control/v1/approvals/${id}/decision`,
       { method: "POST", body: JSON.stringify({ approved, reason }) }),
-  call: (body: Record<string, unknown>) =>
-    gw<{ result?: unknown; approval_id?: string; status?: string; expires_at?: string }>(
-      "/v1/gateway/tools/call", { method: "POST", body: JSON.stringify(body) }),
   audit: (action?: string) =>
     gw<{ items: AuditEvent[] }>(`/v1/audit-events${action ? `?action=${encodeURIComponent(action)}` : ""}`),
   // FR-021: every decision recorded for one run, newest first.

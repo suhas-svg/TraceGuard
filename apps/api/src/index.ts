@@ -14,6 +14,7 @@ import { assertProductionAuth } from "./oauth.js";
 import { resolveProject } from "./project-scope.js";
 import { audit } from "./audit.js";
 import { registerUserRoutes } from "./users.js";
+import { registerSessionRoutes } from "./sessions.js";
 import { registerAdminRoutes } from "./admin.js";
 import { registerProjectRoutes } from "./projects.js";
 import { captureRawEnabled, redactDeep } from "./redact.js";
@@ -59,7 +60,8 @@ export function buildApp() {
   // works with full access; user keys carry role scopes instead.
   app.addHook("onRequest", async (req, reply) => {
     reply.header("Access-Control-Allow-Origin", DASHBOARD_ORIGIN);
-    reply.header("Access-Control-Allow-Headers", "authorization, content-type");
+    reply.header("Access-Control-Allow-Credentials", "true");
+    reply.header("Access-Control-Allow-Headers", "authorization, content-type, x-csrf-token");
     // Browsers reject PUT/DELETE preflights without an explicit method list.
     reply.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     if (req.method === "OPTIONS") return reply.code(204).send();
@@ -507,6 +509,7 @@ export function buildApp() {
   registerRetentionRoutes(app);
   registerReconciliationRoutes(app);
   registerUserRoutes(app);
+  registerSessionRoutes(app);
 
   // OTLP/HTTP receiver in both encodings. Exporters default to binary
   // protobuf; http/json also works. Spans in one trace share a run; ids map

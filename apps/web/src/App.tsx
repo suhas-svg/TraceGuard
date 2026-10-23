@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { getOverview, settings } from "./api";
+import { connectSession, getOverview, settings } from "./api";
 import { useHashRoute, type Tab } from "./router";
 import type { PaletteItem } from "./palette";
 import { Palette } from "./CommandPalette";
@@ -91,9 +91,11 @@ function ConnectionDrawer({ open, onClose, onSaved }: {
   onSaved: () => void;
 }) {
   const [url, setUrl] = useState(settings.url);
-  const [key, setKey] = useState(settings.key);
+  const [key, setKey] = useState("");
   const [gwUrl, setGwUrl] = useState(settings.gwUrl);
-  const [approverKey, setApproverKey] = useState(settings.approverKey);
+  const [approverKey, setApproverKey] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   return (
     <div
       className={`fixed inset-0 z-50 flex justify-end transition-[visibility] duration-200 ${open ? "visible" : "invisible"}`}
@@ -105,24 +107,45 @@ function ConnectionDrawer({ open, onClose, onSaved }: {
       />
       <form
         className={`relative flex w-80 flex-col gap-3 bg-surface p-5 shadow-xl transition-transform duration-200 ${open ? "translate-x-0" : "translate-x-full"}`}
-        onSubmit={(e) => {
+        onSubmit={async (e) => {
           e.preventDefault();
-          settings.save(url, key, gwUrl, approverKey);
-          onSaved();
-          onClose();
+          setBusy(true);
+          setError(null);
+          try {
+            await connectSession(url, key, gwUrl, approverKey);
+            // The raw keys were used once to mint HttpOnly session cookies;
+            // clearing them here keeps them out of React state after connect.
+            setKey("");
+            setApproverKey("");
+            onSaved();
+            onClose();
+          } catch (err) {
+            setError(err instanceof Error ? err.message : "connection failed");
+          } finally {
+            setBusy(false);
+          }
         }}
       >
         <h2 className="text-base font-semibold text-ink-900">Connection</h2>
-        <p className="text-xs text-ink-500">Keys stay in this browser only, never on the server.</p>
+        <p className="text-xs text-ink-500">
+          Keys are exchanged for short-lived server-side sessions. Only the URLs stay in this browser.
+        </p>
         <Field label="API URL"><Input value={url} onChange={(e) => setUrl(e.target.value)} /></Field>
-        <Field label="API key"><Input type="password" value={key} onChange={(e) => setKey(e.target.value)} /></Field>
+        <Field label="API key">
+          <Input type="password" value={key} placeholder="admin key (exchanged once)"
+            onChange={(e) => setKey(e.target.value)} />
+        </Field>
         <Field label="Gateway URL"><Input value={gwUrl} onChange={(e) => setGwUrl(e.target.value)} /></Field>
         <Field label="Approver key">
-          <Input type="password" value={approverKey} onChange={(e) => setApproverKey(e.target.value)} />
+          <Input type="password" value={approverKey} placeholder="approver key (exchanged once)"
+            onChange={(e) => setApproverKey(e.target.value)} />
         </Field>
+        {error && <p role="alert" className="text-xs text-red-600">{error}</p>}
         <div className="mt-1 flex gap-2">
-          <Button variant="primary" type="submit">Connect</Button>
-          <Button type="button" onClick={onClose}>Cancel</Button>
+          <Button variant="primary" type="submit" disabled={busy}>
+            {busy ? "Connecting…" : "Connect"}
+          </Button>
+          <Button type="button" onClick={onClose} disabled={busy}>Cancel</Button>
         </div>
       </form>
     </div>

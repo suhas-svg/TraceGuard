@@ -4,6 +4,10 @@ import { pool } from "./db.js";
 import { oauthConfigFromEnv, resourceMetadataUrl, verifyAccessToken } from "./oauth.js";
 import { audit } from "./audit.js";
 import { projectIdsForWorkspaces } from "./project-scope.js";
+import {
+  ADMIN_SESSION_COOKIE, APPROVER_SESSION_COOKIE, cookieValue, csrfMatches, findSession,
+  type DashboardSession
+} from "./session-store.js";
 
 // Scoped credentials. Roles map to scope sets; keys carry a subset of their
 // owner's role scopes. Only the approver role (and an OAuth token the trusted
@@ -41,6 +45,7 @@ export interface Principal {
 const WRITE_ALLOW: [string, string][] = [
   ["/v1/auth/login", "public"],
   ["/v1/auth/register", "public"],
+  ["/v1/auth/session", "public"],
   ["/v1/auth/logout", "read"],
   ["/v1/budgets/check", "ingest"],
   ["/v1/budgets/settle", "ingest"],
@@ -54,6 +59,7 @@ const WRITE_ALLOW: [string, string][] = [
 const ROUTES: [string, string][] = [
   ["/v1/auth/login", "public"],
   ["/v1/auth/register", "public"],
+  ["/v1/auth/session", "public"],
   ["/v1/budgets/check", "ingest"],
   ["/v1/budgets/settle", "ingest"],
   ["/v1/budgets/release", "ingest"],
@@ -313,6 +319,7 @@ export function workspaceAllowed(principal: Principal | undefined, workspaceId: 
 declare module "fastify" {
   interface FastifyRequest {
     principal?: Principal;
+    session?: DashboardSession;
   }
 }
 
@@ -322,7 +329,28 @@ export async function authHook(req: FastifyRequest, reply: FastifyReply): Promis
   if (scope === "public") return;
   const presented = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
   const ingestRoute = req.url.startsWith("/v1/ingest") || req.url.startsWith("/v1/traces");
-  const principal = await resolvePrincipal(req.headers.authorization ?? "", {
+
+  // The dashboard exchanges its bearer key for a short-lived, server-side
+  // session. Sessions are deliberately not a dispatch credential: the
+  // approval executor and MCP surface only accept the agent's own client.
+  const sessionRole = req.url.startsWith("/_control/") ? "approver" : "admin";
+  let session: DashboardSession | null = null;
+  if (!presented) {
+    const cookieName = sessionRole === "approver" ? APPROVER_SESSION_COOKIE : ADMIN_SESSION_COOKIE;
+    const token = cookieValue(req.headers.cookie, cookieName);
+    if (token) session = await findSession(sessionRole, token);
+  }
+  if (session && (req.url.startsWith("/mcp") || req.url.startsWith("/v1/gateway/tools/call"))) {
+    return reply.code(403).send({ error: "APPROVAL_CLIENT_REQUIRED" }) as unknown as void;
+  }
+  if (session && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+    const csrf = req.headers["x-csrf-token"];
+    if (!csrfMatches(session, typeof csrf === "string" ? csrf : undefined)) {
+      return reply.code(403).send({ error: "csrf_required" }) as unknown as void;
+    }
+  }
+
+  const principal = session?.principal ?? await resolvePrincipal(req.headers.authorization ?? "", {
     // Ingestion keys are only looked up on the telemetry routes. The gateway
     // listener therefore cannot turn one into an MCP principal.
     allowIngest: ingestRoute
@@ -387,4 +415,5 @@ export async function authHook(req: FastifyRequest, reply: FastifyReply): Promis
     return forbidden(reply, scope) as unknown as void;
   }
   req.principal = principal;
+  if (session) req.session = session;
 }

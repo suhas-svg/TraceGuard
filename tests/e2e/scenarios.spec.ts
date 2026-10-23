@@ -137,15 +137,27 @@ test("scenario C: an exhausted budget blocks the call before the upstream", asyn
 
 test("scenario D: an approval-protected call waits for a human, then executes", async ({ page, request }) => {
   const before = await upstreamHits(request);
-  const held = await gwCall(request, {
+  const call = {
     server_id: serverId, tool: "read_file", arguments: { path: "/approval-needed.txt" },
     caller: "e2e", request_id: `e2e-appr-${tag}`
-  });
+  };
+  const held = await gwCall(request, call);
   expect(held.status()).toBe(202);
+  const approvalId = (await held.json()).approval_id as string;
+  expect(approvalId).toBeTruthy();
   // Nothing executes before the human decision.
   expect(await upstreamHits(request)).toBe(before);
 
   await setKeys(page);
+  // A dashboard session is a human surface, not a dispatch credential.
+  const dashboardDispatch = await page.context().request.post(`${GATEWAY_URL}/v1/gateway/tools/call`, {
+    data: call,
+    headers: { "content-type": "application/json" },
+    failOnStatusCode: false
+  });
+  expect(dashboardDispatch.status()).toBe(403);
+  expect(await dashboardDispatch.json()).toMatchObject({ error: "APPROVAL_CLIENT_REQUIRED" });
+
   await page.goto("/");
   await openTab(page, "Approvals");
   await expect(page.getByText("/approval-needed.txt").first()).toBeVisible();
@@ -153,7 +165,12 @@ test("scenario D: an approval-protected call waits for a human, then executes", 
 
   await page.getByRole("group", { name: "Filter approvals" })
     .getByRole("button", { name: "Approved", exact: true }).click();
-  await page.getByRole("button", { name: "Run now", exact: true }).click();
+
+  // The calling agent retries the original logical request, presenting the
+  // approval identity it received with the 202. The dashboard no longer has a
+  // "Run now" shortcut that dispatches for it.
+  const retry = { ...call, approval_id: approvalId };
+  await expect.poll(async () => (await gwCall(request, retry)).status(), { timeout: 45_000 }).toBe(200);
 
   // Running executes the approval, so the card drops out of the Approved
   // filter and its transient result text unmounts with it. Confirm the

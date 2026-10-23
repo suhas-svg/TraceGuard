@@ -174,7 +174,8 @@ export function buildGateway() {
 
   app.addHook("onRequest", async (req, reply) => {
     reply.header("Access-Control-Allow-Origin", DASHBOARD_ORIGIN);
-    reply.header("Access-Control-Allow-Headers", "authorization, content-type");
+    reply.header("Access-Control-Allow-Credentials", "true");
+    reply.header("Access-Control-Allow-Headers", "authorization, content-type, x-csrf-token");
     // Browsers reject PUT/DELETE preflights without an explicit method list.
     reply.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     if (req.method === "OPTIONS") return reply.code(204).send();
@@ -1445,7 +1446,8 @@ export function buildGatewayControl() {
   app.get("/healthz", async () => ({ ok: true }));
   app.addHook("onRequest", async (req, reply) => {
     reply.header("Access-Control-Allow-Origin", DASHBOARD_ORIGIN);
-    reply.header("Access-Control-Allow-Headers", "authorization, content-type");
+    reply.header("Access-Control-Allow-Credentials", "true");
+    reply.header("Access-Control-Allow-Headers", "authorization, content-type, x-csrf-token");
     reply.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     if (req.method === "OPTIONS") return reply.code(204).send();
     await authHook(req, reply);

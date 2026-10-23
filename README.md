@@ -231,9 +231,10 @@ browser scenarios with `npm run test:e2e`, the Kubernetes manifests with
 - `apps/web` is a read-only React dashboard: run list with status filter and
   Load more pagination, plus a trace view with a nested span tree, per-span
   detail, token totals, and denied-by-policy shown apart from failures.
-- API URL and key are editable in the page header and kept in localStorage.
-  Policy and approval actions live on their own tabs; run views stay
-  read-only.
+- API and gateway URLs are editable in the page header; privileged keys are
+  exchanged for short-lived HttpOnly sessions and are never stored in
+  localStorage. Policy and approval actions live on their own tabs; run views
+  stay read-only.
 - Run it: `npm run dev --workspace=@traceguard/web` (port 5173) against the
   API on 8090, or `docker compose up web` for the built bundle.
 
