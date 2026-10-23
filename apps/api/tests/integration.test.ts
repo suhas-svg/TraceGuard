@@ -989,6 +989,37 @@ describe("integration and security", () => {
     expect(row.rows[0].status).toBe("policy_invalidated");
   });
 
+  it("refuses to call a server that is not stamped by the active signed bundle", async () => {
+    // B2 / §13.1: a newly registered server is a draft. Publication stamps the
+    // signed server config, and only then may the gateway route to it.
+    const draft = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `unsigned-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`,
+        gateway_alias: `unsigned-${tag}`, secret_ref: "env:TEST_UPSTREAM_TOKEN" } });
+    expect(draft.statusCode).toBe(201);
+    const draftId = draft.json().id as string;
+    const unsigned = await pool.query("SELECT signed_bundle_version FROM mcp_servers WHERE id = $1", [draftId]);
+    expect(unsigned.rows[0].signed_bundle_version).toBeNull();
+    const discover = await api.inject({ method: "POST", url: `/v1/servers/${draftId}/discover`, headers: key });
+    expect(discover.statusCode).toBe(200);
+
+    const before = upstreamHits;
+    const blocked = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: draftId, tool: "echo", arguments: { text: "unsigned" }, caller: "t" } });
+    expect(blocked.statusCode).toBe(403);
+    expect(blocked.json().error).toBe("tool_blocked");
+    expect(upstreamHits).toBe(before);
+
+    await api.inject({ method: "POST", url: "/v1/policies", headers: key,
+      payload: { name: `allow-unsigned-${tag}`, server_id: draftId, tool_name: "echo", effect: "allow" } });
+    await publishTestPolicy(pool);
+    const stamped = await pool.query("SELECT signed_bundle_version FROM mcp_servers WHERE id = $1", [draftId]);
+    expect(Number(stamped.rows[0].signed_bundle_version)).toBeGreaterThan(0);
+    const ok = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: draftId, tool: "echo", arguments: { text: "now-signed" }, caller: "t" } });
+    expect(ok.statusCode).toBe(200);
+    expect(upstreamHits).toBe(before + 1);
+  });
+
   it("denies gateway calls once a covering block budget is exhausted", async () => {
     const runId = randomUUID();
     await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,

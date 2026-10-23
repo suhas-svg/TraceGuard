@@ -151,6 +151,9 @@ export const bundleServerSchema = z.object({
   server_id: z.string().uuid(),
   alias: z.string().min(1).max(64).regex(/^[a-z0-9_]+$/),
   base_url: z.string().url(),
+  // Only the reference is signed; the credential value never enters the
+  // bundle or the database. Required on every server in a v2 bundle.
+  secret_ref: z.string().max(512).nullable().optional(),
   // Secret values never enter the bundle; only how the gateway authenticates.
   auth_mode: z.enum(["gateway_secret", "none"])
 }).strict();
@@ -191,6 +194,15 @@ export const policyBundleSchema = z.object({
         code: z.ZodIssueCode.custom,
         path: ["pins", index],
         message: "v2 bundles require pin_id and pin_version"
+      });
+    }
+  });
+  bundle.servers.forEach((server, index) => {
+    if (!("secret_ref" in server)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["servers", index],
+        message: "v2 bundles require secret_ref on every server (null when credential-less)"
       });
     }
   });

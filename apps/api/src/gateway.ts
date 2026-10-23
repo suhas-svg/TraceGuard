@@ -422,14 +422,31 @@ export function buildGateway() {
       // The server itself must be in the signed manifest: a registered row is
       // a draft, only the manifest makes it connectable (Â§7.4).
       const manifestServer = policy.bundle.servers.find((s) => s.server_id === server.id);
-      if (!manifestServer || manifestServer.base_url !== server.base_url) {
-        const reason = "server is not in the active signed policy";
+      const inManifest = !!manifestServer && manifestServer.base_url === server.base_url;
+      const signedVersion = server.signed_bundle_version == null
+        ? null
+        : Number(server.signed_bundle_version);
+      const secretRefMatches = manifestServer?.secret_ref === undefined
+        || manifestServer.secret_ref === server.secret_ref;
+      const signedConfigMatches = !!manifestServer
+        && manifestServer.base_url === server.base_url
+        && signedVersion === policy.bundle.version
+        && manifestServer.alias === server.gateway_alias
+        && secretRefMatches;
+      if (!signedConfigMatches) {
+        const reason = inManifest
+          ? "server configuration does not match the active signed policy"
+          : "server is not in the active signed policy";
         await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
           tool_name: tool, args_hash: argsHash(args as Record<string, unknown>), decision: "deny", reason,
           policy_version_id: policy.policy_version_id, overhead_ms: overheadMs() });
         await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "tool.execute",
           resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied",
-          metadata: { reason: "server_not_in_policy" } });
+          metadata: {
+            reason: inManifest ? "server_config_mismatch" : "server_not_in_policy",
+            signed_bundle_version: signedVersion,
+            policy_version: policy.bundle.version
+          } });
         await recordDeniedSpan(client, parsed.data, server.id, tool, reason);
         return reply.code(403).send({ error: "tool_blocked", reason });
       }

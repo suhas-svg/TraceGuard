@@ -157,7 +157,8 @@ export async function assembleBundle(
       server_id: s.id,
       alias: s.gateway_alias,
       base_url: s.base_url,
-      // The secret value never enters the bundle, only how it is used.
+      // The reference is signed; the secret value never enters the bundle.
+      secret_ref: s.secret_ref ?? null,
       auth_mode: s.secret_ref ? "gateway_secret" : "none"
     })),
     pins: pins.rows.map((p) => ({
@@ -369,6 +370,12 @@ export async function publish(pool: Pool, opts: PublishOptions): Promise<Publish
       "SELECT activate_approved_tool_pins($1) AS activated",
       [projectId]
     );
+    // Stamp the server rows with the exact signed bundle version. The gateway
+    // refuses any server whose row was not stamped by this same transaction.
+    const stamped = await client.query(
+      "SELECT stamp_signed_servers($1,$2) AS stamped",
+      [projectId, bundle.version]
+    );
     await appendAuditEvent(client, {
       actor_type: "admin", actor_id: opts.publishedBy ?? "operator",
       action: "policy.published", resource_type: "policy_version",
@@ -382,6 +389,7 @@ export async function publish(pool: Pool, opts: PublishOptions): Promise<Publish
         key_id: keyId,
         rules: counts.rules,
         servers: counts.servers,
+        servers_signed: Number(stamped.rows[0]?.stamped ?? 0),
         pins: counts.pins,
         pins_activated: Number(activated.rows[0]?.activated ?? 0)
       }

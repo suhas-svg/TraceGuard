@@ -32,6 +32,7 @@ describe("MCP streamable HTTP gateway", () => {
   let serverId = "";
   let alias = "";
   let httpServer: ReturnType<typeof createServer>;
+  let upstreamPort = 0;
 
   // A fresh server per request: one Protocol instance cannot be connected to
 
@@ -71,6 +72,7 @@ describe("MCP streamable HTTP gateway", () => {
     });
     await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
     const port = (httpServer.address() as { port: number }).port;
+    upstreamPort = port;
 
     const reg = await api.inject({
       method: "POST", url: "/v1/servers", headers: key,
@@ -147,6 +149,31 @@ describe("MCP streamable HTTP gateway", () => {
     expect(body.result.ttlMs).toBeGreaterThan(0);
     expect(body.result.cacheScope).toBe("workspace");
     expect(body.result.resultType).toBe("complete");
+  });
+
+  it("hides tools from a server the active signed bundle has not stamped", async () => {
+    const reg = await api.inject({
+      method: "POST", url: "/v1/servers", headers: key,
+      payload: {
+        name: `unsigned-${tag}`,
+        gateway_alias: `unsigned_${tag}`,
+        base_url: `http://127.0.0.1:${upstreamPort}/mcp`
+      }
+    });
+    expect(reg.statusCode).toBe(201);
+    expect(reg.json().signed_bundle_version ?? null).toBeNull();
+    const disc = await api.inject({
+      method: "POST", url: `/v1/servers/${reg.json().id}/discover`, headers: key
+    });
+    expect(disc.statusCode).toBe(200);
+
+    // Discovery created pins for the draft, but the draft is not part of the
+    // active signed bundle, so its tools must not be advertised.
+    const res = await rpc("tools/list", { _meta: meta() });
+    expect(res.statusCode).toBe(200);
+    const names = (res.json() as JsonBody).result.tools.map((t: { name: string }) => t.name);
+    expect(names).toContain(`${alias}__echo`);
+    expect(names).not.toContain(`unsigned_${tag}__echo`);
   });
 
   it("rejects a header that disagrees with the JSON-RPC body", async () => {

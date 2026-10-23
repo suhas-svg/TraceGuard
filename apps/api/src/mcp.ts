@@ -371,9 +371,10 @@ export function registerMcpRoutes(app: FastifyInstance): void {
           `SELECT s.id AS server_id, s.gateway_alias, t.tool_name, t.definition,
                   t.definition_hash, t.active_pin_id, t.definition_version
              FROM mcp_servers s JOIN server_tools t ON t.server_id = s.id
-            WHERE s.project_id = $1 AND s.disabled_at IS NULL AND t.quarantined = false
+            WHERE s.project_id = $1 AND s.signed_bundle_version = $2::bigint
+              AND s.disabled_at IS NULL AND t.quarantined = false
             ORDER BY s.gateway_alias, t.tool_name`,
-          [resolved.project.id]
+          [resolved.project.id, loaded.policy.bundle.version]
         );
         const rules = rulesFromBundle(loaded.policy.bundle);
         return rpcResult(env.id, {

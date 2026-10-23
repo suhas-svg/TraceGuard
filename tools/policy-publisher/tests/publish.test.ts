@@ -140,9 +140,13 @@ describe("policy publisher", () => {
     expect(first.published).toBe(true);
     expect(first.version).toBe(1);
     expect(first.bundle.rules).toHaveLength(1);
-    expect(first.bundle.servers).toEqual([
-      { server_id: serverId, alias: "files", base_url: "http://127.0.0.1:9/mcp", auth_mode: "gateway_secret" }
-    ]);
+    expect(first.bundle.servers).toEqual([{
+      server_id: serverId,
+      alias: "files",
+      base_url: "http://127.0.0.1:9/mcp",
+      secret_ref: "env:TEST_UPSTREAM_TOKEN",
+      auth_mode: "gateway_secret"
+    }]);
     expect(first.bundle.pins).toEqual([{
       server_id: serverId,
       tool_name: "read_file",
@@ -162,6 +166,11 @@ describe("policy publisher", () => {
     expect(Number(active.rows[0].version)).toBe(1);
     expect(active.rows[0].content_hash).toBe(first.contentHash);
     expect(active.rows[0].published_by).toBe("operator");
+    const stamped = await pool.query(
+      "SELECT signed_bundle_version FROM mcp_servers WHERE id = $1",
+      [serverId]
+    );
+    expect(Number(stamped.rows[0].signed_bundle_version)).toBe(1);
 
     // A second publish after a draft change is a new edition that cites the
     // first one's hash: editing history is impossible, chaining is explicit.
@@ -181,7 +190,7 @@ describe("policy publisher", () => {
     );
     expect(audited.rows).toHaveLength(2);
     expect(audited.rows[1].metadata).toMatchObject({
-      version: 2, content_hash: second.contentHash, pins: 1, servers: 1, rules: 2
+      version: 2, content_hash: second.contentHash, pins: 1, servers: 1, servers_signed: 1, rules: 2
     });
     expect(audited.rows[0].metadata.pins).toBe(1);
   });
