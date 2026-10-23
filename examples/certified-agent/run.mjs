@@ -35,7 +35,7 @@ if (!tool) {
   process.exit(2);
 }
 
-const client = new CertifiedClient({ url, token });
+const client = new CertifiedClient({ url, authProfile: "development", token });
 
 console.log(`calling ${tool} through ${url}`);
 try {

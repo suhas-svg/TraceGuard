@@ -22,6 +22,7 @@ describe("integration and security", () => {
   const approver = { authorization: "Bearer test_approver" };
   const tag = Date.now().toString(36);
   let upstreamHits = 0;
+  let lastUpstreamAuth: string | undefined;
   let upstreamPort = 0;
   let httpServer: ReturnType<typeof createServer>;
   let serverId = "";
@@ -43,6 +44,7 @@ describe("integration and security", () => {
   beforeAll(async () => {
     httpServer = createServer(async (req, res) => {
       if (req.method === "POST") {
+        lastUpstreamAuth = req.headers.authorization as string | undefined;
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
         res.on("close", () => transport.close().catch(() => undefined));
         await newMock().connect(transport);
@@ -185,6 +187,10 @@ describe("integration and security", () => {
       payload: { server_id: serverId, tool: "echo", arguments: { text: "hi" }, caller: "t" } });
     expect(ok.statusCode).toBe(200);
     expect(upstreamHits).toBe(before + 1);
+    // FR-002: the upstream sees its configured secret, never the inbound
+    // gateway bearer that authenticated the agent.
+    expect(lastUpstreamAuth).toBe("Bearer s3cret");
+    expect(lastUpstreamAuth).not.toContain("test_key");
     const blocked = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: "nope!" }, caller: "t" } });
     expect(blocked.statusCode).toBe(403);

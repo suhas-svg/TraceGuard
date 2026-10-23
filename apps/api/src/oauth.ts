@@ -138,6 +138,17 @@ function claimAudience(value: unknown): string[] {
   return [];
 }
 
+// RFC 8707 uses the same string-or-array shape as `aud`. The resource claim is
+// the token's intended recipient; checking only `aud` would accept a token the
+// issuer minted for a different protected resource.
+function claimResources(value: unknown): string[] {
+  return claimAudience(value);
+}
+
+function sameResource(a: string, b: string): boolean {
+  return a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+}
+
 function claimScopes(payload: Record<string, unknown>): string[] {
   const scope = payload.scope;
   if (typeof scope === "string") return scope.split(/\s+/).filter(Boolean);
@@ -203,6 +214,9 @@ export async function verifyAccessToken(
 
   if (payload.iss !== cfg.issuer) fail("wrong issuer");
   if (!claimAudience(payload.aud).includes(cfg.audience)) fail("wrong audience");
+  const resources = claimResources(payload.resource);
+  if (resources.length === 0) fail("missing resource");
+  if (!resources.some((resource) => sameResource(resource, cfg.audience))) fail("wrong resource");
   if (typeof payload.exp !== "number") fail("missing exp");
   const skew = (cfg.clockSkewSeconds ?? DEFAULT_SKEW_SECONDS) * 1000;
   if (payload.exp * 1000 + skew < nowMs) fail("expired");
