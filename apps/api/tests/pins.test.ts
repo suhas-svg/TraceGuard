@@ -273,12 +273,12 @@ describe("tool definition pins", () => {
 
     const audited = await pool.query(
       `SELECT action FROM audit_events
-        WHERE action IN ('tool_pin.submitted', 'tool_pin.approved')
+        WHERE action IN ('tool_pin.submitted', 'tool.reapproved')
           AND resource_id = $1`,
       [candidate.id]
     );
     expect(audited.rows.map((r) => r.action).sort())
-      .toEqual(["tool_pin.approved", "tool_pin.submitted"]);
+      .toEqual(["tool.reapproved", "tool_pin.submitted"]);
   });
 
   it("keeps the active pin across repeated drift until the newest candidate is published", async () => {

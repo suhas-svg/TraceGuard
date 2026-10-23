@@ -342,8 +342,12 @@ export function buildGateway() {
         approval_id: decisionMeta.approval_id ?? null, overhead_ms: decisionMeta.overheadMs ?? null
       });
     }
-    await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "tool.execute",
-      resource_type: "server_tool", resource_id: `${server.id}/${tool}`, result: "allowed" });
+    // §10.3: every policy decision is auditable as such. The execution
+    // outcome is already covered by policy_decisions and by the failure
+    // events above; this event records the allow that authorized dispatch.
+    await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "policy.allow",
+      resource_type: "server_tool", resource_id: `${server.id}/${tool}`, result: "allow",
+      metadata: { approval_id: decisionMeta.approval_id ?? null } });
     return result;
   }
 
@@ -562,9 +566,9 @@ export function buildGateway() {
           policy_version_id: policy.policy_version_id,
           matched: verdict.matched, reason: verdict.reason,
           approval_id: parsed.data.approval_id ?? null, overhead_ms: overheadMs() });
-        await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "tool.execute",
-          resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied",
-          metadata: { rule: verdict.rule?.name ?? null } });
+        await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "policy.deny",
+          resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "deny",
+          metadata: { rule: verdict.rule?.name ?? null, reason: verdict.reason } });
         // An approval held for this call is dead on arrival: a newly
         // applicable deny invalidates it instead of letting it wait for TTL.
         if (parsed.data.approval_id) {
@@ -627,9 +631,9 @@ export function buildGateway() {
           tool_name: tool, args_hash: callArgsHash, decision: "deny",
           policy_version_id: policy.policy_version_id, matched: verdict.matched, reason,
           approval_id: parsed.data.approval_id ?? null, overhead_ms: overheadMs() });
-        await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "tool.execute",
-          resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "denied",
-          metadata: { budget_id: exhausted.id, scope: exhausted.scope } });
+        await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "budget.denied",
+          resource_type: "budget", resource_id: exhausted.id, result: "denied",
+          metadata: { server_id, tool, scope: exhausted.scope } });
         void notify(server.workspace_id, "budget.exceeded",
           { budget_id: exhausted.id, scope: exhausted.scope,
             spent_micro: Number(exhausted.spent_micro) + Number(exhausted.reserved_micro),
@@ -951,7 +955,7 @@ export function buildGateway() {
           policy_version_id: lastPolicy.policy_version_id, matched: lastVerdict.matched,
           reason: "approved under the consume-time re-evaluation",
           approval_id: approval.id, overhead_ms: overheadMs() });
-        await auditForScope(client, server, { actor_type: "agent", actor_id: caller, action: "approval.execution_intent",
+        await auditForScope(client, server, { actor_type: "agent", actor_id: caller, action: "approval.execution_started",
           resource_type: "approval", resource_id: approval.id, result: "executing",
           metadata: { server_id, tool, claim_id: claimId,
             policy_version_id: lastPolicy.policy_version_id,
@@ -1079,7 +1083,10 @@ export function buildGateway() {
           policy_version_id: policy.policy_version_id,
           matched: verdict.matched, reason: verdict.reason, approval_id: row.id,
           overhead_ms: overheadMs() });
-        await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "approval.request",
+        await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "policy.approval_required",
+          resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "need_approval",
+          metadata: { rule: verdict.rule?.name ?? null, reason: verdict.reason, approval_id: row.id } });
+        await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "approval.created",
           resource_type: "approval", resource_id: row.id, result: "pending" });
         void notify(server.workspace_id, "approval.requested",
           { approval_id: row.id, caller, server_id, tool });
@@ -1453,7 +1460,8 @@ export function registerApprovalControlRoutes(app: FastifyInstance): void {
         await client.query("ROLLBACK");
         return reply.code(409).send({ error: "approval_decided_elsewhere" });
       }
-      await audit(client, { actor_type: "approver", actor_id: actor, action: "approval.decide",
+      await audit(client, { actor_type: "approver", actor_id: actor,
+        action: parsed.data.approved ? "approval.approved" : "approval.rejected",
         resource_type: "approval", resource_id: id,
         result: parsed.data.approved ? "approved" : "rejected",
         workspace_id: approval.workspace_id, project_id: approval.project_id,

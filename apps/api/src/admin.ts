@@ -635,7 +635,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
         [pin.id, reviewedBy]
       );
       await audit(client, { actor_type: "admin", actor_id: req.principal?.userId ?? undefined,
-        action: "tool_pin.approved", resource_type: "tool_pin", resource_id: pin.id,
+        action: "tool.reapproved", resource_type: "tool_pin", resource_id: pin.id,
         result: "approved", workspace_id: pin.workspace_id, project_id: pin.project_id,
         metadata: { pin_id: pin.id, pin_version: pin.version,
           definition_hash: pin.definition_hash } });
@@ -692,7 +692,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
          p.agent_id ?? null, p.server_id ?? null, p.tool_name ?? null, p.effect,
          JSON.stringify(p.conditions)]
       );
-      await audit(pool, { actor_type: "admin", action: "policy.create",
+      await audit(pool, { actor_type: "admin", action: "policy.draft_created",
         resource_type: "policy", resource_id: res.rows[0].id, result: "success",
         workspace_id: res.rows[0].workspace_id, project_id: res.rows[0].project_id,
         metadata: { name: p.name, effect: p.effect, version: 1 } });
@@ -759,7 +759,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
       await client.query("UPDATE policies SET superseded_by = $2 WHERE id = $1",
         [id, next.rows[0].id]);
       await client.query("COMMIT");
-      await audit(pool, { actor_type: "admin", action: "policy.update",
+      await audit(pool, { actor_type: "admin", action: "policy.draft_updated",
         resource_type: "policy", resource_id: next.rows[0].id, result: "success",
         workspace_id: next.rows[0].workspace_id, project_id: next.rows[0].project_id,
         metadata: { previous_id: id, version: next.rows[0].version } });

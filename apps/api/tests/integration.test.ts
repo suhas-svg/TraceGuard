@@ -232,6 +232,10 @@ describe("integration and security", () => {
       payload: { server_id: serverId, tool: "echo", arguments: { text: "nope!" }, caller: "t" } });
     expect(blocked.statusCode).toBe(403);
     expect(upstreamHits).toBe(before + 1);
+    const decisions = await pool.query<{ action: string }>(
+      `SELECT action FROM audit_events WHERE resource_id = $1
+        AND action IN ('policy.allow','policy.deny')`, [`${serverId}/echo`]);
+    expect(decisions.rows.map((row) => row.action).sort()).toEqual(["policy.allow", "policy.deny"]);
     const unknown = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "ghost", arguments: {}, caller: "t" } });
     expect(unknown.statusCode).toBe(403);
@@ -314,12 +318,22 @@ describe("integration and security", () => {
     expect(call.statusCode).toBe(202);
     expect(upstreamHits).toBe(before);
     const approvalId = call.json().approval_id;
+    const required = await pool.query(
+      `SELECT 1 FROM audit_events WHERE action = 'policy.approval_required'
+        AND resource_id = $1 AND metadata->>'approval_id' = $2`, [`${serverId}/echo`, approvalId]);
+    expect(required.rowCount).toBe(1);
+    const created = await pool.query(
+      "SELECT 1 FROM audit_events WHERE action = 'approval.created' AND resource_id = $1", [approvalId]);
+    expect(created.rowCount).toBe(1);
     const agentDecision = await ctl.inject({ method: "POST", url: `/_control/v1/approvals/${approvalId}/decision`,
       headers: agentKey, payload: { approved: true } });
     expect(agentDecision.statusCode).toBe(403);
     const decided = await ctl.inject({ method: "POST", url: `/_control/v1/approvals/${approvalId}/decision`,
       headers: approver, payload: { approved: true, reason: "test" } });
     expect(decided.json().status).toBe("approved");
+    const approved = await pool.query(
+      "SELECT 1 FROM audit_events WHERE action = 'approval.approved' AND resource_id = $1", [approvalId]);
+    expect(approved.rowCount).toBe(1);
     // Sealed at rest while pending/approved: ciphertext, never the plaintext.
     const stored = await pool.query("SELECT args_enc, args FROM approvals WHERE id = $1", [approvalId]);
     expect(stored.rows[0].args_enc).toBe(true);
@@ -329,6 +343,11 @@ describe("integration and security", () => {
         request_id: `r-${tag}`, approval_id: approvalId } });
     expect(retry.statusCode).toBe(200);
     expect(upstreamHits).toBe(before + 1);
+    const executed = await pool.query<{ action: string }>(
+      `SELECT action FROM audit_events WHERE resource_id = $1
+        AND action IN ('approval.execution_started','approval.response_received')`, [approvalId]);
+    expect(executed.rows.map((row) => row.action).sort())
+      .toEqual(["approval.execution_started", "approval.response_received"]);
     const replay = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: "wait" }, caller: "t",
         request_id: `r-${tag}`, approval_id: approvalId } });
@@ -874,6 +893,9 @@ describe("integration and security", () => {
     ]);
     const codes = [a.statusCode, b.statusCode].sort((x, y) => x - y);
     expect(codes).toEqual([200, 409]);
+    const denied = await pool.query(
+      "SELECT 1 FROM audit_events WHERE action = 'budget.denied' AND resource_id = $1", [budgetId]);
+    expect(denied.rowCount).toBe(1);
   });
 
   it("does not re-issue a tool call after an upstream error", async () => {
@@ -984,6 +1006,9 @@ describe("integration and security", () => {
     expect(denied.json().error).toBe("budget_exceeded");
     expect(denied.json().budget_id).toBe(budget.json().id);
     expect(upstreamHits).toBe(before);
+    const deniedAudit = await pool.query(
+      "SELECT 1 FROM audit_events WHERE action = 'budget.denied' AND resource_id = $1", [budget.json().id]);
+    expect(deniedAudit.rowCount).toBe(1);
     // The denial is visible in the run trace, citing the budget.
     const trace = await api.inject({ method: "GET", url: `/v1/runs/${runId}/trace`, headers: key });
     const span = trace.json().spans.find((s: { status: string }) => s.status === "denied");
@@ -1080,6 +1105,9 @@ describe("integration and security", () => {
     expect(deniedRow.args).toEqual({});
     expect(deniedRow.args_summary).toContain("[REDACTED]");
     expect(deniedRow.args_summary).not.toContain(secret);
+    const rejectedAudit = await pool.query(
+      "SELECT 1 FROM audit_events WHERE action = 'approval.rejected' AND resource_id = $1", [deniedId]);
+    expect(rejectedAudit.rowCount).toBe(1);
     // Consumed: the call executes, then the sealed arguments are dropped.
     const call2 = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: `ok-${tag}` }, caller: "summ-t",

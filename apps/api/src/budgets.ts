@@ -364,7 +364,7 @@ export function registerBudgetRoutes(app: FastifyInstance) {
 
       if (updated.rowCount === 0) {
         await client.query("ROLLBACK");
-        await audit(pool, { actor_type: "agent", action: "budget.exceeded",
+        await audit(pool, { actor_type: "agent", action: "budget.denied",
           resource_type: "budget", resource_id: budget.id, result: "blocked",
           workspace_id: budget.workspace_id, project_id: budget.project_id,
           metadata: { spent_micro: spent, limit_micro: budget.limit_micro,
