@@ -212,6 +212,7 @@ describe("identity model", () => {
       const payload = b64({
         iss: "https://issuer.identity.test",
         aud: "http://localhost:8091/mcp",
+        resource: "http://localhost:8091/mcp",
         sub: "agent-42",
         exp: now + 300,
         scope: "gateway read admin",

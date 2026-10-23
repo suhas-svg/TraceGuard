@@ -48,7 +48,7 @@ const mint = (scopes) => {
   const now = Math.floor(Date.now() / 1000);
   const header = b64url(JSON.stringify({ alg: "RS256", kid, typ: "JWT" }));
   const payload = b64url(JSON.stringify({
-    iss: issuer, aud: audience, sub: "clean-run-user", scope: scopes,
+    iss: issuer, aud: audience, resource: audience, sub: "clean-run-user", scope: scopes,
     workspaces: [workspaceId], iat: now, exp: now + 300
   }));
   const signature = b64url(signBytes("RSA-SHA256", Buffer.from(`${header}.${payload}`), privateKey));

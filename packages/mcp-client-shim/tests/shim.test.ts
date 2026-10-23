@@ -76,7 +76,7 @@ describe("certified approval-retry client", () => {
     );
     cleanups.push(srv.close);
     const client = new CertifiedClient({
-      url: srv.url, token: "tg_test", retryIntervalMs: 5, deadlineMs: 5_000
+      url: srv.url, authProfile: "development", token: "tg_test", retryIntervalMs: 5, deadlineMs: 5_000
     });
     const out = await client.callTool("mock__echo", { text: "hi" });
     expect(out).toEqual(result);
@@ -104,7 +104,7 @@ describe("certified approval-retry client", () => {
       }
     }));
     cleanups.push(srv.close);
-    const client = new CertifiedClient({ url: srv.url, token: "t", retryIntervalMs: 5, deadlineMs: 1_000 });
+    const client = new CertifiedClient({ url: srv.url, authProfile: "development", token: "t", retryIntervalMs: 5, deadlineMs: 1_000 });
     await expect(client.callTool("mock__hold")).rejects.toBeInstanceOf(ApprovalTerminalError);
     expect(srv.seen).toHaveLength(1);
   });
@@ -117,7 +117,7 @@ describe("certified approval-retry client", () => {
       }
     }));
     cleanups.push(srv.close);
-    const client = new CertifiedClient({ url: srv.url, token: "t", retryIntervalMs: 5, deadlineMs: 1_000 });
+    const client = new CertifiedClient({ url: srv.url, authProfile: "development", token: "t", retryIntervalMs: 5, deadlineMs: 1_000 });
     await expect(client.callTool("mock__hold")).rejects.toBeInstanceOf(ApprovalClientRequiredError);
   });
 
@@ -129,14 +129,14 @@ describe("certified approval-retry client", () => {
       }
     }));
     cleanups.push(srv.close);
-    const client = new CertifiedClient({ url: srv.url, token: "t", retryIntervalMs: 5, deadlineMs: 1_000 });
+    const client = new CertifiedClient({ url: srv.url, authProfile: "development", token: "t", retryIntervalMs: 5, deadlineMs: 1_000 });
     await expect(client.callTool("mock__hold")).rejects.toBeInstanceOf(OutcomeUnknownError);
   });
 
   it("gives up at the caller deadline while still pending", async () => {
     const srv = await start(() => ({ body: pending("unused") }));
     cleanups.push(srv.close);
-    const client = new CertifiedClient({ url: srv.url, token: "t", retryIntervalMs: 10, deadlineMs: 60 });
+    const client = new CertifiedClient({ url: srv.url, authProfile: "development", token: "t", retryIntervalMs: 10, deadlineMs: 60 });
     const failure = await client.callTool("mock__hold").catch((err) => err);
     expect(failure).toBeInstanceOf(ApprovalPendingError);
     expect(failure.approvalId).toBe("11111111-1111-1111-1111-111111111111");
@@ -147,13 +147,13 @@ describe("certified approval-retry client", () => {
   it("never resubmits after a transport failure that may have executed", async () => {
     const srv = await start(() => "destroy");
     cleanups.push(srv.close);
-    const client = new CertifiedClient({ url: srv.url, token: "t", retryIntervalMs: 5, deadlineMs: 1_000 });
+    const client = new CertifiedClient({ url: srv.url, authProfile: "development", token: "t", retryIntervalMs: 5, deadlineMs: 1_000 });
     await expect(client.callTool("mock__hold")).rejects.toBeInstanceOf(OutcomeUnknownError);
     expect(srv.seen).toHaveLength(1);
   });
 
   it("distinguishes an unreachable gateway from an ambiguous outcome", async () => {
-    const client = new CertifiedClient({ url: "http://127.0.0.1:59999/mcp", token: "t", retryIntervalMs: 5, deadlineMs: 1_000 });
+    const client = new CertifiedClient({ url: "http://127.0.0.1:59999/mcp", authProfile: "development", token: "t", retryIntervalMs: 5, deadlineMs: 1_000 });
     const failure = await client.callTool("mock__echo").catch((err) => err);
     expect(failure).toBeInstanceOf(ShimError);
     expect(failure.code).toBe("GATEWAY_UNREACHABLE");

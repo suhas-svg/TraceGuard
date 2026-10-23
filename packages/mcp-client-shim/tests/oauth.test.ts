@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { CertifiedClient, OAuthClientError, ShimError } from "../src/index.js";
+import { beginAuthorization, CertifiedClient, OAuthClientError, ShimError } from "../src/index.js";
 
 // FR-002, client half: the shim discovers the protected-resource metadata,
 // discovers the authorization server it names, asks for a token with the
@@ -34,6 +35,7 @@ let advertiseIssuer = "";
 let metadataIssuer = "";
 let servePathAppended = false;
 let tokenIssuer = "";
+let challengeMethods = ["S256"];
 
 function body(req: IncomingMessage): Promise<string> {
   return new Promise((resolve) => {
@@ -73,7 +75,9 @@ beforeAll(async () => {
       return json(res, 200, {
         issuer: metadataIssuer,
         token_endpoint: `${base}/token`,
-        grant_types_supported: ["client_credentials"]
+        authorization_endpoint: `${base}/authorize`,
+        grant_types_supported: ["client_credentials", "authorization_code", "refresh_token"],
+        code_challenge_methods_supported: challengeMethods
       });
     }
     if (req.url === "/token") {
@@ -82,6 +86,7 @@ beforeAll(async () => {
       (poisonFirst && tokenRequests === 1 ? stale : valid).add(token);
       return json(res, 200, {
         access_token: token, token_type: "Bearer", expires_in: 300,
+        refresh_token: "refresh-1",
         ...(tokenIssuer ? { iss: tokenIssuer } : {})
       });
     }
@@ -208,6 +213,84 @@ describe("OAuth client half", () => {
     }
   });
 
+  it("builds an Authorization Code + PKCE authorization URL", async () => {
+    const req = await beginAuthorization(
+      { resource: RESOURCE, clientId: "web", scopes: ["gateway"], issuer: ISSUER },
+      { redirectUri: `${base}/callback`, state: "state-1" }
+    );
+    const url = new URL(req.url);
+    expect(`${url.origin}${url.pathname}`).toBe(`${base}/authorize`);
+    expect(url.searchParams.get("response_type")).toBe("code");
+    expect(url.searchParams.get("client_id")).toBe("web");
+    expect(url.searchParams.get("redirect_uri")).toBe(`${base}/callback`);
+    expect(url.searchParams.get("scope")).toBe("gateway");
+    expect(url.searchParams.get("resource")).toBe(RESOURCE);
+    expect(url.searchParams.get("state")).toBe("state-1");
+    expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(url.searchParams.get("code_challenge")).toBe(req.codeChallenge);
+    expect(req.codeChallenge).toBe(createHash("sha256").update(req.codeVerifier).digest("base64url"));
+  });
+
+  it("exchanges an authorization code with PKCE and refreshes it", async () => {
+    requests = [];
+    valid.clear();
+    tokenRequests = 0;
+    counter = 0;
+    let clock = 10_000;
+    const req = await beginAuthorization(
+      { resource: RESOURCE, clientId: "web", issuer: ISSUER },
+      { redirectUri: `${base}/callback` }
+    );
+    const c = new CertifiedClient({
+      url: `${base}/mcp`,
+      oauth: {
+        resource: RESOURCE,
+        clientId: "web",
+        issuer: ISSUER,
+        nowMs: () => clock,
+        authorizationCode: {
+          code: "code-abc",
+          redirectUri: req.redirectUri,
+          codeVerifier: req.codeVerifier
+        }
+      },
+      retryIntervalMs: 10
+    });
+
+    await c.callTool("read_file", { path: "/notes.txt" });
+    const first = requests.filter((r) => r.url === `${base}/token`)[0]!;
+    const form = new URLSearchParams(first.body);
+    expect(form.get("grant_type")).toBe("authorization_code");
+    expect(form.get("code")).toBe("code-abc");
+    expect(form.get("redirect_uri")).toBe(`${base}/callback`);
+    expect(form.get("code_verifier")).toBe(req.codeVerifier);
+    expect(form.get("resource")).toBe(RESOURCE);
+    expect(form.get("client_id")).toBe("web");
+    expect(first.authorization).toBeUndefined();
+
+    clock += 400_000;
+    await c.callTool("read_file", { path: "/notes.txt" });
+    const tokenReqs = requests.filter((r) => r.url === `${base}/token`);
+    expect(tokenReqs).toHaveLength(2);
+    const refresh = new URLSearchParams(tokenReqs[1].body);
+    expect(refresh.get("grant_type")).toBe("refresh_token");
+    expect(refresh.get("refresh_token")).toBe("refresh-1");
+    expect(refresh.get("code")).toBeNull();
+    expect(refresh.get("code_verifier")).toBeNull();
+  });
+
+  it("refuses a server that does not advertise PKCE S256", async () => {
+    challengeMethods = ["plain"];
+    try {
+      await expect(beginAuthorization(
+        { resource: RESOURCE, clientId: "web", issuer: ISSUER },
+        { redirectUri: `${base}/callback` }
+      )).rejects.toThrow(/PKCE S256/);
+    } finally {
+      challengeMethods = ["S256"];
+    }
+  });
+
   it("caches the token until it expires", async () => {
     valid.clear();
     tokenRequests = 0;
@@ -281,7 +364,7 @@ describe("OAuth client half", () => {
     }
   });
 
-  it("requires exactly one credential", () => {
+  it("requires exactly one credential and gates static tokens to development", () => {
     expect(() => new CertifiedClient({ url: `${base}/mcp` })).toThrow(ShimError);
     expect(() => new CertifiedClient({
       url: `${base}/mcp`, token: "static",
@@ -291,5 +374,13 @@ describe("OAuth client half", () => {
       url: `${base}/mcp`,
       oauth: { resource: RESOURCE, clientId: "" }
     })).toThrow(/client id/);
+    expect(() => new CertifiedClient({ url: `${base}/mcp`, token: "static" }))
+      .toThrow(/authProfile: "development"/);
+    expect(() => new CertifiedClient({
+      url: `${base}/mcp`, token: "static", authProfile: "production"
+    })).toThrow(/authProfile: "development"/);
+    expect(() => new CertifiedClient({
+      url: `${base}/mcp`, token: "static", authProfile: "development"
+    })).not.toThrow();
   });
 });

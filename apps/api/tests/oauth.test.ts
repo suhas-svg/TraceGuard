@@ -62,6 +62,8 @@ const NOW = Math.floor(Date.now() / 1000);
 const baseClaims = {
   iss: ISSUER,
   aud: AUDIENCE,
+  // RFC 8707: the token names the gateway resource, not just its audience.
+  resource: AUDIENCE,
   sub: "agent-7",
   exp: NOW + 300,
   scope: "gateway read",
@@ -127,6 +129,14 @@ describe("OAuth access token validation", () => {
     const wrongAud = mint(baseClaims, edSigner, { payloadOverride: { aud: "https://other-resource" } });
     await expect(verifyAccessToken(wrongAud, cfg)).rejects.toThrow(/audience/);
 
+    const missingResource = mint(baseClaims, edSigner, { payloadOverride: { resource: undefined } });
+    await expect(verifyAccessToken(missingResource, cfg)).rejects.toThrow(/missing resource/);
+
+    const wrongResource = mint(baseClaims, edSigner, {
+      payloadOverride: { resource: "https://other-resource/mcp" }
+    });
+    await expect(verifyAccessToken(wrongResource, cfg)).rejects.toThrow(/wrong resource/);
+
     const expired = mint(baseClaims, edSigner, { payloadOverride: { exp: NOW - 3600 } });
     await expect(verifyAccessToken(expired, cfg)).rejects.toThrow(/expired/);
 
@@ -142,9 +152,14 @@ describe("OAuth access token validation", () => {
     await expect(verifyAccessToken(wrongType, cfg)).rejects.toThrow(/signature/);
   });
 
-  it("accepts an audience list and a space- or array-shaped scope claim", async () => {
+  it("accepts audience/resource lists and a space- or array-shaped scope claim", async () => {
     const listAud = mint(baseClaims, edSigner, {
-      payloadOverride: { aud: ["https://other", AUDIENCE], scope: undefined, scp: ["gateway", "approve"] }
+      payloadOverride: {
+        aud: ["https://other", AUDIENCE],
+        resource: ["https://other-resource", `${AUDIENCE}/`],
+        scope: undefined,
+        scp: ["gateway", "approve"]
+      }
     });
     const claims = await verifyAccessToken(listAud, cfg);
     expect(claims.scopes).toEqual(["gateway", "approve"]);

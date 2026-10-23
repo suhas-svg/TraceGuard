@@ -38,12 +38,23 @@ export {
   OutcomeUnknownError,
   ShimError
 } from "./errors.js";
-export { OAuthClientError, type OAuthClientOptions } from "./oauth.js";
+export {
+  OAuthClientError,
+  beginAuthorization,
+  createPkcePair,
+  type AuthorizationCodeGrant,
+  type AuthorizationRequest,
+  type OAuthClientOptions
+} from "./oauth.js";
 
 export interface CertifiedClientOptions {
   /** Gateway MCP endpoint, e.g. http://localhost:8091/mcp */
   url: string;
-  /** Gateway bearer token (dev profile: the static gateway key). Exactly one of token or oauth. */
+  /**
+   * Gateway bearer token. This is the explicit development profile, not a
+   * production shortcut: it is accepted only with authProfile "development".
+   * Exactly one of token or oauth.
+   */
   token?: string;
   /**
    * FR-002 client half: discover the gateway's protected-resource metadata,
@@ -51,6 +62,8 @@ export interface CertifiedClientOptions {
    * it. Use it when the deployment runs on OAuth (OAUTH_ISSUER set).
    */
   oauth?: OAuthClientOptions;
+  /** Required for a static token; OAuth clients do not need it. */
+  authProfile?: "production" | "development";
   /** Backoff seed between APPROVAL_PENDING retries. Default 2s. */
   retryIntervalMs?: number;
   /** Overall deadline for one logical call. Default 15 minutes. */
@@ -81,6 +94,12 @@ export class CertifiedClient {
   constructor(opts: CertifiedClientOptions) {
     if ((opts.token ? 1 : 0) + (opts.oauth ? 1 : 0) !== 1) {
       throw new ShimError("CertifiedClient needs exactly one of token or oauth", "CONFIG");
+    }
+    if (opts.token && opts.authProfile !== "development") {
+      throw new ShimError(
+        "static bearer tokens require authProfile: \"development\"",
+        "STATIC_TOKEN_DEV_ONLY"
+      );
     }
     this.url = opts.url;
     this.token = opts.token;
