@@ -56,10 +56,14 @@ events use v4 hashes with workspace and project attribution; v1–v3 hashes
 remain byte-identical for old rows. The hash formula stays in
 `@traceguard/audit-chain`, where the verifier shares it.
 
-The remaining deviation from the spec's §13.4 table is the local identity
-path: `api_runtime` can still insert/update `users`, `api_keys`, and
-`memberships`, so a non-OAuth deployment can mint trusted roles. Removing
-that path is tracked as an open identity workstream, not a hidden exception.
+The identity boundary is procedural: `api_runtime` has `SELECT` but no direct
+`INSERT`/`UPDATE`/`DELETE` on `users`, `api_keys`, or `memberships`; every
+write goes through a narrow `SECURITY DEFINER` procedure owned by
+`identity_owner`. When an issuer is configured, the local registration/login
+plane is closed with `403 external_identity_required`, and pre-existing local
+API keys and dashboard sessions no longer authenticate. The procedures still
+back the local development profile when no issuer is configured; that profile
+is not a production identity source.
 
 `apps/api/tests/db-roles.test.ts` proves the matrix at the database layer by
 running each probe under `SET ROLE`; it fails if a grant widens.

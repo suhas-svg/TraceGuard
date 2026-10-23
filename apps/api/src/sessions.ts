@@ -1,9 +1,11 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { resolvePrincipal } from "./auth.js";
+import { oauthConfigFromEnv } from "./oauth.js";
 import {
   ADMIN_SESSION_COOKIE, APPROVER_SESSION_COOKIE, SESSION_TTL_SECONDS,
   clearCookie, cookieValue, createSession, csrfCookieName, csrfMatches, deleteSession,
-  findSession, serializeCookie, sessionCookieName, type CreatedSession, type SessionRole
+  findSession, serializeCookie, sessionCookieName,
+  type CreatedSession, type DashboardSession, type SessionRole
 } from "./session-store.js";
 
 function setSessionCookies(reply: FastifyReply, created: CreatedSession) {
@@ -24,6 +26,14 @@ function publicSession(session: { principal: unknown; expiresAt: number } | null
     principal: session.principal,
     expires_at: new Date(session.expiresAt).toISOString()
   };
+}
+
+// Local sessions are a development-profile artifact. Once an issuer is
+// configured, a cookie left over from password login must not keep a local
+// principal alive.
+function usableSession(session: DashboardSession | null): DashboardSession | null {
+  if (session?.principal.kind === "user" && oauthConfigFromEnv()) return null;
+  return session;
 }
 
 export function registerSessionRoutes(app: FastifyInstance) {
@@ -48,12 +58,12 @@ export function registerSessionRoutes(app: FastifyInstance) {
   // A reload asks the server which sessions this browser still holds. The
   // response is intentionally non-secret: no cookie values or hashes.
   app.get("/v1/auth/session", async (req, reply) => {
-    const admin = await findSession(
+    const admin = usableSession(await findSession(
       "admin", cookieValue(req.headers.cookie, ADMIN_SESSION_COOKIE) ?? ""
-    );
-    const approver = await findSession(
+    ));
+    const approver = usableSession(await findSession(
       "approver", cookieValue(req.headers.cookie, APPROVER_SESSION_COOKIE) ?? ""
-    );
+    ));
     reply.header("Cache-Control", "no-store");
     return { ok: true, admin: publicSession(admin), approver: publicSession(approver) };
   });
