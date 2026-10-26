@@ -31,8 +31,8 @@ Preconditions:
 - Baseline met; gateway up (:8091) with the dashboard's API key (`dev_key_change_me`).
 - A signed policy has been published at least once, otherwise every gateway interaction
   reports `policy unavailable`:
-  `npm run policy:keygen` (once), `npm run policy:trust -- --workspace default` (once),
-  `npm run policy:publish -- --workspace default` (repeat after rule changes).
+  `pnpm policy:keygen` (once), `pnpm policy:trust -- --workspace default` (once),
+  `pnpm policy:publish -- --workspace default` (repeat after rule changes).
 - **Load.** Open `#/policy`. Servers card lists registered servers (or the honest
   `No servers registered.` line); rules table lists rules or the empty state; the
   `Signed policy` section shows the active version, or the empty state naming
@@ -48,7 +48,7 @@ Preconditions:
 - **Edit.** Click `Edit` on that row; the form reopens prefilled with button text
   `Save as v2`. Click it; the row now reads `v2` and the old id is superseded (list shows
   the newest version).
-- **Publish round-trip.** `npm run policy:publish -- --workspace default`, then reload
+- **Publish round-trip.** `pnpm policy:publish -- --workspace default`, then reload
   `#/policy`: the active version increments and its hash changes.
 - **Verify chain.** Click `Verify chain`; expect the `chain verified` badge and a checked
   count. (Downgrade only by tampering with the database, which is outside this harness.)

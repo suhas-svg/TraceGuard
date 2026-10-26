@@ -32,9 +32,9 @@ Preconditions:
   from the gateway container), register it (`POST /v1/servers` with that url),
   `POST /v1/servers/:id/discover`, add a server-scoped `require_approval` rule
   (`POST /v1/policies` with `server_id`, `tool_name: "wipe_disk"`, `priority: 100`),
-  then **publish the signed policy** (`npm run policy:keygen` and
-  `npm run policy:trust -- --workspace default` once, then
-  `npm run policy:publish -- --workspace default` — without a publish the call fails
+  then **publish the signed policy** (`pnpm policy:keygen` and
+  `pnpm policy:trust -- --workspace default` once, then
+  `pnpm policy:publish -- --workspace default` — without a publish the call fails
   closed with `503 policy_unavailable` and no rule ever matches). Then call
   `POST /v1/gateway/tools/call` with that server id and tool.
   The response carries `approval_id` + `expires_at`. Do this immediately before driving —
