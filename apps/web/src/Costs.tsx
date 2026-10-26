@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { formatMicro, listBudgets, opsApi, type CompareRow } from "./api";
+import { budgetRemainingHint, formatMicro, listBudgets, opsApi, type CompareRow } from "./api";
 import {
   Alert, Badge, Button, Card, Empty, Field, Input, Select,
   Page, Table, Td, Th
@@ -87,7 +87,7 @@ function BudgetUtilization() {
               max={Math.max(b.limit_micro, 1)}
               color={color}
               valueText={`${formatMicro(used)} / ${formatMicro(b.limit_micro)}`}
-              hint={`remaining ${formatMicro(Math.max(b.remaining_micro, 0))}`}
+              hint={budgetRemainingHint(b, "remaining unknown: unpriced usage")}
             />
           );
         })}

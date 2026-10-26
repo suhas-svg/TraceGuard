@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  adminApi, createBudget, formatMicro, gwApi, listBudgets, updateBudget,
+  adminApi, budgetRemainingHint, createBudget, formatMicro, gwApi, listBudgets, updateBudget,
   type Budget, type McpServer, type Policy
 } from "./api";
 import {
@@ -307,7 +307,7 @@ function BudgetRow({ budget, onChanged, onError }: {
         {budget.ref_id.slice(0, 13)}…
       </span>
       <span className="tg-nums text-xs text-ink-500">
-        {formatMicro(used)} / {formatMicro(budget.limit_micro)} · remaining {formatMicro(budget.remaining_micro)}
+        {formatMicro(used)} / {formatMicro(budget.limit_micro)} · {budgetRemainingHint(budget, "remaining unknown (unpriced usage)")}
       </span>
       <span className="ml-auto flex items-center gap-2">
         <Input aria-label={`Limit for ${budget.id}`} className="w-24" value={limit}

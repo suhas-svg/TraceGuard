@@ -227,7 +227,10 @@ export interface Budget {
   effect: string;
   spent_micro: number;
   reserved_micro: number;
-  remaining_micro: number;
+  remaining_micro: number | null;
+  /** False when unpriced usage makes a project budget's remainder unknowable. */
+  spend_complete?: boolean;
+  unpriced_spans?: number;
 }
 
 export function listBudgets() {
@@ -309,6 +312,16 @@ async function deleteApi<T>(path: string): Promise<T> {
 
 export function formatMicro(micro: number): string {
   return `$${(micro / 1_000_000).toFixed(4)}`;
+}
+
+// A remainder is unknowable when unpriced usage exists — never render it as
+// $0. Each screen keeps its own "unknown" wording; the decision stays here.
+export function budgetRemainingHint(
+  b: Pick<Budget, "spend_complete" | "remaining_micro">,
+  unknownLabel: string
+): string {
+  if (b.spend_complete === false) return unknownLabel;
+  return `remaining ${formatMicro(Math.max(b.remaining_micro ?? 0, 0))}`;
 }
 
 export interface EvalSuite {
