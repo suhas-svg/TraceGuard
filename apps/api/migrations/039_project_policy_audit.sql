@@ -46,8 +46,17 @@ ALTER TABLE policy_versions ENABLE TRIGGER policy_versions_immutable;
 ALTER TABLE policy_versions ALTER COLUMN project_id SET NOT NULL;
 ALTER TABLE policy_versions
   DROP CONSTRAINT IF EXISTS policy_versions_workspace_id_version_key;
-ALTER TABLE policy_versions
-  ADD CONSTRAINT policy_versions_project_id_version_key UNIQUE (project_id, version);
+-- Re-runnable: the ledger skips applied files, but a pre-ledger database
+-- replays this file, and a bare ADD CONSTRAINT fails the whole script.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'policy_versions_project_id_version_key'
+  ) THEN
+    ALTER TABLE policy_versions
+      ADD CONSTRAINT policy_versions_project_id_version_key UNIQUE (project_id, version);
+  END IF;
+END $$;
 
 DROP INDEX IF EXISTS policy_versions_workspace_version_idx;
 CREATE INDEX IF NOT EXISTS policy_versions_project_version_idx
