@@ -165,15 +165,19 @@ The dashboard's Policy tab shows the active signed version and its history, and 
   effects, and a reporting `period` of `lifetime` (default), `day`, `week`,
   or `month`. Windowed spend is summed from the append-only ledger, so no
   counter is reset on a schedule and past windows stay explainable.
-- A **project** budget (`scope: "project"`, `ref_id` = a workspace id) caps
+- A **project** budget (`scope: "project"`, `ref_id` = a project id; a legacy
+  workspace id still resolves to that workspace's default project) caps
   what the whole project spends over its period. It is measured from the
   project's priced spans rather than from its own ledger, because a ledger
   only counts calls that checked that specific budget — measuring it would
-  report headroom that is not there and never block.
+  report headroom that is not there and never block. A span with usage but no
+  matching price has unknown cost, not zero: a block budget refuses with 409
+  `budget_unknown_usage`, and the list reports `spend_complete: false` with
+  `remaining_micro: null` instead of claiming headroom.
 - A hold that is abandoned (a caller that dies between reserve and settle)
-  is released by the next check against that budget, and the release is
-  audited. Without that the worst case stayed reserved forever and the
-  budget answered 409 with `spent_micro` at zero.
+  is settled at its reserved maximum by the next check against that budget,
+  and the settlement is audited. Unknown usage is charged conservatively
+  rather than returned to the budget.
 - `GET /v1/runs/:id/usage` breaks tokens and cost down per span against the
   price in force at the time. Cached input tokens bill once at the cached
   rate, never on top of the full input rate; spans with no matching price
@@ -181,6 +185,15 @@ The dashboard's Policy tab shows the active signed version and its history, and 
 - The managed path reserves before the call under a row lock, then settles
   to the measured cost. A blocked call gets 409 and the SDK raises
   `BudgetExceeded` instead of calling the provider.
+- Tool calls can hold budget too. With `TOOL_CALL_RESERVATION_MICRO` above
+  zero, the gateway reserves that amount against every covering run or agent
+  block budget before dispatch and releases it when the call finishes. The
+  hold is all-or-nothing across covering budgets and is audited as
+  `budget.reserved`; a crash leaves a held row that the expiry sweep settles
+  at the reserved maximum. `TOOL_CALL_RESERVATION_TTL_SECONDS` bounds the
+  hold (default 300). The default amount is 0 because tool calls do not
+  themselves spend provider money; enable it when a tool call needs to
+  consume budget headroom while it is in flight.
 - The Python SDK gained `BudgetGuard` plus `flush`, and now stamps Zulu
   timestamps the API accepts.
 - The trace header shows the estimated run cost from the usage endpoint.

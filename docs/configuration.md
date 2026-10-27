@@ -20,6 +20,8 @@ variable, which is how the compose file reads them.
 | AUDIT_CHECKPOINT_KEY_FILE | operator CLI | — | path to the ed25519 private key; used by `pnpm audit:checkpoint` on the operator host, never mounted in a container |
 | AUDIT_CHECKPOINT_PUBLIC_KEY_FILE | operator CLI | — | path to the public key for `audit:checkpoint prune` and `pnpm audit:verify` |
 | APPROVAL_EXECUTION_TIMEOUT_SECONDS | gateway | 300 | how long an EXECUTING row may stay unresolved before the sweep finalizes it as OUTCOME_UNKNOWN |
+| TOOL_CALL_RESERVATION_MICRO | gateway | 0 | micro-USD held against every covering run/agent block budget while a tool call is in flight; 0 disables the hold |
+| TOOL_CALL_RESERVATION_TTL_SECONDS | gateway | 300 | lifetime of a tool-call hold; an abandoned hold is settled at its reserved maximum by the expiry sweep |
 | APPROVAL_MAX_PENDING_PER_CALLER | gateway | 10 | spec hard maximum; set lower only |
 | APPROVAL_MAX_PENDING_PER_WORKSPACE | gateway | 100 | spec hard maximum; set lower only |
 | APPROVAL_RATE_PER_MINUTE | gateway | 5 | new approval requests per caller per minute; spec hard maximum, set lower only |
