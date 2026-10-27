@@ -21,6 +21,7 @@
     "audit:checkpoint": "tsx scripts/audit-checkpoint.mts",
     "deps:check": "node scripts/dependency-audit.mjs",
     "deps:sbom": "node scripts/dependency-audit.mjs --sbom sbom.cdx.json",
+    "deps:advisories": "node scripts/advisory-audit.mjs",
     "demo": "node scripts/demo.mjs",
     "demo:reset": "node scripts/demo.mjs reset",
     "demo:audit": "node scripts/demo.mjs audit"
