@@ -10,7 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@traceguard/audit-chain": "workspace:*",
     "@traceguard/canonical-json": "workspace:*",
     "@traceguard/policy-signing": "workspace:*",
