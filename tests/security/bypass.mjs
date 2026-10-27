@@ -4,7 +4,7 @@
 // boundary rather than a broken network. Runs against a live `docker compose
 // up`; see the `security` job in .github/workflows/ci.yml.
 //
-//   node tests/security/bypass.mjs            (or: npm run test:security)
+//   node tests/security/bypass.mjs            (or: pnpm test:security)
 
 import { execFileSync } from "node:child_process";
 

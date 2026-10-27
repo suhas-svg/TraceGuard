@@ -190,7 +190,7 @@ describe("signed policy enforcement", () => {
       "SELECT id FROM policy_signing_keys WHERE workspace_id = $1 AND retired_at IS NULL", [workspaceId]
     );
     const forged = {
-      bundle_version: 1, protocol_profile: PROTOCOL, workspace_id: workspaceId, version: 2,
+      bundle_version: 2, protocol_profile: PROTOCOL, workspace_id: workspaceId, version: 2,
       previous_version_hash: null, rules: [
         { id: "11111111-1111-1111-1111-111111111111", name: "forged-allow", enabled: true, priority: 0,
           agent_id: null, server_id: serverId, tool_name: "echo", effect: "allow", conditions: {} }

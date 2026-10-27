@@ -1,5 +1,5 @@
 # Build context hygiene. Without this, `COPY . .` style steps in the app images
-# copy the host workspace over the dependency tree npm just installed inside the
+# copy the host workspace over the dependency tree pnpm just installed inside the
 # image, so a stale or wrong-platform node_modules silently wins.
 node_modules
 **/node_modules

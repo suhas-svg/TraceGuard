@@ -124,6 +124,29 @@ describe("tool definition pins", () => {
     return res.rows[0];
   }
 
+  async function latestPin() {
+    const res = await pool.query(
+      `SELECT * FROM tool_pins WHERE server_id = $1 AND tool_name = 'echo'
+        ORDER BY version DESC LIMIT 1`,
+      [serverId]
+    );
+    return res.rows[0];
+  }
+
+  async function submitAndApprove(pinId: string): Promise<void> {
+    const review = await api.inject({
+      method: "POST", url: `/v1/tool-pins/${pinId}/submit-review`, headers: key
+    });
+    expect(review.statusCode).toBe(200);
+    expect(review.json().status).toBe("pending_review");
+
+    const approved = await api.inject({
+      method: "POST", url: `/v1/tool-pin-candidates/${pinId}/approve-for-publication`, headers: key
+    });
+    expect(approved.statusCode).toBe(200);
+    expect(approved.json().status).toBe("approved");
+  }
+
   it("pins every declared field and serves the reviewed definition to clients", async () => {
     const row = await toolRow();
     expect(row.definition_version).toBe(1);
@@ -145,7 +168,7 @@ describe("tool definition pins", () => {
     expect(tool?.title).toBe("Echo");
   });
 
-  it("quarantines any covered field change and keeps the previous pin for the diff", async () => {
+  it("quarantines any covered field change and creates an immutable candidate", async () => {
     await startMock([echo({
       title: "Echo v2",
       // Previously absent fields and a changed _meta: all covered by the pin.
@@ -162,13 +185,33 @@ describe("tool definition pins", () => {
     const row = await toolRow();
     expect(row.quarantined).toBe(true);
     expect(row.quarantine_reason).toBe("definition changed");
-    expect(row.definition_version).toBe(2);
-    expect(row.previous_hash).toBe(firstHash);
-    expect(row.definition_hash).not.toBe(firstHash);
-    expect(row.previous_definition.title).toBe("Echo");
-    expect(row.previous_definition.outputSchema).toBeUndefined();
-    expect(row.definition.title).toBe("Echo v2");
-    expect(row.definition.icons).toEqual([{ src: "https://example.com/i.png" }]);
+    // The reviewed active pin is untouched: the drift is a candidate until a
+    // reviewer approves it and the publisher activates a new signed bundle.
+    expect(row.definition_version).toBe(1);
+    expect(row.definition_hash).toBe(firstHash);
+    expect(row.definition.title).toBe("Echo");
+    expect(row.active_pin_id).toBeTruthy();
+    expect(row.candidate_pin_id).toBeTruthy();
+
+    const candidate = await latestPin();
+    expect(candidate.id).toBe(row.candidate_pin_id);
+    expect(candidate.version).toBe(2);
+    expect(candidate.status).toBe("candidate");
+    expect(candidate.quarantine_reason).toBe("definition changed");
+    expect(candidate.definition.title).toBe("Echo v2");
+    expect(candidate.definition.icons).toEqual([{ src: "https://example.com/i.png" }]);
+    expect(candidate.definition_hash).not.toBe(firstHash);
+
+    // Refreshing while the upstream still serves the same changed definition
+    // keeps the existing candidate and its review state intact.
+    const refreshed = await api.inject({
+      method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key
+    });
+    expect(refreshed.statusCode).toBe(200);
+    const afterRefresh = await latestPin();
+    expect(afterRefresh.id).toBe(candidate.id);
+    expect(afterRefresh.status).toBe("candidate");
+    expect((await toolRow()).candidate_pin_id).toBe(candidate.id);
 
     // Not listed, and a call is blocked before any upstream contact.
     const listed = await rpc("tools/list", {});
@@ -190,49 +233,93 @@ describe("tool definition pins", () => {
       [`${serverId}/echo`]
     );
     expect(audited.rows[0]?.metadata).toMatchObject({
-      previous_hash: firstHash, definition_hash: row.definition_hash
+      previous_hash: firstHash, definition_hash: candidate.definition_hash,
+      active_pin_id: row.active_pin_id, candidate_pin_id: candidate.id
     });
   });
 
-  it("re-review clears the quarantine and keeps the new pin version", async () => {
-    const review = await api.inject({
+  it("activates a reviewed candidate only through signed publication", async () => {
+    const candidate = await latestPin();
+    expect(candidate.status).toBe("candidate");
+
+    // Clearing quarantine directly is not review and must not make the
+    // candidate callable.
+    const shortcut = await api.inject({
       method: "PUT", url: `/v1/servers/${serverId}/tools/echo/quarantine`, headers: key,
       payload: { quarantined: false }
     });
-    expect(review.statusCode).toBe(200);
+    expect(shortcut.statusCode).toBe(409);
+    expect(shortcut.json().error).toBe("review_required");
+
+    await submitAndApprove(candidate.id);
+    const refreshed = await api.inject({
+      method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key
+    });
+    expect(refreshed.statusCode).toBe(200);
+    expect((await latestPin()).status).toBe("approved");
+    const beforePublish = await toolRow();
+    expect(beforePublish.quarantined).toBe(true);
+    expect(beforePublish.definition_version).toBe(1);
+
+    await publishTestPolicy(pool);
     const row = await toolRow();
     expect(row.quarantined).toBe(false);
     expect(row.quarantine_reason).toBeNull();
     expect(row.definition_version).toBe(2);
+    expect(row.definition_hash).toBe(candidate.definition_hash);
+    expect(row.definition.title).toBe("Echo v2");
+    expect(row.active_pin_id).toBe(candidate.id);
+    expect(row.candidate_pin_id).toBeNull();
+
     const audited = await pool.query(
-      "SELECT action FROM audit_events WHERE action = 'tool.reapprove' AND resource_id = $1",
-      [`${serverId}/echo`]
+      `SELECT action FROM audit_events
+        WHERE action IN ('tool_pin.submitted', 'tool.reapproved')
+          AND resource_id = $1`,
+      [candidate.id]
     );
-    expect(audited.rows.length).toBeGreaterThan(0);
+    expect(audited.rows.map((r) => r.action).sort())
+      .toEqual(["tool.reapproved", "tool_pin.submitted"]);
   });
 
-  it("keeps the first approved pin across a second drift before review", async () => {
-    // Drift once: the approved baseline moves to the v2 definition.
+  it("keeps the active pin across repeated drift until the newest candidate is published", async () => {
+    // Drift once: v3 is a candidate; the active v2 pin remains in force.
     await startMock([echo({ title: "Echo v3" })]);
     await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     const afterFirst = await toolRow();
     expect(afterFirst.quarantined).toBe(true);
-    const approvedHash = afterFirst.previous_hash as string;
+    expect(afterFirst.definition_version).toBe(2);
+    const activeHash = afterFirst.definition_hash as string;
+    const firstCandidate = await latestPin();
+    expect(firstCandidate.version).toBe(3);
+    expect(firstCandidate.status).toBe("candidate");
 
-    // Drift again while still quarantined: §7.5 re-approval is against the
-    // reviewed baseline, so the second mistake must not overwrite it.
+    // Drift again while still quarantined: the first candidate is superseded
+    // and the active reviewed baseline is still untouched.
     await startMock([echo({ title: "Echo v4" })]);
     await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     const afterSecond = await toolRow();
     expect(afterSecond.quarantined).toBe(true);
-    expect(afterSecond.previous_hash).toBe(approvedHash);
-    expect(afterSecond.definition_hash).not.toBe(approvedHash);
+    expect(afterSecond.definition_version).toBe(2);
+    expect(afterSecond.definition_hash).toBe(activeHash);
+    const secondCandidate = await latestPin();
+    expect(secondCandidate.version).toBe(4);
+    expect(secondCandidate.status).toBe("candidate");
 
-    const cleared = await api.inject({
-      method: "PUT", url: `/v1/servers/${serverId}/tools/echo/quarantine`, headers: key,
-      payload: { quarantined: false }
+    const stale = await pool.query("SELECT status FROM tool_pins WHERE id = $1", [firstCandidate.id]);
+    expect(stale.rows[0].status).toBe("superseded");
+    const staleApproval = await api.inject({
+      method: "POST", url: `/v1/tool-pin-candidates/${firstCandidate.id}/approve-for-publication`,
+      headers: key
     });
-    expect(cleared.statusCode).toBe(200);
+    expect(staleApproval.statusCode).toBe(409);
+
+    await submitAndApprove(secondCandidate.id);
+    await publishTestPolicy(pool);
+    const row = await toolRow();
+    expect(row.quarantined).toBe(false);
+    expect(row.definition_version).toBe(4);
+    expect(row.definition_hash).toBe(secondCandidate.definition_hash);
+    expect(row.active_pin_id).toBe(secondCandidate.id);
   });
 
   it("never pins a definition with an external $ref, and quarantines a trusted pin that gains one", async () => {
@@ -245,7 +332,7 @@ describe("tool definition pins", () => {
       }
     ]);
     const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
-    expect(disc.statusCode).toBe(200);
+    expect(disc.statusCode, disc.body).toBe(200);
     const rejected = disc.json().rejected as { name: string; reason: string }[];
     expect(rejected.map((r) => r.name).sort()).toEqual(["echo", "fresh"]);
     expect(rejected.find((r) => r.name === "echo")?.reason).toContain("external $ref");

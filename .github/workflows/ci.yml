@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  # `packageManager` in package.json pins pnpm; corepack may fetch it on a cold
+  # runner. Never block CI on an interactive download prompt.
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -14,9 +19,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci --ignore-scripts
-      - run: npx eslint .
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm exec eslint .
 
   # NFR-006: a floor against committed credentials. Runs on the tracked tree
   # only, needs no network or extra action, and fails the PR on a finding.
@@ -57,33 +62,33 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci --ignore-scripts
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       # §20: dependency and license review over the pinned lockfile, plus a
       # production advisory gate. The SBOM is uploaded for release evidence.
       - name: Dependency and license review
         run: node scripts/dependency-audit.mjs --sbom sbom.cdx.json
       - name: Production dependency audit
-        run: npm audit --omit=dev --audit-level=high
-      - run: ./node_modules/.bin/tsc -p packages/schemas/tsconfig.json
-      - run: ./node_modules/.bin/tsc -p packages/canonical-json/tsconfig.json
-      - run: ./node_modules/.bin/tsc -p packages/policy-signing/tsconfig.json
-      - run: ./node_modules/.bin/tsc -p packages/audit-chain/tsconfig.json
-      - run: ./node_modules/.bin/tsc -p packages/mcp-client-shim/tsconfig.json
-      - run: ./node_modules/.bin/tsc -p tools/policy-publisher/tsconfig.json
-      - run: ./node_modules/.bin/tsc -p apps/api/tsconfig.json
-      - run: ./node_modules/.bin/tsc -p apps/web/tsconfig.json
-      - run: ./node_modules/.bin/tsc -p sdks/typescript/tsconfig.json
-      - run: ./node_modules/.bin/tsc -p examples/demo-agent-ts/tsconfig.json
+        run: node scripts/advisory-audit.mjs
+      - run: pnpm --filter @traceguard/schemas build
+      - run: pnpm --filter @traceguard/canonical-json build
+      - run: pnpm --filter @traceguard/policy-signing build
+      - run: pnpm --filter @traceguard/audit-chain build
+      - run: pnpm --filter @traceguard/mcp-client-shim build
+      - run: pnpm --filter @traceguard/policy-publisher build
+      - run: pnpm --filter @traceguard/api build
+      - run: pnpm --filter @traceguard/web build
+      - run: pnpm --filter @traceguard/sdk build
+      - run: pnpm --filter demo-agent-ts build
       - run: for f in apps/api/migrations/*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
-      - run: ./node_modules/.bin/vitest run --root apps/api
-      - run: ./node_modules/.bin/vitest run --root apps/web
-      - run: ./node_modules/.bin/vitest run --root packages/canonical-json
-      - run: ./node_modules/.bin/vitest run --root packages/policy-signing
-      - run: ./node_modules/.bin/vitest run --root packages/audit-chain
-      - run: ./node_modules/.bin/vitest run --root packages/mcp-client-shim
-      - run: ./node_modules/.bin/vitest run --root tools/policy-publisher
-      - run: ./node_modules/.bin/vitest run --root sdks/typescript
+      - run: pnpm exec vitest run --root apps/api
+      - run: pnpm exec vitest run --root apps/web
+      - run: pnpm exec vitest run --root packages/canonical-json
+      - run: pnpm exec vitest run --root packages/policy-signing
+      - run: pnpm exec vitest run --root packages/audit-chain
+      - run: pnpm exec vitest run --root packages/mcp-client-shim
+      - run: pnpm exec vitest run --root tools/policy-publisher
+      - run: pnpm exec vitest run --root sdks/typescript
       - name: Fault injection (database outage must fail closed)
         run: node tests/faults/run.mjs
       - name: OAuth clean-clone run
@@ -143,17 +148,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci --ignore-scripts
-      - run: npx playwright install --with-deps chromium
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm exec playwright install --with-deps chromium
       # apps/api imports these workspaces, so their dist/ must exist before
       # the api build - the e2e job does not inherit build-and-test's output.
-      - run: ./node_modules/.bin/tsc -p packages/schemas/tsconfig.json
-      - run: ./node_modules/.bin/tsc -p packages/canonical-json/tsconfig.json
-      - run: ./node_modules/.bin/tsc -p packages/policy-signing/tsconfig.json
-      - run: ./node_modules/.bin/tsc -p packages/audit-chain/tsconfig.json
-      - run: npm run build -w apps/api -w apps/web
-      - run: npx playwright test --config tests/e2e/playwright.config.ts
+      - run: pnpm --filter @traceguard/api... build
+      - run: pnpm --filter @traceguard/web build
+      - run: pnpm exec playwright test --config tests/e2e/playwright.config.ts
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -171,13 +173,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci --ignore-scripts
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Bring up the boundary
         run: |
           printf 'APPROVAL_ARGS_KEY=%s\n' "$(openssl rand -hex 32)" > .env
           docker compose up -d --build --wait gateway mock-tools agent api
-      - run: npm run test:security
+      - run: pnpm run test:security
       - name: Tear down
         if: always()
         run: docker compose down -v

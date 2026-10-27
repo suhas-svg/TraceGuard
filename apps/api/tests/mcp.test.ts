@@ -32,6 +32,7 @@ describe("MCP streamable HTTP gateway", () => {
   let serverId = "";
   let alias = "";
   let httpServer: ReturnType<typeof createServer>;
+  let upstreamPort = 0;
 
   // A fresh server per request: one Protocol instance cannot be connected to
 
@@ -71,6 +72,7 @@ describe("MCP streamable HTTP gateway", () => {
     });
     await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
     const port = (httpServer.address() as { port: number }).port;
+    upstreamPort = port;
 
     const reg = await api.inject({
       method: "POST", url: "/v1/servers", headers: key,
@@ -147,6 +149,31 @@ describe("MCP streamable HTTP gateway", () => {
     expect(body.result.ttlMs).toBeGreaterThan(0);
     expect(body.result.cacheScope).toBe("workspace");
     expect(body.result.resultType).toBe("complete");
+  });
+
+  it("hides tools from a server the active signed bundle has not stamped", async () => {
+    const reg = await api.inject({
+      method: "POST", url: "/v1/servers", headers: key,
+      payload: {
+        name: `unsigned-${tag}`,
+        gateway_alias: `unsigned_${tag}`,
+        base_url: `http://127.0.0.1:${upstreamPort}/mcp`
+      }
+    });
+    expect(reg.statusCode).toBe(201);
+    expect(reg.json().signed_bundle_version ?? null).toBeNull();
+    const disc = await api.inject({
+      method: "POST", url: `/v1/servers/${reg.json().id}/discover`, headers: key
+    });
+    expect(disc.statusCode).toBe(200);
+
+    // Discovery created pins for the draft, but the draft is not part of the
+    // active signed bundle, so its tools must not be advertised.
+    const res = await rpc("tools/list", { _meta: meta() });
+    expect(res.statusCode).toBe(200);
+    const names = (res.json() as JsonBody).result.tools.map((t: { name: string }) => t.name);
+    expect(names).toContain(`${alias}__echo`);
+    expect(names).not.toContain(`unsigned_${tag}__echo`);
   });
 
   it("rejects a header that disagrees with the JSON-RPC body", async () => {
@@ -407,6 +434,42 @@ describe("MCP streamable HTTP gateway", () => {
       expect((audited.rows as Array<{ metadata: { reason: string } }>).map((r) => r.metadata.reason).sort())
         .toEqual(shapes.map((s) => s.reason).sort());
     });
+  });
+
+  it("does not dispatch an allow when the decision cannot be persisted", async () => {
+    // Section 15: the decision and audit evidence must be durable before the
+    // upstream side effect. Break the decision write and prove the tool body
+    // still never ran. Without the pre-dispatch ordering the upstream would
+    // answer and only then would the gateway fail.
+    const before = hits.echo;
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION test_fail_allow_decision() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.tool_name = 'echo' AND NEW.decision = 'allow' THEN
+          RAISE EXCEPTION 'injected policy decision outage';
+        END IF;
+        RETURN NEW;
+      END;
+      $$`);
+    await pool.query(
+      "CREATE TRIGGER test_fail_allow_decision BEFORE INSERT ON policy_decisions " +
+      "FOR EACH ROW EXECUTE FUNCTION test_fail_allow_decision()"
+    );
+    try {
+      const name = `${alias}__echo`;
+      const res = await rpc("tools/call",
+        { name, arguments: { text: "must-not-run" }, _meta: meta(`fault-${tag}`) },
+        { name });
+      // MCP carries application failures as a JSON-RPC error on an HTTP 200.
+      const body = res.json() as JsonBody;
+      expect(body.error.code).toBe(-32603);
+      expect(body.error.data.error).toBe("UPSTREAM_FAILED");
+      expect(hits.echo).toBe(before);
+    } finally {
+      await pool.query("DROP TRIGGER IF EXISTS test_fail_allow_decision ON policy_decisions");
+      await pool.query("DROP FUNCTION IF EXISTS test_fail_allow_decision()");
+    }
   });
 
   it("serves MCP only over HTTP and refuses a stdio-shaped upstream", async () => {

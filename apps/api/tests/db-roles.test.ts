@@ -138,14 +138,67 @@ describe("least-privilege database roles", () => {
     });
   });
 
-  it("api_runtime keeps reads and its draft/operational writes", async () => {
+  it("api_runtime keeps reads and draft writes but trusted state is procedure-only", async () => {
     await asRole("api_runtime", async (c) => {
       expect(await attempt(c, () => c.query("SELECT count(*) FROM policy_versions"))).toBe("ok");
       expect(await attempt(c, () => c.query("SELECT count(*) FROM approvals"))).toBe("ok");
       expect(await attempt(c, () => c.query("UPDATE policies SET name = name WHERE false"))).toBe("ok");
       expect(await attempt(c, () => c.query("UPDATE mcp_servers SET name = name WHERE false"))).toBe("ok");
-      expect(await attempt(c, () => c.query("UPDATE server_tools SET quarantined = quarantined WHERE false"))).toBe("ok");
+      expect(await attempt(c, () => c.query("UPDATE server_tools SET quarantined = quarantined WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("UPDATE tool_pins SET status = status WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("DELETE FROM spans WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("DELETE FROM runs WHERE false"))).toBe(DENIED);
     });
+  });
+
+  it("stamped server configuration is immutable to the API but can still be disabled", async () => {
+    const ws = await pool.query<{ id: string }>(
+      "INSERT INTO workspaces (name) VALUES ('signed-config-probe') RETURNING id"
+    );
+    const project = await pool.query<{ id: string }>(
+      "INSERT INTO projects (workspace_id, name) VALUES ($1, 'probe') RETURNING id",
+      [ws.rows[0].id]
+    );
+    const server = await pool.query<{ id: string }>(
+      `INSERT INTO mcp_servers
+         (workspace_id, project_id, name, base_url, gateway_alias, secret_ref, signed_bundle_version)
+       VALUES ($1, $2, 'signed-probe', 'https://upstream.invalid/mcp', 'signed-probe',
+               'env:TEST_UPSTREAM_TOKEN', 1)
+       RETURNING id`,
+      [ws.rows[0].id, project.rows[0].id]
+    );
+    const id = server.rows[0].id;
+
+    await asRole("api_runtime", async (c) => {
+      // The signed fields are frozen once the publisher stamps the row.
+      expect(await attempt(c, () => c.query(
+        "UPDATE mcp_servers SET base_url = 'https://evil.invalid/mcp' WHERE id = $1", [id]
+      ))).toBe("P0001");
+      expect(await attempt(c, () => c.query(
+        "UPDATE mcp_servers SET gateway_alias = 'evil' WHERE id = $1", [id]
+      ))).toBe("P0001");
+      expect(await attempt(c, () => c.query(
+        "UPDATE mcp_servers SET secret_ref = 'env:OTHER_TOKEN' WHERE id = $1", [id]
+      ))).toBe("P0001");
+      expect(await attempt(c, () => c.query(
+        "UPDATE mcp_servers SET signed_bundle_version = 2 WHERE id = $1", [id]
+      ))).toBe("P0001");
+      // Disabling is the one operational mutation the API may still perform.
+      await c.query("UPDATE mcp_servers SET disabled_at = now() WHERE id = $1", [id]);
+      expect(await attempt(c, () => c.query(
+        "UPDATE mcp_servers SET disabled_at = NULL WHERE id = $1", [id]
+      ))).toBe("P0001");
+      // Only the publisher's SECURITY DEFINER procedure may stamp versions.
+      expect(await attempt(c, () => c.query(
+        "SELECT stamp_signed_servers($1, 1)", [project.rows[0].id]
+      ))).toBe(DENIED);
+    });
+
+    const fn = await pool.query<{ owner: string; secdef: boolean }>(
+      `SELECT pg_get_userbyid(proowner) AS owner, prosecdef AS secdef
+         FROM pg_proc WHERE proname = 'stamp_signed_servers'`
+    );
+    expect(fn.rows[0]).toMatchObject({ owner: "policy_owner", secdef: true });
   });
 
   it("gateway_runtime cannot publish or alter trusted configuration", async () => {

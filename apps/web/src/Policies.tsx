@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  adminApi, createBudget, formatMicro, gwApi, listBudgets, updateBudget,
+  adminApi, budgetRemainingHint, createBudget, formatMicro, gwApi, listBudgets, updateBudget,
   type Budget, type McpServer, type Policy
 } from "./api";
 import {
@@ -119,7 +119,7 @@ const effectTone: Record<string, "ok" | "bad" | "warn"> = {
 };
 
 function ServerForm({ onDone, onError }: { onDone: () => void; onError: (m: string) => void }) {
-  const [form, setForm] = useState({ name: "", base_url: "", auth_secret: "" });
+  const [form, setForm] = useState({ name: "", base_url: "", secret_ref: "" });
   return (
     <Card className="mb-4 max-w-3xl p-4">
       <form
@@ -129,7 +129,7 @@ function ServerForm({ onDone, onError }: { onDone: () => void; onError: (m: stri
           adminApi.createServer({
             name: form.name,
             base_url: form.base_url,
-            ...(form.auth_secret ? { auth_secret: form.auth_secret } : {})
+            ...(form.secret_ref ? { secret_ref: form.secret_ref } : {})
           })
             .then(onDone)
             .catch((err) => onError(err instanceof Error ? err.message : "register failed"));
@@ -143,9 +143,10 @@ function ServerForm({ onDone, onError }: { onDone: () => void; onError: (m: stri
           <Input aria-label="Server base url" className="w-72" placeholder="http://host:8092/mcp"
             value={form.base_url} onChange={(e) => setForm((f) => ({ ...f, base_url: e.target.value }))} required />
         </Field>
-        <Field label="Auth secret (optional)">
-          <Input aria-label="Server auth secret" className="w-44" value={form.auth_secret}
-            onChange={(e) => setForm((f) => ({ ...f, auth_secret: e.target.value }))} />
+        <Field label="Secret ref (optional)">
+          <Input aria-label="Server secret reference" className="w-56" placeholder="env:UPSTREAM_TOKEN"
+            value={form.secret_ref}
+            onChange={(e) => setForm((f) => ({ ...f, secret_ref: e.target.value }))} />
         </Field>
         <Button variant="primary" type="submit">Register server</Button>
       </form>
@@ -161,6 +162,11 @@ type ServerToolRow = {
   previous_definition?: Record<string, unknown> | null;
   definition_hash?: string | null;
   previous_hash?: string | null;
+  active_pin_id?: string | null;
+  active_pin_version?: number | null;
+  candidate_pin_id?: string | null;
+  candidate_pin_version?: number | null;
+  candidate_status?: "candidate" | "pending_review" | "approved" | "superseded" | null;
 };
 
 // FR-017: a quarantined tool shows its reviewer what changed — the previous
@@ -190,20 +196,61 @@ function ServerTools({ server, onError }: { server: McpServer; onError: (m: stri
             <li key={t.tool_name} className="flex flex-wrap items-center gap-2">
               <span className="font-mono text-ink-800">{t.tool_name}</span>
               <Badge tone={t.quarantined ? "bad" : "ok"}>{t.quarantined ? "quarantined" : "active"}</Badge>
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={busy === t.tool_name}
-                onClick={() => {
-                  setBusy(t.tool_name);
-                  adminApi.quarantine(server.id, t.tool_name, !t.quarantined)
-                    .then(refresh)
-                    .catch((e) => onError(e instanceof Error ? e.message : "quarantine failed"))
-                    .finally(() => setBusy(""));
-                }}
-              >
-                {t.quarantined ? "Re-approve" : "Quarantine"}
-              </Button>
+              {t.quarantined ? (
+                t.candidate_status === "approved" ? (
+                  <span className="text-[11px] text-ink-500">Awaiting signed publish</span>
+                ) : t.candidate_pin_id ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={busy === t.tool_name}
+                    onClick={() => {
+                      setBusy(t.tool_name);
+                      const action = t.candidate_status === "pending_review"
+                        ? adminApi.approvePin(t.candidate_pin_id!)
+                        : adminApi.submitPinReview(t.candidate_pin_id!);
+                      action
+                        .then(refresh)
+                        .catch((e) => onError(e instanceof Error ? e.message : "review failed"))
+                        .finally(() => setBusy(""));
+                    }}
+                  >
+                    {t.candidate_status === "pending_review"
+                      ? "Approve for publication"
+                      : "Submit for review"}
+                  </Button>
+                ) : t.active_pin_id ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={busy === t.tool_name}
+                    onClick={() => {
+                      setBusy(t.tool_name);
+                      adminApi.submitPinReview(t.active_pin_id!)
+                        .then(refresh)
+                        .catch((e) => onError(e instanceof Error ? e.message : "review failed"))
+                        .finally(() => setBusy(""));
+                    }}
+                  >
+                    Request re-review
+                  </Button>
+                ) : null
+              ) : (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={busy === t.tool_name}
+                  onClick={() => {
+                    setBusy(t.tool_name);
+                    adminApi.quarantine(server.id, t.tool_name, true)
+                      .then(refresh)
+                      .catch((e) => onError(e instanceof Error ? e.message : "quarantine failed"))
+                      .finally(() => setBusy(""));
+                  }}
+                >
+                  Quarantine
+                </Button>
+              )}
               {t.quarantined && t.previous_definition && t.definition && (
                 <div className="w-full text-[11px] text-ink-500">
                   <span className="font-mono">{shortHash(t.previous_hash)}</span> →{" "}
@@ -260,7 +307,7 @@ function BudgetRow({ budget, onChanged, onError }: {
         {budget.ref_id.slice(0, 13)}…
       </span>
       <span className="tg-nums text-xs text-ink-500">
-        {formatMicro(used)} / {formatMicro(budget.limit_micro)} · remaining {formatMicro(budget.remaining_micro)}
+        {formatMicro(used)} / {formatMicro(budget.limit_micro)} · {budgetRemainingHint(budget, "remaining unknown (unpriced usage)")}
       </span>
       <span className="ml-auto flex items-center gap-2">
         <Input aria-label={`Limit for ${budget.id}`} className="w-24" value={limit}

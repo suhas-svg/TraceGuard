@@ -19,6 +19,26 @@ let projectId = "";
 let serverId = "";
 const publisherKey = generateSigningKey();
 
+async function insertPin(
+  serverIdValue: string,
+  definition: Record<string, unknown>,
+  definitionHash: string,
+  status: "active" | "approved"
+): Promise<{ id: string; version: number }> {
+  const next = await pool.query(
+    `SELECT COALESCE(MAX(version), 0) + 1 AS version
+       FROM tool_pins WHERE server_id = $1 AND tool_name = 'read_file'`,
+    [serverIdValue]
+  );
+  const version = Number(next.rows[0].version);
+  const inserted = await pool.query(
+    `INSERT INTO tool_pins (server_id, tool_name, version, definition, definition_hash, status, reviewed_at, reviewed_by)
+     VALUES ($1, 'read_file', $2, $3::jsonb, $4, $5, now(), 'test') RETURNING id`,
+    [serverIdValue, version, JSON.stringify(definition), definitionHash, status]
+  );
+  return { id: String(inserted.rows[0].id), version };
+}
+
 beforeAll(async () => {
   const { rows } = await pool.query<{ tablename: string }>(
     "select tablename from pg_tables where schemaname = 'public'"
@@ -91,8 +111,8 @@ describe("policy publisher", () => {
 
   it("publishes drafts as an immutable version and advances the active pointer", async () => {
     const srv = await pool.query(
-      `INSERT INTO mcp_servers (workspace_id, name, gateway_alias, base_url, auth_secret)
-       VALUES ($1,'files','files','http://127.0.0.1:9/mcp','secret') RETURNING id`,
+      `INSERT INTO mcp_servers (workspace_id, name, gateway_alias, base_url, secret_ref)
+       VALUES ($1,'files','files','http://127.0.0.1:9/mcp','env:TEST_UPSTREAM_TOKEN') RETURNING id`,
       [workspaceId]
     );
     serverId = String(srv.rows[0].id);
@@ -101,6 +121,12 @@ describe("policy publisher", () => {
       `INSERT INTO server_tools (server_id, tool_name, description, input_schema, definition, definition_hash)
        VALUES ($1,'read_file','read a file','{}'::jsonb,'{}'::jsonb,$2)`,
       [serverId, hash]
+    );
+    const activePin = await insertPin(serverId, {}, hash, "active");
+    await pool.query(
+      `UPDATE server_tools SET active_pin_id = $2
+        WHERE server_id = $1 AND tool_name = 'read_file'`,
+      [serverId, activePin.id]
     );
     await pool.query(
       `INSERT INTO policies (workspace_id, name, server_id, tool_name, effect)
@@ -114,10 +140,20 @@ describe("policy publisher", () => {
     expect(first.published).toBe(true);
     expect(first.version).toBe(1);
     expect(first.bundle.rules).toHaveLength(1);
-    expect(first.bundle.servers).toEqual([
-      { server_id: serverId, alias: "files", base_url: "http://127.0.0.1:9/mcp", auth_mode: "gateway_secret" }
-    ]);
-    expect(first.bundle.pins).toEqual([{ server_id: serverId, tool_name: "read_file", definition_hash: hash }]);
+    expect(first.bundle.servers).toEqual([{
+      server_id: serverId,
+      alias: "files",
+      base_url: "http://127.0.0.1:9/mcp",
+      secret_ref: "env:TEST_UPSTREAM_TOKEN",
+      auth_mode: "gateway_secret"
+    }]);
+    expect(first.bundle.pins).toEqual([{
+      server_id: serverId,
+      tool_name: "read_file",
+      pin_id: expect.any(String),
+      pin_version: 1,
+      definition_hash: hash
+    }]);
     expect(first.bundle.previous_version_hash).toBeNull();
     expect(first.projectId).toBe(projectId);
     expect(first.bundle.project_id).toBe(projectId);
@@ -130,6 +166,11 @@ describe("policy publisher", () => {
     expect(Number(active.rows[0].version)).toBe(1);
     expect(active.rows[0].content_hash).toBe(first.contentHash);
     expect(active.rows[0].published_by).toBe("operator");
+    const stamped = await pool.query(
+      "SELECT signed_bundle_version FROM mcp_servers WHERE id = $1",
+      [serverId]
+    );
+    expect(Number(stamped.rows[0].signed_bundle_version)).toBe(1);
 
     // A second publish after a draft change is a new edition that cites the
     // first one's hash: editing history is impossible, chaining is explicit.
@@ -149,7 +190,7 @@ describe("policy publisher", () => {
     );
     expect(audited.rows).toHaveLength(2);
     expect(audited.rows[1].metadata).toMatchObject({
-      version: 2, content_hash: second.contentHash, pins: 1, servers: 1, rules: 2
+      version: 2, content_hash: second.contentHash, pins: 1, servers: 1, servers_signed: 1, rules: 2
     });
     expect(audited.rows[0].metadata.pins).toBe(1);
   });
@@ -230,11 +271,20 @@ describe("policy publisher", () => {
     await pool.query("DELETE FROM policies WHERE name = 'path-no-meta'");
 
     // Attested executor, but the constraint sits outside the attested root.
+    // The active pin is immutable, so a re-approved definition is a new pin
+    // version selected through candidate_pin_id.
+    const attestedDefinition = {
+      _meta: { "io.traceguard/path-confinement": { root: "/data", enforcement: "executor" } }
+    };
+    const attestedHash = "b".repeat(64);
     await pool.query(
-      "UPDATE server_tools SET definition = $2::jsonb WHERE server_id = $1 AND tool_name = 'read_file'",
-      [serverId, JSON.stringify({
-        _meta: { "io.traceguard/path-confinement": { root: "/data", enforcement: "executor" } }
-      })]
+      "UPDATE server_tools SET definition = $2::jsonb, definition_hash = $3 WHERE server_id = $1 AND tool_name = 'read_file'",
+      [serverId, JSON.stringify(attestedDefinition), attestedHash]
+    );
+    const attestedPin = await insertPin(serverId, attestedDefinition, attestedHash, "approved");
+    await pool.query(
+      "UPDATE server_tools SET candidate_pin_id = $2 WHERE server_id = $1 AND tool_name = 'read_file'",
+      [serverId, attestedPin.id]
     );
     await insertRule("path-outside", "/etc");
     await expect(publish(pool, { workspaceId, privateKeyPem: publisherKey.privateKeyPem }))

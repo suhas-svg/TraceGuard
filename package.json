@@ -3,21 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "license": "Apache-2.0",
-  "workspaces": [
-    "apps/api",
-    "apps/web",
-    "examples/demo-agent-ts",
-    "packages/audit-chain",
-    "packages/canonical-json",
-    "packages/mcp-client-shim",
-    "packages/policy-signing",
-    "packages/schemas",
-    "sdks/typescript",
-    "tools/policy-publisher"
-  ],
+  "packageManager": "pnpm@9.15.4",
   "scripts": {
-    "build": "npm run build --workspaces",
-    "test": "npm run test --workspaces --if-present",
+    "build": "pnpm -r build",
+    "test": "pnpm -r --if-present test",
     "test:e2e": "playwright test --config tests/e2e/playwright.config.ts",
     "test:security": "node tests/security/bypass.mjs",
     "test:faults": "node tests/faults/run.mjs",
@@ -32,6 +21,7 @@
     "audit:checkpoint": "tsx scripts/audit-checkpoint.mts",
     "deps:check": "node scripts/dependency-audit.mjs",
     "deps:sbom": "node scripts/dependency-audit.mjs --sbom sbom.cdx.json",
+    "deps:advisories": "node scripts/advisory-audit.mjs",
     "demo": "node scripts/demo.mjs",
     "demo:reset": "node scripts/demo.mjs reset",
     "demo:audit": "node scripts/demo.mjs audit"
@@ -42,6 +32,7 @@
     "eslint": "^9.39.5",
     "globals": "^17.13.0",
     "tsx": "^4.16.0",
-    "typescript-eslint": "^8.71.2"
+    "typescript-eslint": "^8.71.2",
+    "yaml": "^2.8.1"
   }
 }

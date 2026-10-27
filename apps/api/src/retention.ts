@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Pool, PoolClient } from "pg";
 import { pool, retentionPool } from "./db.js";
 import { audit } from "./audit.js";
+import { scopeClause, workspaceAllowed } from "./auth.js";
 
 // Retention deletes execution and operational data past its age. It never
 // touches policies, decisions, approvals, the audit log, or money.
@@ -105,15 +106,29 @@ export function registerRetentionRoutes(app: FastifyInstance) {
     target: z.enum(targets),
     older_than_days: z.number().int().min(1).max(3650),
     max_rows: z.number().int().min(1).max(1_000_000_000).nullable().optional(),
-    enabled: z.boolean().default(true)
+    enabled: z.boolean().default(true),
+    workspace_id: z.string().uuid().optional()
   });
 
+  // Retention rules delete whole traces and are workspace-scoped. A
+  // project-restricted principal cannot safely choose a workspace-wide rule,
+  // so keep this surface to principals that can see every project in the
+  // workspaces they administer.
+  const projectScopeRequired = (req: { principal?: { projects: "all" | string[] } }) =>
+    !req.principal || req.principal.projects !== "all";
+
   app.post("/v1/retention/rules", async (req, reply) => {
+    if (projectScopeRequired(req)) {
+      return reply.code(403).send({ error: "retention_requires_workspace_scope" });
+    }
     const parsed = ruleSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_rule" });
     const client = await pool.connect();
     try {
-      const workspaceId = await defaultWorkspaceId(client);
+      const workspaceId = parsed.data.workspace_id ?? await defaultWorkspaceId(client);
+      if (!workspaceAllowed(req.principal, workspaceId)) {
+        return reply.code(403).send({ error: "workspace_forbidden" });
+      }
       const r = parsed.data;
       try {
         const res = await client.query(
@@ -123,6 +138,7 @@ export function registerRetentionRoutes(app: FastifyInstance) {
         );
         await audit(pool, { actor_type: "admin", action: "retention.rule_create",
           resource_type: "retention_rule", resource_id: res.rows[0].id, result: "success",
+          workspace_id: workspaceId,
           metadata: { name: r.name, target: r.target, older_than_days: r.older_than_days,
             max_rows: r.max_rows ?? null } });
         return reply.code(201).send(res.rows[0]);
@@ -137,12 +153,23 @@ export function registerRetentionRoutes(app: FastifyInstance) {
     }
   });
 
-  app.get("/v1/retention/rules", async () => {
-    const res = await pool.query("SELECT * FROM retention_rules ORDER BY created_at DESC");
+  app.get("/v1/retention/rules", async (req, reply) => {
+    if (projectScopeRequired(req)) {
+      return reply.code(403).send({ error: "retention_requires_workspace_scope" });
+    }
+    const params: unknown[] = [];
+    const scope = scopeClause(req.principal, params, "workspace_id");
+    const res = await pool.query(
+      `SELECT * FROM retention_rules ${scope ? `WHERE ${scope}` : ""} ORDER BY created_at DESC`,
+      params
+    );
     return { items: res.rows };
   });
 
   app.put("/v1/retention/rules/:id", async (req, reply) => {
+    if (projectScopeRequired(req)) {
+      return reply.code(403).send({ error: "retention_requires_workspace_scope" });
+    }
     const { id } = req.params as { id: string };
     const parsed = z.object({
       older_than_days: z.number().int().min(1).max(3650).optional(),
@@ -150,6 +177,10 @@ export function registerRetentionRoutes(app: FastifyInstance) {
       enabled: z.boolean().optional()
     }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_rule" });
+    const current = await pool.query("SELECT workspace_id FROM retention_rules WHERE id = $1", [id]);
+    if (!current.rows[0] || !workspaceAllowed(req.principal, current.rows[0].workspace_id)) {
+      return reply.code(404).send({ error: "rule_not_found" });
+    }
     const sets: string[] = [];
     const params: unknown[] = [];
     if (parsed.data.older_than_days !== undefined) {
@@ -174,23 +205,40 @@ export function registerRetentionRoutes(app: FastifyInstance) {
   });
 
   app.delete("/v1/retention/rules/:id", async (req, reply) => {
+    if (projectScopeRequired(req)) {
+      return reply.code(403).send({ error: "retention_requires_workspace_scope" });
+    }
     const { id } = req.params as { id: string };
+    const current = await pool.query("SELECT workspace_id FROM retention_rules WHERE id = $1", [id]);
+    if (!current.rows[0] || !workspaceAllowed(req.principal, current.rows[0].workspace_id)) {
+      return reply.code(404).send({ error: "rule_not_found" });
+    }
     const res = await pool.query("DELETE FROM retention_rules WHERE id = $1 RETURNING id", [id]);
     if (!res.rows[0]) return reply.code(404).send({ error: "rule_not_found" });
     await audit(pool, { actor_type: "admin", action: "retention.rule_delete",
-      resource_type: "retention_rule", resource_id: id, result: "success" });
+      resource_type: "retention_rule", resource_id: id, result: "success",
+      workspace_id: current.rows[0].workspace_id });
     return { ok: true };
   });
 
-  app.post("/v1/retention/run", async () => {
+  app.post("/v1/retention/run", async (req, reply) => {
+    if (projectScopeRequired(req)) {
+      return reply.code(403).send({ error: "retention_requires_workspace_scope" });
+    }
     const client = await pool.connect();
     try {
+      const params: unknown[] = [];
+      const scope = scopeClause(req.principal, params, "workspace_id");
       const rules = await client.query(
-        "SELECT * FROM retention_rules WHERE enabled = true ORDER BY created_at"
+        `SELECT * FROM retention_rules WHERE enabled = true ${scope ? `AND ${scope}` : ""}
+         ORDER BY created_at`, params
       );
+      if (rules.rows.length === 0) {
+        return reply.code(400).send({ error: "no_retention_rules" });
+      }
       const run = await client.query(
         "INSERT INTO retention_runs (workspace_id, status) VALUES ($1, 'running') RETURNING id",
-        [rules.rows[0]?.workspace_id ?? (await defaultWorkspaceId(client))]
+        [rules.rows[0].workspace_id]
       );
       const counts: Record<string, number> = {};
       // The deletes run on the sweep connection: with DATABASE_URL_RETENTION
@@ -221,6 +269,7 @@ export function registerRetentionRoutes(app: FastifyInstance) {
       );
       await audit(pool, { actor_type: "admin", action: "retention.run",
         resource_type: "retention_run", resource_id: run.rows[0].id, result: "success",
+        workspace_id: rules.rows[0].workspace_id,
         metadata: { deleted: counts } });
       return { run_id: run.rows[0].id, deleted: counts };
     } finally {
@@ -228,10 +277,19 @@ export function registerRetentionRoutes(app: FastifyInstance) {
     }
   });
 
-  app.get("/v1/retention/runs", async (req) => {
+  app.get("/v1/retention/runs", async (req, reply) => {
+    if (projectScopeRequired(req)) {
+      return reply.code(403).send({ error: "retention_requires_workspace_scope" });
+    }
     const q = req.query as { limit?: string };
     const limit = Math.min(Math.max(Number(q.limit ?? 20), 1), 100);
-    const res = await pool.query("SELECT * FROM retention_runs ORDER BY started_at DESC LIMIT $1", [limit]);
+    const params: unknown[] = [];
+    const scope = scopeClause(req.principal, params, "workspace_id");
+    params.push(limit);
+    const res = await pool.query(
+      `SELECT * FROM retention_runs ${scope ? `WHERE ${scope}` : ""}
+       ORDER BY started_at DESC LIMIT $${params.length}`, params
+    );
     return { items: res.rows };
   });
 }

@@ -50,7 +50,7 @@ POSIX syntax works in `terminal`; use `C:/...` paths for native tools).
 3. **Web dashboard** (vite dev server, :5173):
 
    ```sh
-   cd apps/web && npm run dev
+   cd apps/web && pnpm dev
    ```
 
    Run in `terminal` with `background=true`; note the returned `session_id` — it is the
@@ -60,7 +60,7 @@ POSIX syntax works in `terminal`; use `C:/...` paths for native tools).
 4. **Seed data** (optional but required for runs/trace/cost evidence):
 
    ```sh
-   npm run start -w demo-agent-ts        # one run with a model event
+   pnpm --filter demo-agent-ts start        # one run with a model event
    ```
 
    Run it several times for a populated list. Env knobs: `TRACEGUARD_URL`
@@ -187,5 +187,5 @@ Kill only what this run started, by handle:
 ## Helpers
 
 None shipped — `browser_exec` inline recipes are the harness. Seed runs come from the
-repo's own `demo-agent-ts` (`npm run start -w demo-agent-ts`), which is also the
+repo's own `demo-agent-ts` (`pnpm --filter demo-agent-ts start`), which is also the
 smoke test for ingestion.

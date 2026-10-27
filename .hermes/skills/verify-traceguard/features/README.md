@@ -8,7 +8,7 @@ helper list and the stable-handle table).
 ## Baseline preconditions
 
 - Full stack up per `../SKILL.md` → Launch; `Doctor` returns all 200.
-- At least two runs seeded (`npm run start -w demo-agent-ts`, run twice or more).
+- At least two runs seeded (`pnpm --filter demo-agent-ts start`, run twice or more).
 - Dashboard at `http://localhost:5173`, default keys (no localStorage overrides).
 - One `browser_exec` session named `traceguard` per verification run; start every
   recipe from `http://localhost:5173/#/runs` unless its preconditions say otherwise.

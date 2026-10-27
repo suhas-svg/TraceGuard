@@ -1,0 +1,11 @@
+packages:
+  - "apps/api"
+  - "apps/web"
+  - "examples/demo-agent-ts"
+  - "packages/audit-chain"
+  - "packages/canonical-json"
+  - "packages/mcp-client-shim"
+  - "packages/policy-signing"
+  - "packages/schemas"
+  - "sdks/typescript"
+  - "tools/policy-publisher"

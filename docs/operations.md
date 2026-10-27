@@ -66,7 +66,7 @@ migration job is safe.
 
 ```bash
 # Local, against DATABASE_URL.
-npm run db:migrate
+pnpm db:migrate
 
 # In Kubernetes, the migrate Job does it (waits for postgres, then applies).
 kubectl -n traceguard logs job/migrate
@@ -105,18 +105,18 @@ curl -fsS -X POST "$API/v1/retention/run" -H "Authorization: Bearer $API_KEY"
 # public key. `create` reads the exact prefix through the cutoff event, signs
 # the v3 payload, stores a working copy, writes the external artifact, and
 # audits the creation. Run it with DATABASE_URL_RETENTION (or DATABASE_URL).
-npm run audit:checkpoint -- create --cutoff latest \
+pnpm audit:checkpoint -- create --cutoff latest \
   --out checkpoint-export.json --key checkpoint.key.pem
 # Verify the artifact offline — signature, event ids/hashes, and per-workspace
 # sequence continuity — before trusting the copy you will prune against:
-npm run audit:verify -- --export checkpoint-export.json --public-key checkpoint.pub.pem
+pnpm audit:verify -- --export checkpoint-export.json --public-key checkpoint.pub.pem
 # Only then prune. The CLI verifies the same signature and that the database
 # prefix exactly matches the signed artifact; it refuses an unsigned, tampered,
 # or mismatched checkpoint. --receipt names the external copy kept outside the
 # database and containers and lands in the audit trail. The database function
 # also rejects a null/blank receipt, so a direct retention-role call cannot
 # bypass the external-copy requirement.
-npm run audit:checkpoint -- prune --artifact checkpoint-export.json \
+pnpm audit:checkpoint -- prune --artifact checkpoint-export.json \
   --public-key checkpoint.pub.pem \
   --receipt s3://audit-vault/2026-10-20/checkpoint.json
 ```
@@ -168,18 +168,18 @@ PostgreSQL, the API container, or the gateway container.
 
 ```bash
 # Create the pair once, on the operator's host.
-npm run policy:keygen                                   # ./policy-keys/
+pnpm policy:keygen                                   # ./policy-keys/
 
 # Trust the public key for a workspace; audited, and refused if another key
 # is already live unless --rotate is passed (rotation retires the old key).
-npm run policy:trust -- --workspace default
+pnpm policy:trust -- --workspace default
 
 # Publish a project's current drafts as its new active version (monotonic).
 # --project accepts a project name or id; it defaults to the workspace's
 # project named "default".
-npm run policy:publish -- --workspace default --project default
-npm run policy:publish -- --workspace default --project default --dry-run
-npm run policy:status -- --workspace default --project default
+pnpm policy:publish -- --workspace default --project default
+pnpm policy:publish -- --workspace default --project default --dry-run
+pnpm policy:status -- --workspace default --project default
 ```
 
 Key rotation order matters: `trust --rotate` retires the old key, and the
@@ -213,7 +213,7 @@ prefix or a truncated read is reported as partial, never as fully verified.
 Pruning is the only way audit rows leave the database: the operator CLI
 refuses to prune without a valid externally stored checkpoint and an explicit
 `--receipt`, and only `retention_job` can execute the prune function. The
-gateway cannot create, sign, or prune checkpoints. `npm run audit:verify --
+gateway cannot create, sign, or prune checkpoints. `pnpm audit:verify --
 --export <file> --public-key <pem>` runs the same checks offline against an
 exported checkpoint, without the live database or gateway. The dashboard's
 Policy tab has the same check behind the `Verify chain` button.
@@ -266,7 +266,7 @@ ALTER ROLE retention_job     LOGIN PASSWORD '<from secret>';
 Then point each connection at its role: `DATABASE_URL` for the API and the
 gateway (one each), `DATABASE_URL_RETENTION` for the sweep, and the
 publisher's `--database-url`/`DATABASE_URL` on the operator host. Verify with
-`npm run test --workspace apps/api -- tests/db-roles.test.ts`, which asserts
+`pnpm --filter @traceguard/api test -- tests/db-roles.test.ts`, which asserts
 the whole allowance/denial matrix.
 
 Gotchas worth knowing before you switch:

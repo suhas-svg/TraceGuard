@@ -105,14 +105,22 @@ export async function assembleBundle(
   const previous = (activeRow.rows[0]?.content_hash as string | undefined) ?? null;
 
   const servers = await client.query(
-    "SELECT id, gateway_alias, base_url, auth_secret FROM mcp_servers WHERE project_id = $1 ORDER BY gateway_alias",
+    "SELECT id, gateway_alias, base_url, secret_ref FROM mcp_servers WHERE project_id = $1 ORDER BY gateway_alias",
     [projectId]
   );
   const pins = await client.query(
-    `SELECT t.server_id, t.tool_name, t.definition_hash, t.definition
-       FROM server_tools t JOIN mcp_servers s ON s.id = t.server_id
-      WHERE s.project_id = $1 AND t.quarantined = false AND t.quarantine_reason IS NULL
-      ORDER BY t.server_id, t.tool_name`,
+    `SELECT st.server_id, st.tool_name,
+            COALESCE(cp.id, ap.id) AS pin_id,
+            COALESCE(cp.version, ap.version) AS pin_version,
+            COALESCE(cp.definition_hash, ap.definition_hash) AS definition_hash,
+            COALESCE(cp.definition, ap.definition) AS definition
+       FROM server_tools st
+       JOIN mcp_servers s ON s.id = st.server_id
+       JOIN tool_pins ap ON ap.id = st.active_pin_id
+       LEFT JOIN tool_pins cp ON cp.id = st.candidate_pin_id AND cp.status = 'approved'
+      WHERE s.project_id = $1
+        AND ((st.quarantined = false AND st.quarantine_reason IS NULL) OR cp.status = 'approved')
+      ORDER BY st.server_id, st.tool_name`,
     [projectId]
   );
   const rules = await client.query(
@@ -149,12 +157,15 @@ export async function assembleBundle(
       server_id: s.id,
       alias: s.gateway_alias,
       base_url: s.base_url,
-      // The secret value never enters the bundle, only how it is used.
-      auth_mode: s.auth_secret ? "gateway_secret" : "none"
+      // The reference is signed; the secret value never enters the bundle.
+      secret_ref: s.secret_ref ?? null,
+      auth_mode: s.secret_ref ? "gateway_secret" : "none"
     })),
     pins: pins.rows.map((p) => ({
       server_id: p.server_id,
       tool_name: p.tool_name,
+      pin_id: p.pin_id,
+      pin_version: Number(p.pin_version),
       definition_hash: p.definition_hash
     }))
   };
@@ -352,6 +363,19 @@ export async function publish(pool: Pool, opts: PublishOptions): Promise<Publish
     await client.query("SELECT policy_activate_version($1,$2)", [
       opts.workspaceId, inserted.rows[0].id
     ]);
+    // The bundle carries the approved pin versions, but a pin becomes callable
+    // only in this same transaction. If this fails, the policy activation rolls
+    // back too, so the signed policy and the callable definitions cannot drift.
+    const activated = await client.query(
+      "SELECT activate_approved_tool_pins($1) AS activated",
+      [projectId]
+    );
+    // Stamp the server rows with the exact signed bundle version. The gateway
+    // refuses any server whose row was not stamped by this same transaction.
+    const stamped = await client.query(
+      "SELECT stamp_signed_servers($1,$2) AS stamped",
+      [projectId, bundle.version]
+    );
     await appendAuditEvent(client, {
       actor_type: "admin", actor_id: opts.publishedBy ?? "operator",
       action: "policy.published", resource_type: "policy_version",
@@ -365,7 +389,9 @@ export async function publish(pool: Pool, opts: PublishOptions): Promise<Publish
         key_id: keyId,
         rules: counts.rules,
         servers: counts.servers,
-        pins: counts.pins
+        servers_signed: Number(stamped.rows[0]?.stamped ?? 0),
+        pins: counts.pins,
+        pins_activated: Number(activated.rows[0]?.activated ?? 0)
       }
     });
     await client.query("COMMIT");

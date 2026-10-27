@@ -11,7 +11,7 @@ import { attrsToObject, mapOtlpSpan, otlpLimits, otlpRateLimited, type OtlpSpan 
 import { decodeTraceRequest, encodeTraceResponse } from "./otlp_proto.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
 import { assertProductionAuth } from "./oauth.js";
-import { resolveProject } from "./project-scope.js";
+import { projectAllowed, projectClause, resolveProject } from "./project-scope.js";
 import { audit } from "./audit.js";
 import { registerUserRoutes } from "./users.js";
 import { registerSessionRoutes } from "./sessions.js";
@@ -272,10 +272,12 @@ export function buildApp() {
       params.push(q.cursor);
       where.push(`r.started_at < (SELECT started_at FROM runs WHERE id = $${params.length})`);
     }
-    // Members list only their own workspaces; the dashboard never sees
-    // another team's runs.
+    // Members list only their own workspaces and projects. Workspace scope
+    // alone would expose every project in a shared workspace.
     const scope = scopeClause(req.principal, params, "r.workspace_id");
     if (scope) where.push(scope);
+    const projectScope = projectClause(req.principal, params, "r.project_id");
+    if (projectScope) where.push(projectScope);
     params.push(limit + 1);
     const rows = await pool.query(
       `SELECT r.*, a.name AS agent_name,
@@ -299,18 +301,26 @@ export function buildApp() {
   // re-count itself. Same workspace scoping as the list.
   app.get("/v1/runs/counts", async (req) => {
     const params: unknown[] = [];
+    const where: string[] = [];
     const scope = scopeClause(req.principal, params, "r.workspace_id");
+    if (scope) where.push(scope);
+    const projectScope = projectClause(req.principal, params, "r.project_id");
+    if (projectScope) where.push(projectScope);
+    const runFilter = where.length ? `WHERE ${where.join(" AND ")}` : "";
     const byStatus = await pool.query(
       `SELECT r.status, COUNT(*)::int AS count
          FROM runs r
-        ${scope ? "WHERE " + scope : ""}
+        ${runFilter}
         GROUP BY r.status`,
       params
     );
+    // `params` now holds both scopes. Reusing it here keeps the workspace and
+    // project predicates identical rather than accidentally widening the
+    // denied count back to the whole workspace.
     const denied = await pool.query(
       `SELECT COUNT(*)::int AS count
          FROM spans s JOIN runs r ON r.id = s.run_id
-        WHERE s.status = 'denied' ${scope ? "AND " + scope : ""}`,
+        WHERE s.status = 'denied' ${where.length ? "AND " + where.join(" AND ") : ""}`,
       params
     );
     const counts: Record<string, number> = {};
@@ -336,6 +346,8 @@ export function buildApp() {
       const where: string[] = [];
       const scope = scopeClause(req.principal, params, "r.workspace_id");
       if (scope) where.push(scope);
+      const projectScope = projectClause(req.principal, params, "r.project_id");
+      if (projectScope) where.push(projectScope);
       if (since) {
         params.push(since);
         where.push(`r.started_at >= $${params.length}`);
@@ -405,10 +417,14 @@ export function buildApp() {
     // Pending approvals live on the gateway but share this database. Expired
     // rows are excluded even before any sweeper touches them.
     const apParams: unknown[] = [];
+    const apWhere = ["a.status = 'pending'", "a.expires_at > now()"];
     const apScope = scopeClause(req.principal, apParams, "a.workspace_id");
+    if (apScope) apWhere.push(apScope);
+    const apProjectScope = projectClause(req.principal, apParams, "a.project_id");
+    if (apProjectScope) apWhere.push(apProjectScope);
     const pending = await pool.query(
       `SELECT COUNT(*)::int AS count FROM approvals a
-        WHERE a.status = 'pending' AND a.expires_at > now() ${apScope ? "AND " + apScope : ""}`,
+        WHERE ${apWhere.join(" AND ")}`,
       apParams
     );
 
@@ -440,10 +456,20 @@ export function buildApp() {
   // else; names repeat across workspaces, so ids are the filter key.
   app.get("/v1/agents", async (req) => {
     const params: unknown[] = [];
+    const where: string[] = [];
     const scope = scopeClause(req.principal, params, "workspace_id");
+    if (scope) where.push(scope);
+    // Agents are workspace-level rows, but a project-restricted principal
+    // must not enumerate agents that only ever acted in another project.
+    const projectScope = projectClause(req.principal, params, "r.project_id");
+    if (projectScope) {
+      where.push(
+        `EXISTS (SELECT 1 FROM runs r WHERE r.agent_id = agents.id AND ${projectScope})`
+      );
+    }
     const rows = await pool.query(
       `SELECT id, name, adapter_type, created_at FROM agents
-        ${scope ? "WHERE " + scope : ""}
+        ${where.length ? "WHERE " + where.join(" AND ") : ""}
         ORDER BY name ASC LIMIT 500`,
       params
     );
@@ -454,7 +480,8 @@ export function buildApp() {
     const { id } = req.params as { id: string };
     const res = await pool.query("SELECT * FROM runs WHERE id = $1", [id]);
     // Foreign runs read as missing, so ids cannot probe other workspaces.
-    if (!res.rows[0] || !workspaceAllowed(req.principal, res.rows[0].workspace_id)) {
+    if (!res.rows[0] || !workspaceAllowed(req.principal, res.rows[0].workspace_id) ||
+        !projectAllowed(req.principal, res.rows[0].project_id)) {
       return reply.code(404).send({ error: "run_not_found" });
     }
     return res.rows[0];
@@ -469,7 +496,8 @@ export function buildApp() {
        WHERE r.id = $1`,
       [id]
     );
-    if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id)) {
+    if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id) ||
+        !projectAllowed(req.principal, run.rows[0].project_id)) {
       return reply.code(404).send({ error: "run_not_found" });
     }
     const spans = await pool.query("SELECT * FROM spans WHERE run_id = $1 ORDER BY started_at ASC", [
@@ -478,13 +506,63 @@ export function buildApp() {
     return { run: run.rows[0], spans: spans.rows };
   });
 
+  app.get("/v1/runs/:id/spans", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const run = await pool.query("SELECT * FROM runs WHERE id = $1", [id]);
+    if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id) ||
+        !projectAllowed(req.principal, run.rows[0].project_id)) {
+      return reply.code(404).send({ error: "run_not_found" });
+    }
+    const spans = await pool.query(
+      "SELECT * FROM spans WHERE run_id = $1 ORDER BY started_at ASC", [id]
+    );
+    return { items: spans.rows };
+  });
+
+  // §14: redacted approval summaries for the dashboard. This endpoint cannot
+  // decrypt arguments or transition state; decisions remain on the gateway's
+  // dedicated control listener.
+  app.get("/v1/approvals", async (req, reply) => {
+    reply.header("Cache-Control", "no-store");
+    const q = req.query as { status?: string; limit?: string };
+    const limit = Math.min(Math.max(Number(q.limit ?? 50), 1), 200);
+    const params: unknown[] = [];
+    const where: string[] = [];
+    if (q.status) {
+      params.push(q.status);
+      where.push(`a.status = $${params.length}`);
+    }
+    const scope = scopeClause(req.principal, params, "a.workspace_id");
+    if (scope) where.push(scope);
+    const projectScope = projectClause(req.principal, params, "a.project_id");
+    if (projectScope) where.push(projectScope);
+    params.push(limit);
+    const res = await pool.query(
+      `SELECT a.id, a.workspace_id, a.project_id, a.server_id, a.tool_name, a.status,
+              a.requested_by, a.requested_at, a.expires_at, a.decided_at, a.terminal_at,
+              a.args_summary, a.outcome_summary, a.execution_started_at,
+              d.run_id, d.span_id, d.request_id
+         FROM approvals a
+         LEFT JOIN LATERAL (
+           SELECT run_id, span_id, request_id FROM policy_decisions
+            WHERE approval_id = a.id
+            ORDER BY timestamp DESC LIMIT 1
+         ) d ON true
+        ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+        ORDER BY a.requested_at DESC LIMIT $${params.length}`,
+      params
+    );
+    return { items: res.rows };
+  });
+
   // FR-010 loop and usage diagnostics. Advisory heuristics over the run's
   // recorded spans; recomputed per request so it always reflects current
   // data and never blocks or mutates anything.
   app.get("/v1/runs/:id/diagnostics", async (req, reply) => {
     const { id } = req.params as { id: string };
     const run = await pool.query("SELECT * FROM runs WHERE id = $1", [id]);
-    if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id)) {
+    if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id) ||
+        !projectAllowed(req.principal, run.rows[0].project_id)) {
       return reply.code(404).send({ error: "run_not_found" });
     }
     const spans = await pool.query(
@@ -540,13 +618,28 @@ export function buildApp() {
     }
     // Rate before any database work: a runaway exporter is turned away
     // cheaply (§11.1). In-process fixed window, keyed per authenticated
-    // caller; see otlp.ts for the single-process caveat.
-    const totalSpans = resourceSpans.reduce(
-      (n, rs) => n + (rs.scopeSpans ?? []).reduce((m, ss) => m + (ss.spans ?? []).length, 0),
-      0
-    );
-    if (otlpRateLimited(req.principal?.userId ?? "static-key", totalSpans, limits.rateSpansPerMinute)) {
-      return reply.code(429).header("retry-after", "60").send({ error: "rate_limited" });
+    // caller and project. The project comes from the resource attributes (or
+    // the caller's single project for an ingest key), so one project cannot
+    // spend another project's budget. See otlp.ts for the single-process
+    // caveat.
+    const rateGroups = new Map<string, number>();
+    const principalProject = req.principal?.projects !== "all"
+      ? req.principal?.projects?.[0] : undefined;
+    for (const rs of resourceSpans) {
+      const resource = attrsToObject(rs.resource?.attributes ?? []);
+      const workspace = String(resource["traceguard.workspace"] ?? "unscoped");
+      const project = String(
+        resource["traceguard.project_id"] ?? resource["traceguard.project"]
+          ?? principalProject ?? "unscoped"
+      );
+      const key = `${req.principal?.userId ?? req.principal?.agentPrincipalId ?? "static-key"}:${workspace}:${project}`;
+      const spans = (rs.scopeSpans ?? []).reduce((m, ss) => m + (ss.spans ?? []).length, 0);
+      rateGroups.set(key, (rateGroups.get(key) ?? 0) + spans);
+    }
+    for (const [key, spans] of rateGroups) {
+      if (otlpRateLimited(key, spans, limits.rateSpansPerMinute)) {
+        return reply.code(429).header("retry-after", "60").send({ error: "rate_limited" });
+      }
     }
 
     const receivedAtMs = Date.now();
@@ -727,10 +820,10 @@ export function buildApp() {
   // endpoint sweeps every hold past its TTL in one pass for the cron.
   app.post("/v1/admin/sweep-budget-holds", async () => {
     const totals = await sweepAllExpiredHolds(pool);
-    if (totals.freed_micro > 0 || totals.budgets > 0) {
+    if (totals.settled_micro > 0 || totals.budgets > 0) {
       await audit(pool, { actor_type: "system", action: "budget.holds_swept",
         resource_type: "budget", result: "success",
-        metadata: { freed_micro: totals.freed_micro, budgets: totals.budgets } });
+        metadata: { settled_micro: totals.settled_micro, budgets: totals.budgets } });
     }
     return totals;
   });

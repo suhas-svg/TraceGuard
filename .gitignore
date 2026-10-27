@@ -16,4 +16,5 @@ gateway-state/
 demo-policy-keys/
 .demo-keys/
 sbom.cdx.json
+pnpm-debug.log*
 

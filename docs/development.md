@@ -6,7 +6,7 @@ Requires Node 22, Python 3.10+, Docker with compose, and psql.
 cp .env.example .env
 docker compose up -d postgres
 for f in apps/api/migrations/*.sql; do psql "$DATABASE_URL" -f "$f"; done
-npm install --ignore-scripts
+pnpm install --ignore-scripts
 ```
 
 Run each process in its own shell:
@@ -23,21 +23,19 @@ DATABASE_URL=... API_KEY=... APPROVER_KEY=... GATEWAY_PORT=8091 \
 # mock tools on :8092
 node examples/mock-tools/server.mjs
 # dashboard on :5173
-node node_modules/vite/bin/vite.js preview apps/web --port 5173
+pnpm --filter @traceguard/web preview --port 5173
 ```
 
-Build with `./node_modules/.bin/tsc -p <package>/tsconfig.json` per
-package, or `npm run build --workspace=@traceguard/web` for the bundle
-(run the tsc and vite steps directly if npm lifecycle scripts are blocked
-on your machine). Tests: `../../node_modules/.bin/vitest run` from
-`apps/api`, `./node_modules/.bin/vitest run --root apps/web` from the repo
-root. Integration tests need a database with all migrations applied and
-default to the dev one.
+Build the whole workspace with `pnpm build`, or one package with
+`pnpm --filter <package-name> build`. Tests run per workspace:
+`pnpm --filter @traceguard/api test`, `pnpm --filter @traceguard/web test`,
+and so on; `pnpm test` runs every workspace suite. Integration tests need a
+database with all migrations applied and default to the dev one.
 
-Cross-cutting gates live at the repo root: `npm run test:secrets` scans every
-tracked file for credential shapes, `npm run test:faults` boots the API and
+Cross-cutting gates live at the repo root: `pnpm test:secrets` scans every
+tracked file for credential shapes, `pnpm test:faults` boots the API and
 the gateway against a dead database and requires fail-closed answers (build
-`apps/api` first), and `npm run test:oauth` starts a generated RS256
+`apps/api` first), and `pnpm test:oauth` starts a generated RS256
 issuer/JWKS, boots both apps in production OAuth mode, and proves static keys
 are refused while OAuth tokens work. All three run in CI.
 
@@ -48,8 +46,8 @@ separate, disposable database — and leave the rest unset. `tests/e2e` is the
 exception: it sets its own environment and recreates its own database.
 
 The gateway enforces only signed policy: bring a project up with
-`npm run policy:keygen`, `npm run policy:trust -- --workspace default`, and
-`npm run policy:publish -- --workspace default --project default` (repeat the
+`pnpm policy:keygen`, `pnpm policy:trust -- --workspace default`, and
+`pnpm policy:publish -- --workspace default --project default` (repeat the
 publish after every rule, server, or reviewed-pin change). The signing key stays in
 `./policy-keys/` on your machine — never in a container. The e2e suite runs
 its own publish against its own key and `GATEWAY_STATE_DIR` under

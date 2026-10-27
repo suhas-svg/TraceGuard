@@ -2,9 +2,9 @@
 // Captures the dashboard screenshots the README links to, from the current
 // build, against a running stack. Requires Playwright's browsers:
 //
-//   npx playwright install chromium
+//   pnpm exec playwright install chromium
 //   node apps/api/dist/index.js & node apps/api/dist/gateway.js &
-//   npm run preview --workspace apps/web -- --port 5173 &
+//   pnpm --filter @traceguard/web preview --port 5173 &
 //   node scripts/screenshots.mjs
 //
 // Writes docs/images/*.png. The point of committing this is that the README's

@@ -82,7 +82,12 @@ const ROUTES: [string, string][] = [
   ["/v1/webhooks/deliveries", "read"],
   ["/v1/evaluations", "admin"],
   ["/v1/policies", "read"],
+  ["/v1/policy-drafts", "read"],
+  ["/v1/policy-decisions", "read"],
   ["/v1/policy-versions", "read"],
+  ["/v1/mcp-servers", "read"],
+  ["/v1/mcp-server-drafts", "read"],
+  ["/v1/approvals", "read"],
   ["/v1/servers", "read"],
   ["/v1/budgets", "admin"],
   ["/v1/pricing", "admin"],
@@ -257,6 +262,11 @@ export async function resolvePrincipal(
       return null;
     }
   }
+  // §13.1: in OAuth mode the issuer owns human identity. A local API key
+  // minted before the issuer was configured must not survive as a parallel
+  // credential, and the development bootstrap must not become a production
+  // back door. Static dev keys were handled above and remain a dev profile.
+  if (oauth) return null;
   const hash = createHash("sha256").update(token).digest("hex");
   const res = await pool.query(
     `SELECT k.user_id, k.scopes, k.expires_at, k.workspace_id AS key_workspace,
@@ -340,6 +350,9 @@ export async function authHook(req: FastifyRequest, reply: FastifyReply): Promis
     const token = cookieValue(req.headers.cookie, cookieName);
     if (token) session = await findSession(sessionRole, token);
   }
+  // A dashboard session minted from a local password/key before OAuth was
+  // enabled must expire immediately rather than remain a parallel identity.
+  if (session?.principal.kind === "user" && oauthConfigFromEnv()) session = null;
   if (session && (req.url.startsWith("/mcp") || req.url.startsWith("/v1/gateway/tools/call"))) {
     return reply.code(403).send({ error: "APPROVAL_CLIENT_REQUIRED" }) as unknown as void;
   }

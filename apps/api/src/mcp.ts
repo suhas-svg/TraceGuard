@@ -187,7 +187,8 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
     return rpcError(env.id, -32003, "Tool not found", { error: "unknown_server_alias", name });
   }
   const serverRow = await pool.query(
-    "SELECT * FROM mcp_servers WHERE project_id = $1 AND gateway_alias = $2",
+    `SELECT * FROM mcp_servers
+      WHERE project_id = $1 AND gateway_alias = $2 AND disabled_at IS NULL`,
     [resolved.project.id, alias]
   );
   const server = serverRow.rows[0];
@@ -363,15 +364,17 @@ export function registerMcpRoutes(app: FastifyInstance): void {
           });
         }
         const manifest = new Map(loaded.policy.bundle.servers.map((s) => [s.server_id, s]));
-        const pins = new Set(
-          loaded.policy.bundle.pins.map((p) => `${p.server_id}|${p.tool_name}|${p.definition_hash}`)
+        const pins = new Map(
+          loaded.policy.bundle.pins.map((p) => [`${p.server_id}|${p.tool_name}`, p])
         );
         const rows = await pool.query(
-          `SELECT s.id AS server_id, s.gateway_alias, t.tool_name, t.definition, t.definition_hash
+          `SELECT s.id AS server_id, s.gateway_alias, t.tool_name, t.definition,
+                  t.definition_hash, t.active_pin_id, t.definition_version
              FROM mcp_servers s JOIN server_tools t ON t.server_id = s.id
-            WHERE s.project_id = $1 AND t.quarantined = false
+            WHERE s.project_id = $1 AND s.signed_bundle_version = $2::bigint
+              AND s.disabled_at IS NULL AND t.quarantined = false
             ORDER BY s.gateway_alias, t.tool_name`,
-          [resolved.project.id]
+          [resolved.project.id, loaded.policy.bundle.version]
         );
         const rules = rulesFromBundle(loaded.policy.bundle);
         return rpcResult(env.id, {
@@ -382,7 +385,11 @@ export function registerMcpRoutes(app: FastifyInstance): void {
             .filter((r) => {
               const listed = manifest.get(r.server_id as string);
               if (listed?.alias !== r.gateway_alias) return false;
-              if (!pins.has(`${r.server_id}|${r.tool_name}|${r.definition_hash}`)) return false;
+              const pin = pins.get(`${r.server_id}|${r.tool_name}`);
+              if (!pin
+                  || (pin.pin_id !== undefined && pin.pin_id !== r.active_pin_id)
+                  || (pin.pin_version !== undefined && pin.pin_version !== r.definition_version)
+                  || pin.definition_hash !== r.definition_hash) return false;
               // §7.2: only enabled tools are listed. v1 has no per-tool
               // enable flag, so a tool counts as disabled when an enabled
               // unconditional deny rule covers it; conditional denies stay

@@ -13,6 +13,14 @@
   bundle carries the new pin.
 - Denied calls never contact the upstream server. The security suite asserts
   this with upstream hit counters, not just status codes.
+- An allowed call is not dispatched until its policy decision and
+  `policy.allow` audit event are durable. If that evidence write fails, the
+  call fails closed rather than leaving an executed tool with no record.
+- Every read and control route is constrained to the caller's workspaces and
+  projects. An id belonging to another project is answered as not found, and
+  control approvals enforce the same boundary.
+- Upstream redirects are refused, not followed: a URL that passed validation
+  cannot bounce the gateway to a different origin or a private address.
 - Agent credentials cannot decide approvals. The queue and decision endpoints
   live on the gateway's separate control listener (`GATEWAY_CONTROL_PORT`,
   default 8093) rather than the agent-facing port; the approve scope is
@@ -20,7 +28,9 @@
   admin keys answer 403.
 - The audit log is append-only at the database layer (UPDATE/DELETE rejected
   by trigger), hash-chained, and verifiable through `POST /v1/audit/verify`;
-  a detected mutation means a database owner disabled the guard.
+  a detected mutation means a database owner disabled the guard. Verification
+  requires a global principal because the chain spans workspaces and a partial
+  chain cannot be verified without exposing another tenant's hashes.
 - Access tokens are validated as JWTs against the configured issuer's keys
   when OAuth is on (`OAUTH_ISSUER` + `OAUTH_AUDIENCE` + a JWKS source): the
   algorithm is pinned to EdDSA / RS256 / ES256, the issuer, audience,
@@ -29,22 +39,31 @@
   without an issuer and stops accepting the static development keys.
 - Costs are estimates from provider-reported usage and versioned prices,
   never billing truth.
+- A project **block** budget refuses to reserve when usage with no matching
+  price makes spend unknowable (`409 budget_unknown_usage`), rather than
+  treating the unpriced usage as zero and granting headroom that may not
+  exist. Warn budgets proceed but report `spend_complete: false`.
+- When `TOOL_CALL_RESERVATION_MICRO` is set, a tool call holds that amount
+  against every covering run/agent block budget before dispatch. The hold is
+  all-or-nothing across budgets, audited as `budget.reserved`, and released
+  when the call ends; a crashed hold is settled at its reserved maximum by
+  the expiry sweep instead of silently returning the headroom.
 
 ## Database roles
 
-Since migration `023`, with the later tightening in `035`–`039`, the boundary
-between "can enforce" and "can rewrite policy" is a database privilege, not a
-convention. Eight roles exist, all `NOLOGIN` until a deployment gives them
-credentials:
+Since migration `023`, with the later tightening in `035`–`039` and `046`, the
+boundary between "can enforce" and "can rewrite policy" is a database
+privilege, not a convention. Eight roles exist, all `NOLOGIN` until a
+deployment gives them credentials:
 
 | Role | Holds | Denied |
 |---|---|---|
-| `api_runtime` | reads; control-plane drafts (`policies`, `mcp_servers`, `server_tools`); projects, agent principals, ingest keys; users/keys/memberships; runs, spans, budgets, evals, webhooks, retention rules; trace-data deletes | every write to `policy_versions`, `policy_signing_keys`, `active_config`; direct insert/update/delete on `audit_events`; all approval writes |
+| `api_runtime` | reads; control-plane drafts (`policies`, `mcp_servers`); append-only discovery rows (`server_tools`, `tool_pins`); executes the pin/state procedures; projects, agent principals, ingest keys; users/keys/memberships through identity procedures; runs, spans, budgets, evals, webhooks, retention rules | every write to `policy_versions`, `policy_signing_keys`, `active_config`; direct `UPDATE` on `tool_pins`/`server_tools`; `DELETE` on `runs`/`spans`; direct insert/update/delete on `audit_events`; all approval writes |
 | `gateway_runtime` | reads of signed policy, trust keys, active config, projects, principals; approval procedures, decisions, discovery; spans | publish or alter `policy_versions`/`active_config`/`policy_signing_keys`; server, pin, or policy writes; direct `approvals` or `audit_events` DML |
 | `policy_publisher` | inserts `policy_versions`; executes `policy_trust_key`/`policy_activate_version`; appends audit | update/delete of `policy_versions` (the immutability trigger backs this up); direct trust or active-pointer writes; any audit DML |
 | `retention_job` | deletes `spans`, `runs`, webhook deliveries; its own run bookkeeping; executes the checkpoint-gated audit prune | approval deletes; ordinary audit DML; `policy_versions` or trust-state writes |
 | `approval_owner` | owns the approval procedures and tables; cannot log in | runtime traffic |
-| `policy_owner` | owns the trust/activation procedures and `lock_active_config_share`; cannot log in | runtime traffic |
+| `policy_owner` | owns the trust/activation procedures, `lock_active_config_share`, and the tool-pin/server-tool state procedures; cannot log in | runtime traffic |
 | `audit_owner` | owns `audit_events` and `append_audit_event`; cannot log in | runtime traffic |
 | `migration_owner` | a membership target for the deployer; migrations should run as it | runtime traffic |
 
@@ -56,10 +75,22 @@ events use v4 hashes with workspace and project attribution; v1–v3 hashes
 remain byte-identical for old rows. The hash formula stays in
 `@traceguard/audit-chain`, where the verifier shares it.
 
-The remaining deviation from the spec's §13.4 table is the local identity
-path: `api_runtime` can still insert/update `users`, `api_keys`, and
-`memberships`, so a non-OAuth deployment can mint trusted roles. Removing
-that path is tracked as an open identity workstream, not a hidden exception.
+Tool trust state is procedural too: migration `046` removes `api_runtime`'s
+direct `UPDATE` on `tool_pins` and `server_tools` and its `DELETE` on `runs`
+and `spans`. Discovery may still insert new rows, but every pin transition,
+candidate swap, and quarantine change goes through
+`api_set_tool_pin_status`/`api_set_server_tool_state`, both `SECURITY DEFINER`
+and owned by `policy_owner`. Execution evidence is therefore removed only by
+the retention role under its own policy.
+
+The identity boundary is procedural: `api_runtime` has `SELECT` but no direct
+`INSERT`/`UPDATE`/`DELETE` on `users`, `api_keys`, or `memberships`; every
+write goes through a narrow `SECURITY DEFINER` procedure owned by
+`identity_owner`. When an issuer is configured, the local registration/login
+plane is closed with `403 external_identity_required`, and pre-existing local
+API keys and dashboard sessions no longer authenticate. The procedures still
+back the local development profile when no issuer is configured; that profile
+is not a production identity source.
 
 `apps/api/tests/db-roles.test.ts` proves the matrix at the database layer by
 running each probe under `SET ROLE`; it fails if a grant widens.

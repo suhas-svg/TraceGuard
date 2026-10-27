@@ -49,7 +49,12 @@ export const ingestBodySchema = z.object({
 // before signing, the gateway after verification — and never from partial
 // data.
 
-export const BUNDLE_VERSION = 1;
+export const BUNDLE_VERSION = 2;
+// Version 1 bundles predate immutable pin identities. They remain readable so
+// an upgrade does not strand the active signed policy, but new publications
+// always use BUNDLE_VERSION. Once a v2 bundle is active, pin_id/pin_version are
+// enforced against the gateway's current rows.
+export const LEGACY_BUNDLE_VERSION = 1;
 export const PROTOCOL_PROFILE = "mcp-2026-07-28";
 
 // The fixed operator set of §8.4, nothing else: no expressions, no code.
@@ -146,6 +151,9 @@ export const bundleServerSchema = z.object({
   server_id: z.string().uuid(),
   alias: z.string().min(1).max(64).regex(/^[a-z0-9_]+$/),
   base_url: z.string().url(),
+  // Only the reference is signed; the credential value never enters the
+  // bundle or the database. Required on every server in a v2 bundle.
+  secret_ref: z.string().max(512).nullable().optional(),
   // Secret values never enter the bundle; only how the gateway authenticates.
   auth_mode: z.enum(["gateway_secret", "none"])
 }).strict();
@@ -153,11 +161,21 @@ export const bundleServerSchema = z.object({
 export const bundlePinSchema = z.object({
   server_id: z.string().uuid(),
   tool_name: z.string().min(1).max(128),
+  // Absent only in legacy v1 bundles. New bundles always carry both.
+  pin_id: z.string().uuid().optional(),
+  pin_version: z.number().int().positive().optional(),
   definition_hash: z.string().regex(/^[0-9a-f]{64}$/)
-}).strict();
+}).strict().superRefine((pin, ctx) => {
+  if ((pin.pin_id === undefined) !== (pin.pin_version === undefined)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "pin_id and pin_version must be present together"
+    });
+  }
+});
 
 export const policyBundleSchema = z.object({
-  bundle_version: z.literal(BUNDLE_VERSION),
+  bundle_version: z.union([z.literal(LEGACY_BUNDLE_VERSION), z.literal(BUNDLE_VERSION)]),
   protocol_profile: z.literal(PROTOCOL_PROFILE),
   workspace_id: z.string().uuid(),
   // Legacy bundles predate project-scoped publication. New bundles always
@@ -168,7 +186,27 @@ export const policyBundleSchema = z.object({
   rules: z.array(bundleRuleSchema).max(500),
   servers: z.array(bundleServerSchema).max(100),
   pins: z.array(bundlePinSchema).max(5000)
-}).strict();
+}).strict().superRefine((bundle, ctx) => {
+  if (bundle.bundle_version < BUNDLE_VERSION) return;
+  bundle.pins.forEach((pin, index) => {
+    if (pin.pin_id === undefined || pin.pin_version === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["pins", index],
+        message: "v2 bundles require pin_id and pin_version"
+      });
+    }
+  });
+  bundle.servers.forEach((server, index) => {
+    if (!("secret_ref" in server)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["servers", index],
+        message: "v2 bundles require secret_ref on every server (null when credential-less)"
+      });
+    }
+  });
+});
 
 export type PolicyBundle = z.infer<typeof policyBundleSchema>;
 export type BundleRule = z.infer<typeof bundleRuleSchema>;

@@ -31,9 +31,9 @@ done
 # 4. Sign and publish the rules + server manifest + reviewed pins as the
 #    active policy version. Until this runs, every gateway call fails closed
 #    (503 policy_unavailable): these rules are drafts.
-npm run policy:keygen                                  # once, writes ./policy-keys/
-npm run policy:trust -- --workspace default            # once, audited
-npm run policy:publish -- --workspace default
+pnpm policy:keygen                                  # once, writes ./policy-keys/
+pnpm policy:trust -- --workspace default            # once, audited
+pnpm policy:publish -- --workspace default
 ```
 
 ## What each rule does

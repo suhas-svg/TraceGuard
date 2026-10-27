@@ -54,6 +54,9 @@ describe("integration and security", () => {
   };
 
   beforeAll(async () => {
+    // §7.4: the gateway resolves this reference at call time. Only the
+    // reference is stored; the credential stays in the process environment.
+    process.env.TEST_UPSTREAM_TOKEN = "s3cret";
     httpServer = createServer(async (req, res) => {
       if (req.method === "POST") {
         lastUpstreamAuth = req.headers.authorization as string | undefined;
@@ -70,6 +73,9 @@ describe("integration and security", () => {
   });
 
   afterAll(async () => {
+    delete process.env.TEST_UPSTREAM_TOKEN;
+    delete process.env.TOOL_CALL_RESERVATION_MICRO;
+    delete process.env.TOOL_CALL_RESERVATION_TTL_SECONDS;
     httpServer.close();
     await api.close();
     await gw.close();
@@ -90,6 +96,14 @@ describe("integration and security", () => {
     attributes: {},
     ...over
   });
+
+  // A price's effective_from is database time. These fixtures record a price
+  // and then a span in quick succession, so deriving the span timestamp from
+  // the returned effective_from keeps the version boundary deterministic: a
+  // price recorded in the same millisecond can never sort after the span and
+  // make correctly priced usage look unpriced.
+  const afterPrice = (price: { effective_from: string }): string =>
+    new Date(Date.parse(price.effective_from) + 1).toISOString();
 
   it("ingests, reads back, and dedupes retries", async () => {
     const runId = randomUUID();
@@ -174,14 +188,35 @@ describe("integration and security", () => {
     const metadata = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
       payload: { name: `meta-${tag}`, base_url: "http://169.254.169.254/mcp" } });
     expect(metadata.statusCode).toBe(400);
+    // A bare value is not a reference: refuse it instead of persisting the
+    // credential in mcp_servers.
+    const inline = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `inline-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`,
+        secret_ref: "s3cret" } });
+    expect(inline.statusCode).toBe(400);
+    expect(inline.json().error).toBe("invalid_secret_ref");
     const res = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
-      payload: { name: `mock-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`, auth_secret: "s3cret" } });
+      payload: { name: `mock-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`,
+        secret_ref: "env:TEST_UPSTREAM_TOKEN" } });
     expect(res.statusCode).toBe(201);
+    expect(res.json().secret_ref).toBe("env:TEST_UPSTREAM_TOKEN");
     serverId = res.json().id;
     const list = await api.inject({ method: "GET", url: "/v1/servers", headers: key });
     expect(JSON.stringify(list.json())).not.toContain("s3cret");
     const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
     expect(disc.json().tools.map((t: { tool_name: string }) => t.tool_name)).toContain("echo");
+  });
+
+  it("fails closed when a secret reference cannot be resolved", async () => {
+    const before = upstreamHits;
+    const res = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `missing-secret-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`,
+        secret_ref: "env:TRACEGUARD_MISSING_UPSTREAM_TOKEN" } });
+    expect(res.statusCode).toBe(201);
+    const disc = await api.inject({ method: "POST", url: `/v1/servers/${res.json().id}/discover`, headers: key });
+    expect(disc.statusCode).toBe(503);
+    expect(disc.json().error).toBe("secret_unavailable");
+    expect(upstreamHits).toBe(before);
   });
 
   it("allows listed calls and blocks denied ones without upstream contact", async () => {
@@ -207,6 +242,10 @@ describe("integration and security", () => {
       payload: { server_id: serverId, tool: "echo", arguments: { text: "nope!" }, caller: "t" } });
     expect(blocked.statusCode).toBe(403);
     expect(upstreamHits).toBe(before + 1);
+    const decisions = await pool.query<{ action: string }>(
+      `SELECT action FROM audit_events WHERE resource_id = $1
+        AND action IN ('policy.allow','policy.deny')`, [`${serverId}/echo`]);
+    expect(decisions.rows.map((row) => row.action).sort()).toEqual(["policy.allow", "policy.deny"]);
     const unknown = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "ghost", arguments: {}, caller: "t" } });
     expect(unknown.statusCode).toBe(403);
@@ -289,12 +328,22 @@ describe("integration and security", () => {
     expect(call.statusCode).toBe(202);
     expect(upstreamHits).toBe(before);
     const approvalId = call.json().approval_id;
+    const required = await pool.query(
+      `SELECT 1 FROM audit_events WHERE action = 'policy.approval_required'
+        AND resource_id = $1 AND metadata->>'approval_id' = $2`, [`${serverId}/echo`, approvalId]);
+    expect(required.rowCount).toBe(1);
+    const created = await pool.query(
+      "SELECT 1 FROM audit_events WHERE action = 'approval.created' AND resource_id = $1", [approvalId]);
+    expect(created.rowCount).toBe(1);
     const agentDecision = await ctl.inject({ method: "POST", url: `/_control/v1/approvals/${approvalId}/decision`,
       headers: agentKey, payload: { approved: true } });
     expect(agentDecision.statusCode).toBe(403);
     const decided = await ctl.inject({ method: "POST", url: `/_control/v1/approvals/${approvalId}/decision`,
       headers: approver, payload: { approved: true, reason: "test" } });
     expect(decided.json().status).toBe("approved");
+    const approved = await pool.query(
+      "SELECT 1 FROM audit_events WHERE action = 'approval.approved' AND resource_id = $1", [approvalId]);
+    expect(approved.rowCount).toBe(1);
     // Sealed at rest while pending/approved: ciphertext, never the plaintext.
     const stored = await pool.query("SELECT args_enc, args FROM approvals WHERE id = $1", [approvalId]);
     expect(stored.rows[0].args_enc).toBe(true);
@@ -304,6 +353,11 @@ describe("integration and security", () => {
         request_id: `r-${tag}`, approval_id: approvalId } });
     expect(retry.statusCode).toBe(200);
     expect(upstreamHits).toBe(before + 1);
+    const executed = await pool.query<{ action: string }>(
+      `SELECT action FROM audit_events WHERE resource_id = $1
+        AND action IN ('approval.execution_started','approval.response_received')`, [approvalId]);
+    expect(executed.rows.map((row) => row.action).sort())
+      .toEqual(["approval.execution_started", "approval.response_received"]);
     const replay = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: "wait" }, caller: "t",
         request_id: `r-${tag}`, approval_id: approvalId } });
@@ -565,9 +619,10 @@ describe("integration and security", () => {
 
   it("reconciles estimates against provider actuals", async () => {
     const prov = `rp-${tag}`;
-    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+    const price = await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
       payload: { provider: prov, model: "m1", input_price_per_million: 2000000,
         output_price_per_million: 8000000 } });
+    expect(price.statusCode).toBe(201);
     // Estimated: (1000*2M + 200*8M)/1M = 3600 micro. Actual billed: 4000.
     const runId = randomUUID();
     const spanId = randomUUID();
@@ -575,7 +630,7 @@ describe("integration and security", () => {
       payload: { events: [{
         schema_version: "1", event_id: `evt-${randomUUID()}`, agent_name: `rec-${tag}`,
         run_id: runId, span_id: spanId, parent_span_id: null, event_type: "model.request",
-        timestamp: new Date().toISOString(), status: "success",
+        timestamp: afterPrice(price.json()), status: "success",
         provider: prov, model: "m1", input_tokens: 1000, output_tokens: 200,
         usage_source: "provider_reported", attributes: {} }] } });
     const imp = await api.inject({ method: "POST", url: "/v1/reconciliation/actuals", headers: key,
@@ -849,6 +904,9 @@ describe("integration and security", () => {
     ]);
     const codes = [a.statusCode, b.statusCode].sort((x, y) => x - y);
     expect(codes).toEqual([200, 409]);
+    const denied = await pool.query(
+      "SELECT 1 FROM audit_events WHERE action = 'budget.denied' AND resource_id = $1", [budgetId]);
+    expect(denied.rowCount).toBe(1);
   });
 
   it("does not re-issue a tool call after an upstream error", async () => {
@@ -942,6 +1000,37 @@ describe("integration and security", () => {
     expect(row.rows[0].status).toBe("policy_invalidated");
   });
 
+  it("refuses to call a server that is not stamped by the active signed bundle", async () => {
+    // B2 / §13.1: a newly registered server is a draft. Publication stamps the
+    // signed server config, and only then may the gateway route to it.
+    const draft = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `unsigned-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`,
+        gateway_alias: `unsigned-${tag}`, secret_ref: "env:TEST_UPSTREAM_TOKEN" } });
+    expect(draft.statusCode).toBe(201);
+    const draftId = draft.json().id as string;
+    const unsigned = await pool.query("SELECT signed_bundle_version FROM mcp_servers WHERE id = $1", [draftId]);
+    expect(unsigned.rows[0].signed_bundle_version).toBeNull();
+    const discover = await api.inject({ method: "POST", url: `/v1/servers/${draftId}/discover`, headers: key });
+    expect(discover.statusCode).toBe(200);
+
+    const before = upstreamHits;
+    const blocked = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: draftId, tool: "echo", arguments: { text: "unsigned" }, caller: "t" } });
+    expect(blocked.statusCode).toBe(403);
+    expect(blocked.json().error).toBe("tool_blocked");
+    expect(upstreamHits).toBe(before);
+
+    await api.inject({ method: "POST", url: "/v1/policies", headers: key,
+      payload: { name: `allow-unsigned-${tag}`, server_id: draftId, tool_name: "echo", effect: "allow" } });
+    await publishTestPolicy(pool);
+    const stamped = await pool.query("SELECT signed_bundle_version FROM mcp_servers WHERE id = $1", [draftId]);
+    expect(Number(stamped.rows[0].signed_bundle_version)).toBeGreaterThan(0);
+    const ok = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+      payload: { server_id: draftId, tool: "echo", arguments: { text: "now-signed" }, caller: "t" } });
+    expect(ok.statusCode).toBe(200);
+    expect(upstreamHits).toBe(before + 1);
+  });
+
   it("denies gateway calls once a covering block budget is exhausted", async () => {
     const runId = randomUUID();
     await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
@@ -959,10 +1048,129 @@ describe("integration and security", () => {
     expect(denied.json().error).toBe("budget_exceeded");
     expect(denied.json().budget_id).toBe(budget.json().id);
     expect(upstreamHits).toBe(before);
+    const deniedAudit = await pool.query(
+      "SELECT 1 FROM audit_events WHERE action = 'budget.denied' AND resource_id = $1", [budget.json().id]);
+    expect(deniedAudit.rowCount).toBe(1);
     // The denial is visible in the run trace, citing the budget.
     const trace = await api.inject({ method: "GET", url: `/v1/runs/${runId}/trace`, headers: key });
     const span = trace.json().spans.find((s: { status: string }) => s.status === "denied");
     expect(span?.attributes?.reason).toContain("budget exhausted");
+  });
+
+  it("reserves and releases a tool-call hold around a gateway call", async () => {
+    const runId = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId, event_type: "run.started" })] } });
+    const budget = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: runId, limit_micro: 1_000_000, effect: "block" } });
+    expect(budget.statusCode).toBe(201);
+    const budgetId = budget.json().id as string;
+    // Use a dedicated server: earlier approval tests leave a server-wide
+    // require_approval rule on the shared fixture, which would keep this call
+    // out of the allow path and into the approval queue.
+    const srv = await api.inject({ method: "POST", url: "/v1/servers", headers: key,
+      payload: { name: `hold-${tag}`, base_url: `http://127.0.0.1:${upstreamPort}/mcp`,
+        gateway_alias: `hold-${tag}`, secret_ref: "env:TEST_UPSTREAM_TOKEN" } });
+    expect(srv.statusCode).toBe(201);
+    const holdServerId = srv.json().id as string;
+    const disc = await api.inject({ method: "POST", url: `/v1/servers/${holdServerId}/discover`, headers: key });
+    expect(disc.statusCode).toBe(200);
+    const allow = await api.inject({ method: "POST", url: "/v1/policies", headers: key,
+      payload: { name: `allow-hold-${tag}`, server_id: holdServerId, tool_name: "echo", effect: "allow" } });
+    expect(allow.statusCode).toBe(201);
+    process.env.TOOL_CALL_RESERVATION_MICRO = "1000";
+    try {
+      await publishTestPolicy(pool);
+      const before = upstreamHits;
+      const call = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+        payload: { server_id: holdServerId, tool: "echo", arguments: { text: "held" },
+          caller: "t", run_id: runId } });
+      expect(call.statusCode, call.body).toBe(200);
+      expect(upstreamHits).toBe(before + 1);
+
+      const holds = await pool.query(
+        `SELECT r.status, r.amount_micro::float8 AS amount,
+                b.reserved_micro::float8 AS reserved
+           FROM budget_reservations r JOIN budgets b ON b.id = r.budget_id
+          WHERE r.budget_id = $1`, [budgetId]);
+      expect(holds.rows).toHaveLength(1);
+      expect(holds.rows[0].status).toBe("released");
+      expect(holds.rows[0].amount).toBe(1000);
+      expect(holds.rows[0].reserved).toBe(0);
+
+      const reservedAudit = await pool.query(
+        `SELECT 1 FROM audit_events
+          WHERE action = 'budget.reserved' AND resource_id = $1
+            AND metadata->>'amount_micro' = '1000'`, [budgetId]);
+      expect(reservedAudit.rowCount).toBe(1);
+    } finally {
+      delete process.env.TOOL_CALL_RESERVATION_MICRO;
+    }
+  });
+
+  it("denies a tool call when its hold would exceed the budget", async () => {
+    const runId = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId, event_type: "run.started" })] } });
+    const budget = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: runId, limit_micro: 100, effect: "block" } });
+    expect(budget.statusCode).toBe(201);
+    const budgetId = budget.json().id as string;
+    // The cheap gate passes (50 < 100); only the per-call hold crosses it.
+    await pool.query("UPDATE budgets SET spent_micro = 50 WHERE id = $1", [budgetId]);
+    process.env.TOOL_CALL_RESERVATION_MICRO = "60";
+    try {
+      await publishTestPolicy(pool);
+      const before = upstreamHits;
+      const denied = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
+        payload: { server_id: serverId, tool: "echo", arguments: { text: "too-much" },
+          caller: "t", run_id: runId } });
+      expect(denied.statusCode).toBe(403);
+      expect(denied.json().error).toBe("budget_exceeded");
+      expect(denied.json().budget_id).toBe(budgetId);
+      expect(upstreamHits).toBe(before);
+
+      const holds = await pool.query(
+        "SELECT count(*)::int AS n FROM budget_reservations WHERE budget_id = $1", [budgetId]);
+      expect(holds.rows[0].n).toBe(0);
+      const row = await pool.query(
+        "SELECT reserved_micro::float8 AS reserved FROM budgets WHERE id = $1", [budgetId]);
+      expect(row.rows[0].reserved).toBe(0);
+    } finally {
+      delete process.env.TOOL_CALL_RESERVATION_MICRO;
+    }
+  });
+
+  it("leaves no partial hold when any covering budget lacks headroom", async () => {
+    const runId = randomUUID();
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
+      payload: { events: [ev({ run_id: runId, event_type: "run.started" })] } });
+    const roomy = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: runId, limit_micro: 1000, effect: "block" } });
+    const tight = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "run", ref_id: runId, limit_micro: 50, effect: "block" } });
+    expect(roomy.statusCode).toBe(201);
+    expect(tight.statusCode).toBe(201);
+    const workspace = await pool.query("SELECT workspace_id FROM runs WHERE id = $1", [runId]);
+
+    const reserved = await pool.query(
+      "SELECT gateway_reserve_tool_call($1,$2,NULL,100,60) AS outcome",
+      [workspace.rows[0].workspace_id, runId]);
+    const outcome = reserved.rows[0].outcome as {
+      reservation_ids: string[];
+      exhausted: { id: string } | null;
+    };
+    expect(outcome.exhausted?.id).toBe(tight.json().id);
+    expect(outcome.reservation_ids).toEqual([]);
+
+    const rows = await pool.query(
+      `SELECT id, reserved_micro::float8 AS reserved FROM budgets WHERE id = ANY($1)`,
+      [[roomy.json().id, tight.json().id]]);
+    expect(rows.rows.every((row: { reserved: number }) => row.reserved === 0)).toBe(true);
+    const holds = await pool.query(
+      `SELECT count(*)::int AS n FROM budget_reservations WHERE budget_id = ANY($1)`,
+      [[roomy.json().id, tight.json().id]]);
+    expect(holds.rows[0].n).toBe(0);
   });
 
   it("settles a reservation exactly once under concurrent retries", async () => {
@@ -1055,6 +1263,9 @@ describe("integration and security", () => {
     expect(deniedRow.args).toEqual({});
     expect(deniedRow.args_summary).toContain("[REDACTED]");
     expect(deniedRow.args_summary).not.toContain(secret);
+    const rejectedAudit = await pool.query(
+      "SELECT 1 FROM audit_events WHERE action = 'approval.rejected' AND resource_id = $1", [deniedId]);
+    expect(rejectedAudit.rowCount).toBe(1);
     // Consumed: the call executes, then the sealed arguments are dropped.
     const call2 = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
       payload: { server_id: serverId, tool: "echo", arguments: { text: `ok-${tag}` }, caller: "summ-t",
@@ -1101,15 +1312,17 @@ describe("integration and security", () => {
   it("serves an overview with usage, spend, latency and queue totals", async () => {
     const runId = randomUUID();
     const prov = `ov-${tag}`;
-    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+    const price = await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
       payload: { provider: prov, model: "m", input_price_per_million: 1000000,
         output_price_per_million: 1000000 } });
+    expect(price.statusCode).toBe(201);
     const startedAt = new Date(Date.now() - 5000).toISOString();
+    const spanTs = afterPrice(price.json());
     await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: {
       events: [
         // Timestamp after the pricing row so the effective_from LATERAL
         // join resolves it; the `since` window below still includes it.
-        ev({ run_id: runId, event_type: "model.request", timestamp: new Date().toISOString(),
+        ev({ run_id: runId, event_type: "model.request", timestamp: spanTs,
           provider: prov, model: "m", input_tokens: 100, output_tokens: 10,
           usage_source: "provider_reported" }),
         ev({ run_id: runId, event_type: "run.completed", timestamp: new Date().toISOString() })
@@ -1136,12 +1349,13 @@ describe("integration and security", () => {
     // than measuring whatever earlier tests left behind: on a clean database
     // there is nothing to find, and the check would pass for the wrong reason.
     const prov = `proj-${tag}`;
-    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+    const price = await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
       payload: { provider: prov, model: "m", input_price_per_million: 1_000_000,
         output_price_per_million: 0 } });
+    expect(price.statusCode).toBe(201);
     await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: {
       events: [ ev({ run_id: randomUUID(), event_type: "model.request",
-        timestamp: new Date().toISOString(), provider: prov, model: "m",
+        timestamp: afterPrice(price.json()), provider: prov, model: "m",
         input_tokens: 500, output_tokens: 0, usage_source: "provider_reported" }) ] } });
 
     const ws = await api.inject({ method: "GET", url: "/v1/workspaces", headers: key });
@@ -1164,6 +1378,50 @@ describe("integration and security", () => {
     expect(row.remaining_micro).toBeLessThan(0);
   });
 
+  it("refuses a block project budget when unpriced usage makes spend unknown", async () => {
+    // A unique provider/model pair guarantees no pricing row, so this span's
+    // cost is unknown rather than zero.
+    const prov = `unpriced-${tag}`;
+    await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: {
+      events: [ ev({ run_id: randomUUID(), event_type: "model.request",
+        timestamp: new Date().toISOString(), provider: prov, model: "m",
+        input_tokens: 10, output_tokens: 0, usage_source: "provider_reported" }) ] } });
+
+    const ws = await api.inject({ method: "GET", url: "/v1/workspaces", headers: key });
+    const def = ws.json().items.find((w: { name: string }) => w.name === "default");
+    const limit = 1_000_000_000_000;
+    const b = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "project", ref_id: def.id, limit_micro: limit, effect: "block" } });
+    expect(b.statusCode).toBe(201);
+
+    const check = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+      payload: { budget_id: b.json().id, max_cost_micro: 1000 } });
+    expect(check.statusCode).toBe(409);
+    expect(check.json().error).toBe("budget_unknown_usage");
+    expect(check.json().unpriced_spans).toBeGreaterThan(0);
+    expect(check.json().spend_complete).toBe(false);
+
+    // The list must not present the remainder as spendable headroom.
+    const list = await api.inject({ method: "GET", url: "/v1/budgets?scope=project&limit=500", headers: key });
+    const row = list.json().items.find((x: { id: string }) => x.id === b.json().id);
+    expect(row.spend_complete).toBe(false);
+    expect(row.unpriced_spans).toBeGreaterThan(0);
+    expect(row.remaining_micro).toBeNull();
+
+    // A warn budget still reserves, but reports that its spend is incomplete.
+    const warn = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
+      payload: { scope: "project", ref_id: def.id, limit_micro: limit, effect: "warn" } });
+    expect(warn.statusCode).toBe(201);
+    const allowed = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
+      payload: { budget_id: warn.json().id, max_cost_micro: 1000 } });
+    expect(allowed.statusCode).toBe(200);
+    expect(allowed.json().spend_complete).toBe(false);
+    expect(allowed.json().warning).toMatch(/unpriced/);
+    const released = await api.inject({ method: "POST", url: "/v1/budgets/release", headers: key,
+      payload: { reservation_id: allowed.json().reservation_id } });
+    expect(released.statusCode).toBe(200);
+  });
+
   it("refuses a project budget that names no workspace", async () => {
     const res = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
       payload: { scope: "project", ref_id: randomUUID(), limit_micro: 1000 } });
@@ -1176,17 +1434,19 @@ describe("integration and security", () => {
     // SQL, so each one has to be executed, not just accepted as a parameter.
     const prov = `grp-${tag}`;
     const agentName = `grp-agent-${tag}`;
-    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+    const price = await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
       payload: { provider: prov, model: "m", input_price_per_million: 1_000_000,
         output_price_per_million: 0 } });
+    expect(price.statusCode).toBe(201);
     const runId = randomUUID();
+    const spanTs = afterPrice(price.json());
     await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key, payload: {
       events: [
         ev({ run_id: runId, agent_name: agentName, event_type: "model.request",
-          timestamp: new Date().toISOString(), provider: prov, model: "m",
+          timestamp: spanTs, provider: prov, model: "m",
           input_tokens: 500, output_tokens: 0, usage_source: "provider_reported" }),
         ev({ run_id: runId, agent_name: agentName, event_type: "run.completed",
-          timestamp: new Date().toISOString() })
+          timestamp: spanTs })
       ] } });
     const start = new Date(Date.now() - 3_600_000).toISOString();
     const end = new Date(Date.now() + 60_000).toISOString();
@@ -1356,16 +1616,22 @@ describe("integration and security", () => {
 
   it("keeps historical estimates on the price version in force at span time", async () => {
     const prov = `hist-${tag}`;
-    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+    const price = await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
       payload: { provider: prov, model: "m1", input_price_per_million: 1_000_000, output_price_per_million: 0 } });
+    expect(price.statusCode).toBe(201);
     const runId = randomUUID();
+    // The span is stamped just after the price version took effect, so the
+    // estimate is deterministic even when both land in the same millisecond.
+    const spanTs = afterPrice(price.json());
     await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
       payload: { events: [ev({ run_id: runId, provider: prov, model: "m1",
-        input_tokens: 1000, output_tokens: 0, timestamp: new Date().toISOString() })] } });
+        input_tokens: 1000, output_tokens: 0, timestamp: spanTs })] } });
     const before = await api.inject({ method: "GET", url: `/v1/runs/${runId}/usage`, headers: key });
     expect(before.json().estimated_cost_micro).toBe(1000);
     // A newer price must not rewrite history: estimates pin the price in
-    // force when the span ran, not the latest row on the price list.
+    // force when the span ran, not the latest row on the price list. Let the
+    // clock move past the span's timestamp before recording the new version.
+    await new Promise((resolve) => setTimeout(resolve, 20));
     await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
       payload: { provider: prov, model: "m1", input_price_per_million: 9_000_000, output_price_per_million: 0 } });
     const after = await api.inject({ method: "GET", url: `/v1/runs/${runId}/usage`, headers: key });
@@ -1515,14 +1781,15 @@ describe("integration and security", () => {
 
   it("bills cached tokens at the cached rate and never double", async () => {
     const prov = `cache-${tag}`;
-    await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
+    const price = await api.inject({ method: "POST", url: "/v1/pricing", headers: key,
       payload: { provider: prov, model: "m1", input_price_per_million: 1_000_000,
         output_price_per_million: 0, cached_input_price_per_million: 4_000_000 } });
+    expect(price.statusCode).toBe(201);
     const runId = randomUUID();
     await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
       payload: { events: [ev({ run_id: runId, provider: prov, model: "m1",
         input_tokens: 1000, output_tokens: 0, cached_tokens: 600,
-        timestamp: new Date().toISOString() })] } });
+        timestamp: afterPrice(price.json()) })] } });
     const usage = await api.inject({ method: "GET", url: `/v1/runs/${runId}/usage`, headers: key });
     expect(usage.statusCode).toBe(200);
     // 400 fresh input tokens * 1M/M + 600 cached * 4M/M = 400 + 2400 = 2800 micro.
@@ -1583,18 +1850,18 @@ describe("integration and security", () => {
     expect(rowFor(after.json())?.violations).toBeNull();
   });
 
-  it("releases an abandoned reservation instead of wedging the budget", async () => {
+  it("settles an abandoned reservation at the reserved maximum", async () => {
     const budget = await api.inject({ method: "POST", url: "/v1/budgets", headers: key,
-      payload: { scope: "run", ref_id: randomUUID(), limit_micro: 1000 } });
+      payload: { scope: "run", ref_id: randomUUID(), limit_micro: 2000 } });
     const budgetId = budget.json().id;
-    // Reserve the entire limit and abandon the hold: no settle, no release.
+    // Reserve half the limit and abandon the hold: no settle, no release.
     // This is what a caller dying mid-call leaves behind.
     const held = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
       payload: { budget_id: budgetId, max_cost_micro: 1000, ttl_seconds: 300 } });
     expect(held.statusCode).toBe(200);
     expect(new Date(held.json().expires_at).getTime()).toBeGreaterThan(Date.now());
     const whileHeld = await api.inject({ method: "POST", url: "/v1/budgets/check", headers: key,
-      payload: { budget_id: budgetId, max_cost_micro: 1 } });
+      payload: { budget_id: budgetId, max_cost_micro: 1001 } });
     expect(whileHeld.statusCode).toBe(409);
     // Age that hold past its TTL. Nothing else about the budget changes.
     await pool.query(
@@ -1607,12 +1874,13 @@ describe("integration and security", () => {
       "SELECT reserved_micro::float8 AS reserved, spent_micro::float8 AS spent FROM budgets WHERE id = $1",
       [budgetId]);
     expect(row.rows[0].reserved).toBe(1000); // the fresh hold only
-    expect(row.rows[0].spent).toBe(0);       // an unconfirmed call is not billed
-    const released = await pool.query(
-      "SELECT released_at FROM budget_reservations WHERE budget_id = $1 AND status = 'released'",
+    expect(row.rows[0].spent).toBe(1000);    // unknown usage settles at the hold
+    const settled = await pool.query(
+      "SELECT released_at, settle_reason FROM budget_reservations WHERE budget_id = $1 AND status = 'settled'",
       [budgetId]);
-    expect(released.rows.length).toBe(1);
-    expect(released.rows[0].released_at).not.toBeNull();
+    expect(settled.rows.length).toBe(1);
+    expect(settled.rows[0].released_at).not.toBeNull();
+    expect(settled.rows[0].settle_reason).toBe("timeout");
     const audited = await pool.query(
       `SELECT count(*)::int AS n FROM audit_events
         WHERE action = 'budget.reservation_expired' AND resource_id = $1`, [budgetId]);

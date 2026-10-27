@@ -232,7 +232,17 @@ function upstreamTimeoutMs(): number {
 export async function guardedFetch(url: string | URL, init?: RequestInit): Promise<Response> {
   const allowed = await checkUpstreamUrlResolved(String(url));
   if (!allowed.ok) throw new Error(`upstream refused: ${allowed.reason}`);
-  return fetch(url, { ...init, signal: AbortSignal.timeout(upstreamTimeoutMs()) });
+  // Do not let Node follow a redirect. The URL above was checked, but the
+  // redirect target was not; a public server could otherwise bounce the
+  // gateway into a private address or the cloud metadata endpoint after this
+  // check. Refuse the hop instead of trying to replay methods and bodies.
+  const res = await fetch(url, {
+    ...init, redirect: "manual", signal: AbortSignal.timeout(upstreamTimeoutMs())
+  });
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error(`upstream refused: redirect ${res.status}`);
+  }
+  return res;
 }
 
 function poolKey(baseUrl: string, authSecret: string | null): string {

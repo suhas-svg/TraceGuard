@@ -13,7 +13,7 @@ data:
   APPROVAL_CLAIM_LEASE_SECONDS: "30"
   # §10.2/FR-019: the gateway verifies operator-signed checkpoints but never
   # signs them. The private key stays on the operator host and is used by
-  # `npm run audit:checkpoint`; only the public key is mounted here.
+  # `pnpm audit:checkpoint`; only the public key is mounted here.
   AUDIT_CHECKPOINT_PUBLIC_KEY: ""
   ALLOW_PRIVATE_UPSTREAMS: "false"
   DASHBOARD_ORIGIN: "http://localhost:5173"
