@@ -54,6 +54,9 @@ services:
       DATABASE_URL: postgres://api_runtime:${API_DB_PASSWORD:-api_dev_pw}@postgres:5432/${POSTGRES_DB:-traceguard}
       DATABASE_URL_RETENTION: postgres://retention_job:${RETENTION_DB_PASSWORD:-retention_dev_pw}@postgres:5432/${POSTGRES_DB:-traceguard}
       API_KEY: ${API_KEY:-dev_key_change_me}
+      # The dashboard exchanges the approver key for a session on the API
+      # listener too; without it here the approver half of the connect fails.
+      APPROVER_KEY: ${APPROVER_KEY:-dev_approver_change_me}
       PORT: 8080
     ports:
       - "8090:8080" # 8080 is taken on some dev machines, public side stays off it

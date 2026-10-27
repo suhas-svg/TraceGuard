@@ -8,7 +8,7 @@ variable, which is how the compose file reads them.
 | POSTGRES_USER / PASSWORD / DB | postgres | traceguard / dev only | change the password outside local dev |
 | DATABASE_URL | api, gateway | local postgres | both processes share one database |
 | API_KEY | api, gateway | dev_key_change_me | agent and dashboard credential |
-| APPROVER_KEY | gateway | dev_approver_change_me | human approval decisions only |
+| APPROVER_KEY | api, gateway | dev_approver_change_me | human approval decisions only; the api needs it to exchange a dashboard approver key for a session |
 | APPROVAL_ARGS_KEY | gateway | (required, no default) | 32 bytes hex sealing pending approval arguments; generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
 | APPROVAL_ARGS_KEY_PREVIOUS | gateway | (optional) | previous key kept during rotation until old rows expire |
 | GATEWAY_PORT | gateway | 8091 | agent-facing listener |

@@ -51,6 +51,10 @@ spec:
               value: postgres://retention_job:$(RETENTION_DB_PASSWORD)@postgres:5432/traceguard
             - name: API_KEY
               valueFrom: { secretKeyRef: { name: traceguard-secrets, key: API_KEY } }
+            # The dashboard exchanges the approver key for a session on the API
+            # listener too; empty keeps the dev fallback.
+            - name: APPROVER_KEY
+              valueFrom: { secretKeyRef: { name: traceguard-secrets, key: APPROVER_KEY } }
             - name: PORT
               valueFrom: { configMapKeyRef: { name: traceguard-config, key: PORT } }
             - name: DASHBOARD_ORIGIN
