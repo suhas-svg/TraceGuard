@@ -30,7 +30,10 @@
   by trigger), hash-chained, and verifiable through `POST /v1/audit/verify`;
   a detected mutation means a database owner disabled the guard. Verification
   requires a global principal because the chain spans workspaces and a partial
-  chain cannot be verified without exposing another tenant's hashes.
+  chain cannot be verified without exposing another tenant's hashes. It walks
+  the recorded hash links rather than the `(timestamp, id)` read order, because
+  timestamps have millisecond precision and two appends in the same millisecond
+  would otherwise be judged by a random event id.
 - Access tokens are validated as JWTs against the configured issuer's keys
   when OAuth is on (`OAUTH_ISSUER` + `OAUTH_AUDIENCE` + a JWKS source): the
   algorithm is pinned to EdDSA / RS256 / ES256, the issuer, audience,

@@ -21,7 +21,7 @@ import { createPublicKey } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { Pool, type PoolClient } from "pg";
 import {
-  appendAuditEvent, checkpointKeyId, signCheckpoint, verifyAuditChain,
+  appendAuditEvent, checkpointKeyId, orderAuditChain, signCheckpoint, verifyAuditChain,
   verifyCheckpoint, type AuditRow, type CheckpointPayload, type CheckpointPayloadV3,
   type VerifyOptions
 } from "@traceguard/audit-chain";
@@ -154,8 +154,17 @@ async function create(): Promise<void> {
       `${SELECT_EVENTS} WHERE (timestamp, id) <= ($1, $2) ORDER BY timestamp ASC, id ASC`,
       [cutoff.rows[0].timestamp, cutoff.rows[0].id]
     );
-    const events = rows.rows;
     const anchor = await loadAnchor(client);
+    // (timestamp, id) is ambiguous when two appends share a millisecond. Follow
+    // the hash links so the signed segment is the real chain prefix instead of
+    // an id-order guess.
+    const events = orderAuditChain(rows.rows, anchor?.up_to_hash ?? "");
+    const tail = events[events.length - 1];
+    if (!tail || tail.id !== cutoff.rows[0].id) {
+      throw new Error(
+        "cutoff is ambiguous: another event shares its timestamp and follows it in the chain; choose a later cutoff"
+      );
+    }
     const privatePem = privateKey();
     const publicPem = createPublicKey(privatePem)
       .export({ type: "spki", format: "pem" })
@@ -349,6 +358,9 @@ async function prune(): Promise<void> {
     }
 
     const anchor = await loadAnchor(client);
+    // Both sides are read in (timestamp, id) order, which is ambiguous under a
+    // millisecond tie. Put them back in chain order before comparing.
+    const artifactEvents = orderAuditChain(doc.events, anchor?.up_to_hash ?? "");
     if (anchor) {
       // The database's claimed anchor is only meaningful if the prior
       // checkpoint signature verifies with the operator key.
@@ -360,11 +372,11 @@ async function prune(): Promise<void> {
       if (!verifyCheckpoint(anchor.payload, anchor.signature, pem)) {
         throw new Error("latest pruned checkpoint signature does not verify");
       }
-      if (doc.events[0]?.prev_hash !== anchor.up_to_hash) {
+      if (artifactEvents[0]?.prev_hash !== anchor.up_to_hash) {
         throw new Error("artifact does not link to the latest pruned checkpoint");
       }
     }
-    const verification = verifyAuditChain(doc.events, verifyOptions(anchor, doc.events));
+    const verification = verifyAuditChain(artifactEvents, verifyOptions(anchor, artifactEvents));
     if (!verification.ok) {
       throw new Error(`artifact chain does not verify: ${verification.problems[0]?.problem}`);
     }
@@ -376,12 +388,13 @@ async function prune(): Promise<void> {
       `${SELECT_EVENTS} WHERE (timestamp, id) <= ($1, $2) ORDER BY timestamp ASC, id ASC`,
       [cp.payload.up_to_timestamp, cp.payload.up_to_event_id]
     );
-    if (dbRows.rows.length !== doc.events.length) {
-      throw new Error(`database prefix has ${dbRows.rows.length} events; artifact has ${doc.events.length}`);
+    const dbPrefix = orderAuditChain(dbRows.rows, anchor?.up_to_hash ?? "");
+    if (dbPrefix.length !== artifactEvents.length) {
+      throw new Error(`database prefix has ${dbPrefix.length} events; artifact has ${artifactEvents.length}`);
     }
-    for (let i = 0; i < dbRows.rows.length; i += 1) {
-      const db = dbRows.rows[i];
-      const exported = doc.events[i];
+    for (let i = 0; i < dbPrefix.length; i += 1) {
+      const db = dbPrefix[i];
+      const exported = artifactEvents[i];
       if (db.id !== exported.id || db.hash !== exported.hash || Number(db.seq) !== Number(exported.seq)) {
         throw new Error(`database event ${i} does not match the signed artifact`);
       }

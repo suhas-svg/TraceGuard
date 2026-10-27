@@ -20,7 +20,7 @@
 //   pnpm audit:verify -- --export export.json --public-key checkpoint.pub.pem
 import { readFileSync } from "node:fs";
 import {
-  verifyAuditChain, verifyCheckpoint, checkpointKeyId,
+  orderAuditChain, verifyAuditChain, verifyCheckpoint, checkpointKeyId,
   type AuditRow, type CheckpointPayload, type CheckpointSegment
 } from "@traceguard/audit-chain";
 
@@ -63,7 +63,10 @@ try {
   process.exit(2);
 }
 const checkpoint = doc.checkpoint;
-const events = Array.isArray(doc.events) ? doc.events : [];
+// The export is written in (timestamp, id) order, which is ambiguous when two
+// appends share a millisecond. Restore the order the hash links define before
+// any check reads a "first" or "last" event.
+const events = orderAuditChain(Array.isArray(doc.events) ? doc.events : []);
 if (!checkpoint || typeof checkpoint !== "object") {
   console.error("export carries no checkpoint object");
   process.exit(2);

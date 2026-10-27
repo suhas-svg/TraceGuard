@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { canonicalize } from "@traceguard/canonical-json";
 import {
   auditHash, auditHashFor, auditHashV2, auditHashV3, auditHashV4, canonicalEventFields,
-  checkpointKeyId, signCheckpoint, stableStringify, verifyAuditChain,
+  checkpointKeyId, orderAuditChain, signCheckpoint, stableStringify, verifyAuditChain,
   verifyCheckpoint, HASH_VERSION_CANONICAL, HASH_VERSION_EVENT, HASH_VERSION_PROJECT,
   type AuditRow, type CheckpointPayload
 } from "../src/index.js";
@@ -142,6 +142,49 @@ describe("audit chain", () => {
     const rows = chain().reverse();
     const result = verifyAuditChain(rows);
     expect(result.ok).toBe(false);
+  });
+
+  // Appends share a millisecond under load; the id is random, so reading by
+  // (timestamp, id) can invert a pair the hash links put in order.
+  it("restores chain order when two appends share a millisecond", () => {
+    const firstContent = { ...base, metadata: { version: 1 } };
+    const secondContent = { ...base, actor_id: "user-2", resource_id: "pv-2", metadata: { version: 2 } };
+    const first: AuditRow = {
+      id: "11111111-1111-1111-1111-111111111111",
+      timestamp: ts1,
+      ...base,
+      metadata: { version: 1 },
+      prev_hash: "",
+      hash: auditHash("", ts1, firstContent)
+    };
+    const second: AuditRow = {
+      id: "22222222-2222-2222-2222-222222222222",
+      timestamp: ts1,
+      ...base,
+      actor_id: "user-2",
+      resource_id: "pv-2",
+      metadata: { version: 2 },
+      prev_hash: first.hash,
+      hash: auditHash(first.hash, ts1, secondContent)
+    };
+    expect(verifyAuditChain([second, first]).ok).toBe(false);
+    const ordered = orderAuditChain([second, first]);
+    expect(ordered.map((row) => row.id)).toEqual([first.id, second.id]);
+    expect(verifyAuditChain(ordered).ok).toBe(true);
+  });
+
+  it("leaves a fork in caller order so the verifier still reports it", () => {
+    const rows = chain();
+    const forkContent = { ...base, actor_id: "user-2", resource_id: "pv-2", metadata: { version: 3 } };
+    const fork: AuditRow = {
+      ...rows[1],
+      id: "33333333-3333-3333-3333-333333333333",
+      metadata: { version: 3 },
+      hash: auditHash(rows[0].hash, ts2, forkContent)
+    };
+    const ordered = orderAuditChain([rows[0], rows[1], fork]);
+    expect(ordered).toHaveLength(3);
+    expect(verifyAuditChain(ordered).ok).toBe(false);
   });
 
   it("is order-independent over metadata keys", () => {

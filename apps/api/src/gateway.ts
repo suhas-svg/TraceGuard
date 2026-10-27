@@ -6,7 +6,7 @@ import type { Pool, PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit, type AuditEntry } from "./audit.js";
 import { projectAllowed, projectClause } from "./project-scope.js";
-import { verifyAuditChain, verifyCheckpoint, type CheckpointPayload } from "@traceguard/audit-chain";
+import { orderAuditChain, verifyAuditChain, verifyCheckpoint, type CheckpointPayload } from "@traceguard/audit-chain";
 import {
   argsHash,
   evaluate,
@@ -1379,8 +1379,12 @@ export function buildGateway() {
       [limit + 1]
     );
     const truncated = res.rows.length > limit;
-    const rows = res.rows.slice(0, limit) as Parameters<typeof verifyAuditChain>[0];
-    let verification = verifyAuditChain(rows);
+    // The query returns (timestamp, id) order, but millisecond ties make that
+    // order ambiguous: two appends can share a timestamp and the random event
+    // id decides which one sorts first. Follow the hash links instead, so a
+    // healthy chain is never reported as broken.
+    const ordered = orderAuditChain(res.rows.slice(0, limit) as Parameters<typeof verifyAuditChain>[0]);
+    let verification = verifyAuditChain(ordered);
     // Â§10.3: a chain whose first link is broken is only trustworthy if the
     // missing prefix is covered by a signed checkpoint held outside the
     // database. Verify that anchor before calling the gap corruption. The
@@ -1389,19 +1393,19 @@ export function buildGateway() {
     let anchored: { checkpoint_id: string; up_to_timestamp: string; up_to_hash: string; event_count: number } | null = null;
     const first = verification.problems[0];
     const checkpointPublicKey = process.env.AUDIT_CHECKPOINT_PUBLIC_KEY;
-    if (first && rows.length > 0 && first.id === rows[0].id
+    if (first && ordered.length > 0 && first.id === ordered[0].id
         && first.problem.startsWith("chain link broken") && checkpointPublicKey
-        && typeof rows[0].prev_hash === "string" && rows[0].prev_hash.length > 0) {
+        && typeof ordered[0].prev_hash === "string" && ordered[0].prev_hash.length > 0) {
       const cp = await pool.query(
         `SELECT id, up_to_timestamp, up_to_hash, event_count, payload, signature FROM audit_checkpoints
           WHERE up_to_hash = $1 AND up_to_timestamp <= $2
           ORDER BY created_at DESC LIMIT 1`,
-        [rows[0].prev_hash, rows[0].timestamp]
+        [ordered[0].prev_hash, ordered[0].timestamp]
       );
       if (cp.rows[0] && verifyCheckpoint(cp.rows[0].payload as CheckpointPayload, cp.rows[0].signature, checkpointPublicKey)) {
         const payload = cp.rows[0].payload as CheckpointPayload;
         const expectedSequences = "segments" in payload ? payload.segments : [];
-        const rechecked = verifyAuditChain(rows, {
+        const rechecked = verifyAuditChain(ordered, {
           anchorHash: cp.rows[0].up_to_hash,
           expectedSequences
         });
@@ -1423,9 +1427,9 @@ export function buildGateway() {
     return {
       ...verification,
       truncated,
-      empty: rows.length === 0,
-      complete: verification.ok && rows.length > 0 && !truncated && !anchored,
-      checked_to: rows.length > 0 ? rows[rows.length - 1].hash : null,
+      empty: ordered.length === 0,
+      complete: verification.ok && ordered.length > 0 && !truncated && !anchored,
+      checked_to: ordered.length > 0 ? ordered[ordered.length - 1].hash : null,
       anchored
     };
   });
