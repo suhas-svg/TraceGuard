@@ -331,12 +331,63 @@ function workspaceKey(workspaceId: string | null | undefined): string {
   return workspaceId ?? "";
 }
 
-// Recomputes every event hash and checks every link. Rows must be ordered by
-// (timestamp, id) — the order the appender cites. Each row is verified with
-// the formula its hash_version names, so a chain that spans v1 → v2 → v3 still
-// verifies end to end. v3 hashes cover the event ID and per-workspace
-// sequence; sequence continuity and gaps are reported separately so a missing
-// range can never hide behind an otherwise intact hash chain.
+export interface ChainOrderRow {
+  id: string;
+  prev_hash: string;
+  hash: string;
+}
+
+// Reads sort audit rows by (timestamp, id) because that is the only order the
+// table exposes. Timestamps have millisecond precision, so two appends can
+// share one; the random event id then says nothing about append order and the
+// pair can come back reversed. The hash links do encode the true order, so
+// callers that read a segment should put it back in chain order before
+// verifying. Rows that do not form one linked segment (no unique root, or a
+// fork) are returned unchanged: the verifier must report the damage rather
+// than have this helper guess a plausible order.
+export function orderAuditChain<T extends ChainOrderRow>(rows: readonly T[], anchorHash = ""): T[] {
+  if (rows.length < 2) return [...rows];
+  const byPrev = new Map<string, T[]>();
+  for (const row of rows) {
+    const bucket = byPrev.get(row.prev_hash);
+    if (bucket) bucket.push(row);
+    else byPrev.set(row.prev_hash, [row]);
+  }
+  let start: T | undefined;
+  if (anchorHash) {
+    const anchored = byPrev.get(anchorHash) ?? [];
+    if (anchored.length !== 1) return [...rows];
+    start = anchored[0];
+  } else {
+    const hashes = new Set(rows.map((row) => row.hash));
+    const roots = rows.filter((row) => !hashes.has(row.prev_hash));
+    if (roots.length !== 1) return [...rows];
+    start = roots[0];
+  }
+  const ordered: T[] = [];
+  const used = new Set<T>();
+  let current: T | undefined = start;
+  while (current && !used.has(current)) {
+    ordered.push(current);
+    used.add(current);
+    const bucket = byPrev.get(current.hash);
+    current = bucket?.find((row) => !used.has(row));
+  }
+  // Unreachable rows keep their caller order at the end so they are still
+  // verified and reported instead of being dropped.
+  for (const row of rows) {
+    if (!used.has(row)) ordered.push(row);
+  }
+  return ordered;
+}
+
+// Recomputes every event hash and checks every link. Rows must be in chain
+// order; when they were read by (timestamp, id), pass them through
+// `orderAuditChain` first. Each row is verified with the formula its
+// hash_version names, so a chain that spans v1 → v2 → v3 still verifies end to
+// end. v3 hashes cover the event ID and per-workspace sequence; sequence
+// continuity and gaps are reported separately so a missing range can never
+// hide behind an otherwise intact hash chain.
 export function verifyAuditChain(rows: AuditRow[], opts: VerifyOptions = {}): ChainVerification {
   const problems: ChainProblem[] = [];
   const gaps: ChainGap[] = [];
