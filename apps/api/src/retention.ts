@@ -107,7 +107,7 @@ export function registerRetentionRoutes(app: FastifyInstance) {
     older_than_days: z.number().int().min(1).max(3650),
     max_rows: z.number().int().min(1).max(1_000_000_000).nullable().optional(),
     enabled: z.boolean().default(true),
-    workspace_id: z.string().uuid().optional()
+    workspace_id: z.string().guid().optional()
   });
 
   // Retention rules delete whole traces and are workspace-scoped. A

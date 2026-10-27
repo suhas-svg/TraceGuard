@@ -27,7 +27,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
     // §7.3/§7.4: a reference only. The credential itself must never arrive
     // here, be stored in the database, or be returned by the API.
     secret_ref: z.string().max(512).nullable().optional(),
-    project_id: z.string().uuid().optional()
+    project_id: z.string().guid().optional()
   });
 
   app.post("/v1/servers", async (req, reply) => {
@@ -503,7 +503,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
   });
 
   app.post("/v1/tool-pins/:id/submit-review", async (req, reply) => {
-    const parsedId = z.string().uuid().safeParse((req.params as { id: string }).id);
+    const parsedId = z.string().guid().safeParse((req.params as { id: string }).id);
     if (!parsedId.success) return reply.code(400).send({ error: "invalid_pin" });
     const client = await pool.connect();
     try {
@@ -599,7 +599,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
   });
 
   app.post("/v1/tool-pin-candidates/:id/approve-for-publication", async (req, reply) => {
-    const parsedId = z.string().uuid().safeParse((req.params as { id: string }).id);
+    const parsedId = z.string().guid().safeParse((req.params as { id: string }).id);
     if (!parsedId.success) return reply.code(400).send({ error: "invalid_pin" });
     const client = await pool.connect();
     try {
@@ -651,14 +651,14 @@ export function registerAdminRoutes(app: FastifyInstance): void {
     name: z.string().min(1).max(128),
     enabled: z.boolean().default(true),
     priority: z.number().int().default(0),
-    agent_id: z.string().uuid().nullable().optional(),
-    server_id: z.string().uuid().nullable().optional(),
+    agent_id: z.string().guid().nullable().optional(),
+    server_id: z.string().guid().nullable().optional(),
     tool_name: z.string().max(128).nullable().optional(),
     effect: z.enum(["allow", "deny", "require_approval"]),
     // The typed condition shape, not a free record: an unsupported pattern is
     // refused here rather than at bundle load (T8).
     conditions: argConditionsSchema.default({ required: [] }),
-    project_id: z.string().uuid().optional()
+    project_id: z.string().guid().optional()
   }).superRefine((rule, ctx) => {
     // FR-010: a path constraint needs a scoped target so the pinned executor
     // attestation can be checked at publish and at call time.

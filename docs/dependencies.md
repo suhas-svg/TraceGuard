@@ -63,7 +63,7 @@ Dependabot PRs are reviewed like any other change: check the changelog for
 license changes, confirm the SBOM diff, and merge only when every required check
 is green.
 
-## Current snapshot (2026-10-23)
+## Current snapshot (2026-10-27)
 
 `pnpm run deps:check` against the installed workspace:
 
@@ -82,22 +82,10 @@ Development warnings (not shipped): 1
   caniuse-lite@1.0.30001819 — CC-BY-4.0 — not-in-allowlist
 ```
 
-`pnpm run deps:advisories` reports **1 accepted, 0 blocking** at this
-revision:
+`pnpm run deps:advisories` reports **0 accepted, 0 blocking** at this
+revision. The zod 3 time-box for GHSA-mrhx-c7xc-m3w5 was retired by moving the
+workspace to `zod@4.6.7` and `@modelcontextprotocol/sdk@1.32.2`; the accept
+list in `scripts/advisory-audit.mjs` is now empty.
 
-```
-accepted GHSA-mrhx-c7xc-m3w5 zod
-  reason:  memory exhaustion while validating oversized constrained
-           collections; every zod-validated request body is size-capped
-           before parsing (Fastify bodyLimit, otlpLimits().maxBodyBytes on
-           /v1/traces) and every array schema carries an explicit .max()
-           bound, so no unbounded collection reaches zod
-  revisit: migrate the workspace to zod >= 4.6.6;
-           @modelcontextprotocol/sdk >= 1.32.2 already accepts zod 4
-           as a peer
-```
-
-The advisory has no patched 3.x release, so the time-boxed exception is the
-only option short of a zod 4 migration. Re-run both commands when the lockfile
-changes; the snapshot here is evidence for the review, not a substitute for
-the gates.
+Re-run both commands when the lockfile changes; the snapshot here is evidence
+for the review, not a substitute for the gates.

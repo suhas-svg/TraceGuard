@@ -1,18 +1,24 @@
 import { z } from "zod";
 
+// Identifier fields use .guid(), not .uuid(). zod 4 tightened .uuid() to the
+// RFC 9562 version and variant nibbles; zod 3 accepted any 8-4-4-4-12 hex
+// GUID, which is also what the Postgres uuid type stores. Keeping .guid()
+// means the upgrade does not reject identifiers that parsed before, including
+// legacy signed bundles and agent-supplied telemetry.
+
 // Single parse boundary. API and SDK validate here, interior trusts the type.
 export const eventEnvelopeSchema = z.object({
   schema_version: z.literal("1"),
   event_id: z.string().min(1).max(128),
-  workspace_id: z.string().uuid().optional(),
+  workspace_id: z.string().guid().optional(),
   workspace_name: z.string().min(1).max(128).optional(),
-  project_id: z.string().uuid().optional(),
+  project_id: z.string().guid().optional(),
   project_name: z.string().min(1).max(128).optional(),
-  agent_id: z.string().uuid().optional(),
+  agent_id: z.string().guid().optional(),
   agent_name: z.string().min(1).max(128).optional(),
-  run_id: z.string().uuid(),
-  span_id: z.string().uuid(),
-  parent_span_id: z.string().uuid().nullable().optional(),
+  run_id: z.string().guid(),
+  span_id: z.string().guid(),
+  parent_span_id: z.string().guid().nullable().optional(),
   event_type: z.enum([
     "run.started",
     "run.completed",
@@ -31,7 +37,7 @@ export const eventEnvelopeSchema = z.object({
   cached_tokens: z.number().int().min(0).nullable().optional(),
   usage_source: z.enum(["provider_reported", "estimated", "unavailable"]).nullable().optional(),
   error_type: z.string().max(128).nullable().optional(),
-  attributes: z.record(z.unknown()).default({})
+  attributes: z.record(z.string(), z.unknown()).default({})
 });
 
 export type EventEnvelope = z.infer<typeof eventEnvelopeSchema>;
@@ -94,7 +100,7 @@ export const fieldConstraintSchema = z.object({
   path_within: z.string().min(1).max(4096).optional(),
   // §8.4 / FR-010: a full JSON Schema the argument must satisfy, in addition
   // to the fixed operators above. Checked for safe shapes at bundle load.
-  schema: z.record(z.unknown()).optional(),
+  schema: z.record(z.string(), z.unknown()).optional(),
   regex: regexSchema.optional(),
   enum: z.array(z.unknown()).max(256).optional(),
   max_length: z.number().int().min(0).max(1_000_000).optional()
@@ -104,7 +110,7 @@ export const fieldConstraintSchema = z.object({
 // only when a bundle carrying it is loaded (fail-closed, but late is worse).
 export const argConditionsSchema = z.object({
   required: z.array(z.string().min(1).max(128)).max(128).default([]),
-  arguments: z.record(fieldConstraintSchema).optional()
+  arguments: z.record(z.string(), fieldConstraintSchema).optional()
 }).strict();
 
 // FR-010 / §16.3 T9: a path constraint is only accepted when the executor
@@ -128,15 +134,17 @@ export function hasPathWithin(conditions: ConditionsShape): boolean {
 }
 
 export const bundleRuleSchema = z.object({
-  id: z.string().uuid(),
+  id: z.string().guid(),
   name: z.string().min(1).max(128),
   enabled: z.boolean(),
   priority: z.number().int().min(-1_000_000).max(1_000_000),
-  agent_id: z.string().uuid().nullable(),
-  server_id: z.string().uuid().nullable(),
+  agent_id: z.string().guid().nullable(),
+  server_id: z.string().guid().nullable(),
   tool_name: z.string().min(1).max(128).nullable(),
   effect: z.enum(["allow", "deny", "require_approval"]),
-  conditions: argConditionsSchema.default({})
+  // prefault, not default: zod 4 types default() against the output type, and
+  // prefault still parses the empty input so `required` keeps its [] default.
+  conditions: argConditionsSchema.prefault({})
 }).strict().superRefine((rule, ctx) => {
   if (hasPathWithin(rule.conditions) && (!rule.server_id || !rule.tool_name)) {
     ctx.addIssue({
@@ -148,7 +156,7 @@ export const bundleRuleSchema = z.object({
 });
 
 export const bundleServerSchema = z.object({
-  server_id: z.string().uuid(),
+  server_id: z.string().guid(),
   alias: z.string().min(1).max(64).regex(/^[a-z0-9_]+$/),
   base_url: z.string().url(),
   // Only the reference is signed; the credential value never enters the
@@ -159,10 +167,10 @@ export const bundleServerSchema = z.object({
 }).strict();
 
 export const bundlePinSchema = z.object({
-  server_id: z.string().uuid(),
+  server_id: z.string().guid(),
   tool_name: z.string().min(1).max(128),
   // Absent only in legacy v1 bundles. New bundles always carry both.
-  pin_id: z.string().uuid().optional(),
+  pin_id: z.string().guid().optional(),
   pin_version: z.number().int().positive().optional(),
   definition_hash: z.string().regex(/^[0-9a-f]{64}$/)
 }).strict().superRefine((pin, ctx) => {
@@ -177,10 +185,10 @@ export const bundlePinSchema = z.object({
 export const policyBundleSchema = z.object({
   bundle_version: z.union([z.literal(LEGACY_BUNDLE_VERSION), z.literal(BUNDLE_VERSION)]),
   protocol_profile: z.literal(PROTOCOL_PROFILE),
-  workspace_id: z.string().uuid(),
+  workspace_id: z.string().guid(),
   // Legacy bundles predate project-scoped publication. New bundles always
   // carry it; the gateway only accepts a legacy bundle for the default project.
-  project_id: z.string().uuid().optional(),
+  project_id: z.string().guid().optional(),
   version: z.number().int().positive(),
   previous_version_hash: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
   rules: z.array(bundleRuleSchema).max(500),

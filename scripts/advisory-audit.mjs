@@ -9,19 +9,8 @@
 import { spawnSync } from "node:child_process";
 
 const ACCEPTED = [
-  {
-    ghsa: "GHSA-mrhx-c7xc-m3w5",
-    package: "zod",
-    reason:
-      "memory exhaustion while validating oversized collections; every " +
-      "zod-validated request body is size-capped before parsing (Fastify " +
-      "bodyLimit, otlpLimits().maxBodyBytes on /v1/traces) and every array " +
-      "schema carries an explicit .max() bound, so no unbounded collection " +
-      "reaches zod",
-    revisit:
-      "migrate the workspace to zod >= 4.6.6; @modelcontextprotocol/sdk " +
-      ">= 1.32.2 already accepts zod 4 as a peer"
-  }
+  // Empty: the zod 3 time-box (GHSA-mrhx-c7xc-m3w5) was retired by the zod
+  // 4.6.7 migration. New entries need a reason and a revisit condition.
 ];
 
 const pnpm = "pnpm";

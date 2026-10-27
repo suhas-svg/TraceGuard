@@ -22,4 +22,4 @@ What this build actually supports, and what it does not. Everything listed as
 | OTLP/gRPC | Not supported directly | A Collector can translate to the OTLP/HTTP endpoint. |
 | OpenTelemetry GenAI attributes | Best-effort mapping | A documented subset maps to columns; unknown attributes are bounded in count and length and never treated as security inputs. Stored spans carry `received_at`, `clock_skew` (future-dated starts or negative durations), and `parent_state` (`resolved`, `unresolved`, later `orphaned`). |
 | Provider token usage | Supported when present | Missing usage or unknown price yields `NULL`, never zero. |
-| @modelcontextprotocol/sdk | `^1.32.1` | Used as the upstream client only; the agent-facing surface is implemented in `apps/api/src/mcp.ts`, not by the SDK server classes. The installed version is pinned in the lockfile and exercised by the protocol tests. |
+| @modelcontextprotocol/sdk | `^1.32.2` | Used as the upstream client only; the agent-facing surface is implemented in `apps/api/src/mcp.ts`, not by the SDK server classes. The installed version is pinned in the lockfile and exercised by the protocol tests. |

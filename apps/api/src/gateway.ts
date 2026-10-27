@@ -252,20 +252,20 @@ export function buildGateway() {
 
 
   const callSchema = z.object({
-    server_id: z.string().uuid(),
+    server_id: z.string().guid(),
     tool: z.string().min(1).max(128),
-    arguments: z.record(z.unknown()).default({}),
+    arguments: z.record(z.string(), z.unknown()).default({}),
     agent_name: z.string().max(128).optional(),
     caller: z.string().max(128).optional(),
     request_id: z.string().max(128).optional(),
-    approval_id: z.string().uuid().optional(),
+    approval_id: z.string().guid().optional(),
     // Attribution the caller supplies, like `caller` itself; see
     // docs/security.md for what that does and does not prove.
-    agent_id: z.string().uuid().optional(),
+    agent_id: z.string().guid().optional(),
     // When a run is named, the gateway writes its own denials into that run's
     // trace, so denied calls show up next to failed ones (FR-005).
-    run_id: z.string().uuid().optional(),
-    span_id: z.string().uuid().optional()
+    run_id: z.string().guid().optional(),
+    span_id: z.string().guid().optional()
   });
 
   // A blocked call still belongs in the run trace: one span with the denied
@@ -1326,7 +1326,7 @@ export function buildGateway() {
       }
       const [timestamp, id] = decoded.split("|");
       if (!timestamp || !id || Number.isNaN(Date.parse(timestamp))
-          || !z.string().uuid().safeParse(id).success) {
+          || !z.string().guid().safeParse(id).success) {
         return reply.code(400).send({ error: "invalid_cursor" });
       }
       params.push(timestamp);

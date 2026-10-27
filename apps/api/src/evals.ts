@@ -244,13 +244,13 @@ export function registerEvalRoutes(app: FastifyInstance) {
 
   const caseSchema = z.object({
     name: z.string().min(1).max(128),
-    input_payload: z.record(z.unknown()).default({}),
+    input_payload: z.record(z.string(), z.unknown()).default({}),
     // Any JSON, not just an object: the replay below turns a string expected
     // value into the scripted output, and a record-only schema made that
     // documented path unreachable through the API.
     expected: z.unknown().default({}),
-    assertions: z.array(z.record(z.unknown())).default([]),
-    exec_config: z.record(z.unknown()).default({})
+    assertions: z.array(z.record(z.string(), z.unknown())).default([]),
+    exec_config: z.record(z.string(), z.unknown()).default({})
   });
 
   app.post("/v1/evaluations/suites/:id/cases", async (req, reply) => {
@@ -300,7 +300,7 @@ export function registerEvalRoutes(app: FastifyInstance) {
     cost_cap_micro: z.number().int().min(0).default(0),
     // Per-run behavior overrides keyed by case name. This is what makes two
     // versions comparable on one locked dataset: same cases, different code.
-    exec_overrides: z.record(z.record(z.unknown())).default({}),
+    exec_overrides: z.record(z.string(), z.record(z.string(), z.unknown())).default({}),
     // FR-021: a case executes through a registered adapter. The scripted one
     // replays the case's declared behavior; the http one runs it against a
     // live endpoint.
