@@ -4,7 +4,7 @@ import type { Pool, PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
 import { scopeClause, workspaceAllowed } from "./auth.js";
-import { ensureDefaultProject, projectAllowed } from "./project-scope.js";
+import { ensureDefaultProject, projectAllowed, projectClause } from "./project-scope.js";
 import { notify } from "./notify.js";
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
@@ -14,28 +14,37 @@ async function defaultWorkspaceId(client: PoolClient): Promise<string> {
   return created.rows[0].id;
 }
 
-// Releases every hold whose TTL has passed and returns the micro-dollars
-// freed. One statement, so the reservation flip and the counter decrement
+// Settles every hold whose TTL has passed at its reserved maximum. The spec
+// treats an abandoned reservation as unknown usage, so the conservative
+// amount is charged instead of silently returning the headroom to the caller.
+// One statement, so the reservation flip, ledger entry, and counter update
 // cannot be split by a crash, and re-running it finds nothing left to do.
-// Without this, an abandoned hold (a caller that died between reserve and
-// settle) keeps its worst case reserved forever: the budget then 409s with
-// spent_micro at zero and nothing on the API can recover it.
 async function sweepExpiredHolds(
   client: Pool | PoolClient, budgetId: string
 ): Promise<number> {
   const r = await client.query(
     `WITH expired AS (
-       UPDATE budget_reservations SET status='released', released_at=now(), settle_reason='timeout'
+       UPDATE budget_reservations
+          SET status='settled', released_at=now(), settle_reason='timeout'
         WHERE budget_id=$1 AND status='held' AND expires_at < now()
-        RETURNING amount_micro
+        RETURNING id, amount_micro
+     ), total AS (
+       SELECT COALESCE(SUM(amount_micro),0)::bigint AS amount FROM expired
+     ), ledger AS (
+       INSERT INTO budget_ledger (budget_id, amount_micro, reservation_id)
+       SELECT $1, amount_micro, id FROM expired
+     ), updated AS (
+       UPDATE budgets
+          SET reserved_micro = GREATEST(0, reserved_micro - total.amount),
+              spent_micro = spent_micro + total.amount,
+              updated_at = now()
+         FROM total WHERE budgets.id=$1
+         RETURNING total.amount AS settled
      )
-     UPDATE budgets
-        SET reserved_micro = GREATEST(0, reserved_micro - COALESCE((SELECT SUM(amount_micro) FROM expired),0))
-      WHERE id=$1
-      RETURNING COALESCE((SELECT SUM(amount_micro) FROM expired),0)::bigint AS freed`,
+     SELECT COALESCE((SELECT settled FROM updated),0)::bigint AS settled`,
     [budgetId]
   );
-  return Number(r.rows[0]?.freed ?? 0);
+  return Number(r.rows[0]?.settled ?? 0);
 }
 
 // §12.3: the per-budget reclaim above runs lazily, only when that budget is
@@ -43,18 +52,18 @@ async function sweepExpiredHolds(
 // sit there forever; this sweep recovers every budget with an expired hold.
 export async function sweepAllExpiredHolds(
   db: Pool | PoolClient
-): Promise<{ freed_micro: number; budgets: number }> {
+): Promise<{ settled_micro: number; budgets: number }> {
   const ids = await db.query(
     "SELECT DISTINCT budget_id FROM budget_reservations WHERE status='held' AND expires_at < now()"
   );
-  let freed = 0;
+  let settled = 0;
   let budgets = 0;
   for (const row of ids.rows) {
     const got = await sweepExpiredHolds(db, String(row.budget_id));
     if (got > 0) budgets += 1;
-    freed += got;
+    settled += got;
   }
-  return { freed_micro: freed, budgets };
+  return { settled_micro: settled, budgets };
 }
 
 // Spend inside the budget's reporting period. Returns null for 'lifetime',
@@ -76,11 +85,14 @@ async function periodSpentMicro(
 // spans that actually incurred cost rather than from the budget's own ledger.
 // The ledger only accumulates for calls that checked that specific budget, which
 // for a project cap would mean counting a fraction of the spend and reporting
-// headroom that is not there. Unpriced spans contribute nothing, the same as
-// everywhere else cost is estimated.
+// headroom that is not there. A span with usage but no matching price has an
+// unknown cost, not a zero cost: the caller gets the unpriced count and must
+// not be told that the remainder is safe to spend.
+type ProjectSpend = { spent: number; unpricedSpans: number };
+
 async function projectSpentMicro(
   client: Pool | PoolClient, projectId: string, period: string
-): Promise<number> {
+): Promise<ProjectSpend> {
   const params: unknown[] = [projectId];
   let windowSql = "TRUE";
   if (period !== "lifetime") {
@@ -94,7 +106,11 @@ async function projectSpentMicro(
                    ELSE ((GREATEST(COALESCE(s.input_tokens,0) - COALESCE(s.cached_tokens,0), 0) * p.input_price_per_million
                         + COALESCE(s.cached_tokens,0) * p.cached_input_price_per_million
                         + COALESCE(s.output_tokens,0) * p.output_price_per_million) / 1000000)::BIGINT
-              END), 0)::bigint AS spent
+              END), 0)::bigint AS spent,
+            COUNT(*) FILTER (
+              WHERE (s.input_tokens IS NOT NULL OR s.output_tokens IS NOT NULL)
+                AND p.id IS NULL
+            )::int AS unpriced_spans
        FROM spans s
        JOIN runs r ON r.id = s.run_id
        LEFT JOIN LATERAL (
@@ -105,7 +121,10 @@ async function projectSpentMicro(
       WHERE r.project_id = $1 AND ${windowSql}`,
     params
   );
-  return Number(r.rows[0].spent);
+  return {
+    spent: Number(r.rows[0].spent),
+    unpricedSpans: Number(r.rows[0].unpriced_spans)
+  };
 }
 
 export function registerBudgetRoutes(app: FastifyInstance) {
@@ -236,6 +255,8 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     // limits, spend, and remaining headroom.
     const scope = scopeClause(req.principal, params, "workspace_id");
     if (scope) where.push(scope);
+    const projectScope = projectClause(req.principal, params, "project_id");
+    if (projectScope) where.push(projectScope);
     params.push(limit);
     const res = await pool.query(
       `SELECT *, (limit_micro - spent_micro - reserved_micro) AS remaining_micro
@@ -248,16 +269,31 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     // window on the page, not one per row.
     const projects = res.rows.filter((b) => b.scope === "project");
     if (projects.length > 0) {
-      const spent = new Map<string, number>();
+      const spend = new Map<string, ProjectSpend>();
       for (const b of projects) {
         const key = `${b.project_id}\0${b.period ?? "lifetime"}`;
-        if (!spent.has(key)) {
-          spent.set(key, await projectSpentMicro(pool, b.project_id, b.period ?? "lifetime"));
+        if (!spend.has(key)) {
+          spend.set(key, await projectSpentMicro(pool, b.project_id, b.period ?? "lifetime"));
         }
       }
       for (const b of projects) {
-        b.spent_micro = spent.get(`${b.project_id}\0${b.period ?? "lifetime"}`) ?? 0;
-        b.remaining_micro = Number(b.limit_micro) - b.spent_micro - Number(b.reserved_micro);
+        const found = spend.get(`${b.project_id}\0${b.period ?? "lifetime"}`);
+        b.spent_micro = found?.spent ?? 0;
+        b.unpriced_spans = found?.unpricedSpans ?? 0;
+        const used = Number(b.spent_micro) + Number(b.reserved_micro);
+        // Known spend already meets the limit, so the budget is exhausted even
+        // if unpriced spans add more. Otherwise unknown spend means the
+        // remaining number cannot be trusted and is withheld rather than
+        // shown as headroom.
+        const incomplete = b.unpriced_spans > 0 && used < Number(b.limit_micro);
+        b.spend_complete = !incomplete;
+        b.remaining_micro = incomplete ? null : Number(b.limit_micro) - used;
+      }
+    }
+    for (const b of res.rows) {
+      if (b.scope !== "project") {
+        b.spend_complete = true;
+        b.unpriced_spans = 0;
       }
     }
     return { items: res.rows };
@@ -271,6 +307,12 @@ export function registerBudgetRoutes(app: FastifyInstance) {
       period: z.enum(["lifetime", "day", "week", "month"]).optional()
     }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_budget" });
+    const current = await pool.query(
+      "SELECT workspace_id, project_id FROM budgets WHERE id = $1", [id]);
+    if (!current.rows[0] || !workspaceAllowed(req.principal, current.rows[0].workspace_id)
+        || !projectAllowed(req.principal, current.rows[0].project_id)) {
+      return reply.code(404).send({ error: "budget_not_found" });
+    }
     const sets: string[] = ["updated_at = now()"];
     const params: unknown[] = [];
     if (parsed.data.limit_micro !== undefined) {
@@ -316,11 +358,11 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     // Reclaim abandoned holds before measuring, on its own connection so the
     // 409 path below cannot roll the recovery back. This is what stops an
     // abandoned reservation from wedging the budget permanently.
-    const freed = await sweepExpiredHolds(pool, parsed.data.budget_id);
-    if (freed > 0) {
+    const settled = await sweepExpiredHolds(pool, parsed.data.budget_id);
+    if (settled > 0) {
       await audit(pool, { actor_type: "system", action: "budget.reservation_expired",
-        resource_type: "budget", resource_id: parsed.data.budget_id, result: "released",
-        metadata: { freed_micro: freed } });
+        resource_type: "budget", resource_id: parsed.data.budget_id, result: "settled",
+        metadata: { settled_micro: settled, basis: "reserved_max" } });
     }
     const client = await pool.connect();
     try {
@@ -333,14 +375,38 @@ export function registerBudgetRoutes(app: FastifyInstance) {
       const budget = b.rows[0];
       // The row's workspace_id is the authoritative boundary for both legacy
       // workspace-named project budgets and real project ids.
-      if (!workspaceAllowed(req.principal, budget.workspace_id)) {
+      if (!workspaceAllowed(req.principal, budget.workspace_id)
+          || !projectAllowed(req.principal, budget.project_id)) {
         await client.query("ROLLBACK");
-        return reply.code(403).send({ error: "workspace_forbidden" });
+        return reply.code(403).send({ error: "project_forbidden" });
       }
-      const spent = budget.scope === "project"
+      const projectSpend = budget.scope === "project"
         ? await projectSpentMicro(client, budget.project_id, budget.period ?? "lifetime")
+        : null;
+      const spent = projectSpend
+        ? projectSpend.spent
         : (await periodSpentMicro(client, budget.id, budget.period ?? "lifetime")) ??
           Number(budget.spent_micro);
+      const unpricedSpans = projectSpend?.unpricedSpans ?? 0;
+
+      // A block budget is a hard cap only when spend is knowable. If the
+      // project has usage with no matching price and the known spend still
+      // leaves headroom, the unknown amount could consume it: refuse rather
+      // than report a cap that might already be exceeded.
+      if (budget.effect === "block" && unpricedSpans > 0
+          && spent + Number(budget.reserved_micro) + parsed.data.max_cost_micro
+             <= Number(budget.limit_micro)) {
+        await client.query("ROLLBACK");
+        await audit(pool, { actor_type: "agent", action: "budget.denied",
+          resource_type: "budget", resource_id: budget.id, result: "unknown_usage",
+          workspace_id: budget.workspace_id, project_id: budget.project_id,
+          metadata: { spent_micro: spent, limit_micro: budget.limit_micro,
+            requested_micro: parsed.data.max_cost_micro, unpriced_spans: unpricedSpans,
+            period: budget.period ?? "lifetime" } });
+        return reply.code(409).send({ error: "budget_unknown_usage",
+          spent_micro: spent, limit_micro: Number(budget.limit_micro),
+          unpriced_spans: unpricedSpans, spend_complete: false });
+      }
 
       // Block budgets reserve only when the current spend plus every live
       // hold plus this request still fits. Warn budgets deliberately reserve
@@ -372,7 +438,8 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         void notify(budget.workspace_id, "budget.exceeded",
           { budget_id: budget.id, scope: budget.scope, spent_micro: spent, limit_micro: Number(budget.limit_micro) });
         return reply.code(409).send({ error: "budget_exceeded",
-          spent_micro: spent, limit_micro: Number(budget.limit_micro) });
+          spent_micro: spent, limit_micro: Number(budget.limit_micro),
+          unpriced_spans: unpricedSpans, spend_complete: unpricedSpans === 0 });
       }
 
       const reserved = updated.rows[0];
@@ -389,9 +456,12 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         resource_type: "budget", resource_id: budget.id, result: "reserved",
         workspace_id: budget.workspace_id, project_id: budget.project_id,
         metadata: { reservation_id: r.rows[0].id, amount_micro: parsed.data.max_cost_micro,
-          expires_at: r.rows[0].expires_at } });
+          expires_at: r.rows[0].expires_at, unpriced_spans: unpricedSpans } });
+      const spendComplete = unpricedSpans === 0;
       return { ok: true, reservation_id: r.rows[0].id, expires_at: r.rows[0].expires_at,
-        warning: over ? "budget limit reached, warn-only budget" : undefined,
+        warning: over ? "budget limit reached, warn-only budget"
+          : !spendComplete ? "project spend is incomplete: unpriced spans exist" : undefined,
+        spend_complete: spendComplete, unpriced_spans: unpricedSpans,
         remaining_micro: Number(reserved.limit_micro) - spent - Number(reserved.reserved_micro) };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -430,9 +500,10 @@ export function registerBudgetRoutes(app: FastifyInstance) {
       const bw = await client.query(
         "SELECT workspace_id, project_id FROM budgets WHERE id = $1", [res.budget_id]
       );
-      if (!workspaceAllowed(req.principal, bw.rows[0]?.workspace_id ?? "")) {
+      if (!workspaceAllowed(req.principal, bw.rows[0]?.workspace_id ?? "")
+          || !projectAllowed(req.principal, bw.rows[0]?.project_id ?? "")) {
         await client.query("ROLLBACK");
-        return reply.code(403).send({ error: "workspace_forbidden" });
+        return reply.code(403).send({ error: "project_forbidden" });
       }
       // A reservation is the authorized maximum. A caller that reports more
       // usage than it reserved cannot move more money than the budget check
@@ -488,10 +559,11 @@ export function registerBudgetRoutes(app: FastifyInstance) {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "reservation_not_found" });
       }
-      const rw = await client.query("SELECT workspace_id FROM budgets WHERE id = $1", [r.rows[0].budget_id]);
-      if (!workspaceAllowed(req.principal, rw.rows[0]?.workspace_id ?? "")) {
+      const rw = await client.query("SELECT workspace_id, project_id FROM budgets WHERE id = $1", [r.rows[0].budget_id]);
+      if (!workspaceAllowed(req.principal, rw.rows[0]?.workspace_id ?? "")
+          || !projectAllowed(req.principal, rw.rows[0]?.project_id ?? "")) {
         await client.query("ROLLBACK");
-        return reply.code(403).send({ error: "workspace_forbidden" });
+        return reply.code(403).send({ error: "project_forbidden" });
       }
       await client.query("UPDATE budgets SET reserved_micro = reserved_micro - $2 WHERE id = $1",
         [r.rows[0].budget_id, Number(r.rows[0].amount_micro)]);
@@ -512,7 +584,8 @@ export function registerBudgetRoutes(app: FastifyInstance) {
   app.get("/v1/runs/:id/usage", async (req, reply) => {
     const { id } = req.params as { id: string };
     const run = await pool.query("SELECT * FROM runs WHERE id = $1", [id]);
-    if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id)) {
+    if (!run.rows[0] || !workspaceAllowed(req.principal, run.rows[0].workspace_id)
+        || !projectAllowed(req.principal, run.rows[0].project_id)) {
       return reply.code(404).send({ error: "run_not_found" });
     }
     const spans = await pool.query(
