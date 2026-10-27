@@ -332,7 +332,7 @@ describe("tool definition pins", () => {
       }
     ]);
     const disc = await api.inject({ method: "POST", url: `/v1/servers/${serverId}/discover`, headers: key });
-    expect(disc.statusCode).toBe(200);
+    expect(disc.statusCode, disc.body).toBe(200);
     const rejected = disc.json().rejected as { name: string; reason: string }[];
     expect(rejected.map((r) => r.name).sort()).toEqual(["echo", "fresh"]);
     expect(rejected.find((r) => r.name === "echo")?.reason).toContain("external $ref");

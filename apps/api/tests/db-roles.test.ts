@@ -138,13 +138,16 @@ describe("least-privilege database roles", () => {
     });
   });
 
-  it("api_runtime keeps reads and its draft/operational writes", async () => {
+  it("api_runtime keeps reads and draft writes but trusted state is procedure-only", async () => {
     await asRole("api_runtime", async (c) => {
       expect(await attempt(c, () => c.query("SELECT count(*) FROM policy_versions"))).toBe("ok");
       expect(await attempt(c, () => c.query("SELECT count(*) FROM approvals"))).toBe("ok");
       expect(await attempt(c, () => c.query("UPDATE policies SET name = name WHERE false"))).toBe("ok");
       expect(await attempt(c, () => c.query("UPDATE mcp_servers SET name = name WHERE false"))).toBe("ok");
-      expect(await attempt(c, () => c.query("UPDATE server_tools SET quarantined = quarantined WHERE false"))).toBe("ok");
+      expect(await attempt(c, () => c.query("UPDATE server_tools SET quarantined = quarantined WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("UPDATE tool_pins SET status = status WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("DELETE FROM spans WHERE false"))).toBe(DENIED);
+      expect(await attempt(c, () => c.query("DELETE FROM runs WHERE false"))).toBe(DENIED);
     });
   });
 

@@ -5,7 +5,7 @@ import { argConditionsSchema, hasPathWithin } from "@traceguard/schemas";
 import { pool } from "./db.js";
 import { audit } from "./audit.js";
 import { scopeClause, workspaceAllowed } from "./auth.js";
-import { projectClause, resolveProject } from "./project-scope.js";
+import { projectAllowed, projectClause, resolveProject } from "./project-scope.js";
 import { gatewayAlias } from "./mcp.js";
 import {
   checkUpstreamUrlResolved, definitionHash, definitionIssue, discoverTools,
@@ -159,7 +159,8 @@ export function registerAdminRoutes(app: FastifyInstance): void {
       const found = await client.query(
         "SELECT * FROM mcp_server_drafts WHERE id = $1 FOR UPDATE", [id]
       );
-      if (!found.rows[0] || !workspaceAllowed(req.principal, found.rows[0].workspace_id)) {
+      if (!found.rows[0] || !workspaceAllowed(req.principal, found.rows[0].workspace_id)
+          || !projectAllowed(req.principal, found.rows[0].project_id)) {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "server_draft_not_found" });
       }
@@ -188,7 +189,8 @@ export function registerAdminRoutes(app: FastifyInstance): void {
     const client = await pool.connect();
     try {
       const srv = await client.query("SELECT * FROM mcp_servers WHERE id = $1", [id]);
-      if (!srv.rows[0] || !workspaceAllowed(req.principal, srv.rows[0].workspace_id)) {
+      if (!srv.rows[0] || !workspaceAllowed(req.principal, srv.rows[0].workspace_id)
+          || !projectAllowed(req.principal, srv.rows[0].project_id)) {
         return reply.code(404).send({ error: "server_not_found" });
       }
       const server = srv.rows[0];
@@ -230,17 +232,19 @@ export function registerAdminRoutes(app: FastifyInstance): void {
           );
           if (current.rows[0]?.candidate_pin_id) {
             await client.query(
-              `UPDATE tool_pins SET status = 'superseded'
-                WHERE id = $1 AND status IN ('candidate', 'pending_review', 'approved')`,
+              "SELECT 1 FROM api_set_tool_pin_status($1, 'superseded')",
               [current.rows[0].candidate_pin_id]
             );
           }
-          await client.query(
-            `UPDATE server_tools SET quarantined=true, quarantine_reason=$3,
-               candidate_pin_id=NULL, updated_at=now()
-              WHERE server_id=$1 AND tool_name=$2`,
-            [id, t.name, issue]
-          );
+          // A rejected definition that was never pinned has no row to
+          // quarantine. The state procedure raises for a missing tool, so
+          // only existing tools transition; the rejection is still audited.
+          if (current.rows[0]) {
+            await client.query(
+              `SELECT * FROM api_set_server_tool_state($1,$2,NULL,true,NULL,true,$3)`,
+              [id, t.name, issue]
+            );
+          }
           if (current.rows[0] && !current.rows[0].quarantined) {
             await audit(client, { actor_type: "system", action: "tool.quarantined",
               resource_type: "server_tool", resource_id: `${id}/${t.name}`,
@@ -278,7 +282,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
             [id, t.name, JSON.stringify(definition), hash]
           );
           await client.query(
-            "UPDATE server_tools SET active_pin_id = $3 WHERE server_id = $1 AND tool_name = $2",
+            `SELECT * FROM api_set_server_tool_state($1,$2,$3)`,
             [id, t.name, pin.rows[0].id]
           );
           pinned.push(t.name);
@@ -302,8 +306,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
           }
           if (existing.rows[0].candidate_pin_id) {
             await client.query(
-              `UPDATE tool_pins SET status = 'superseded'
-                WHERE id = $1 AND status IN ('candidate', 'pending_review', 'approved')`,
+              "SELECT 1 FROM api_set_tool_pin_status($1, 'superseded')",
               [existing.rows[0].candidate_pin_id]
             );
           }
@@ -320,9 +323,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
             [id, t.name, next.rows[0].version, JSON.stringify(definition), hash]
           );
           await client.query(
-            `UPDATE server_tools SET candidate_pin_id=$3, quarantined=true,
-               quarantine_reason='definition changed', updated_at=now()
-             WHERE server_id=$1 AND tool_name=$2`,
+            `SELECT * FROM api_set_server_tool_state($1,$2,NULL,true,$3,true,'definition changed')`,
             [id, t.name, candidate.rows[0].id]
           );
           changed.push(t.name);
@@ -343,12 +344,11 @@ export function registerAdminRoutes(app: FastifyInstance): void {
           // candidate is stale. Keep the quarantine in place until an admin
           // explicitly submits the active pin for a fresh review.
           await client.query(
-            `UPDATE tool_pins SET status = 'superseded'
-              WHERE id = $1 AND status IN ('candidate', 'pending_review', 'approved')`,
+            "SELECT 1 FROM api_set_tool_pin_status($1, 'superseded')",
             [existing.rows[0].candidate_pin_id]
           );
           await client.query(
-            "UPDATE server_tools SET candidate_pin_id = NULL WHERE server_id = $1 AND tool_name = $2",
+            "SELECT * FROM api_set_server_tool_state($1,$2,NULL,true,NULL)",
             [id, t.name]
           );
         }
@@ -391,7 +391,8 @@ export function registerAdminRoutes(app: FastifyInstance): void {
   app.get("/v1/mcp-servers/:id/tools", async (req, reply) => {
     const { id } = req.params as { id: string };
     const srv = await pool.query("SELECT * FROM mcp_servers WHERE id = $1", [id]);
-    if (!srv.rows[0] || !workspaceAllowed(req.principal, srv.rows[0].workspace_id)) {
+    if (!srv.rows[0] || !workspaceAllowed(req.principal, srv.rows[0].workspace_id)
+        || !projectAllowed(req.principal, srv.rows[0].project_id)) {
       return reply.code(404).send({ error: "server_not_found" });
     }
     const res = await pool.query(
@@ -417,7 +418,8 @@ export function registerAdminRoutes(app: FastifyInstance): void {
       const found = await client.query(
         "SELECT * FROM mcp_servers WHERE id = $1 FOR UPDATE", [id]
       );
-      if (!found.rows[0] || !workspaceAllowed(req.principal, found.rows[0].workspace_id)) {
+      if (!found.rows[0] || !workspaceAllowed(req.principal, found.rows[0].workspace_id)
+          || !projectAllowed(req.principal, found.rows[0].project_id)) {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "server_not_found" });
       }
@@ -459,6 +461,14 @@ export function registerAdminRoutes(app: FastifyInstance): void {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      const scope = await client.query(
+        "SELECT workspace_id, project_id FROM mcp_servers WHERE id = $1", [sid]
+      );
+      if (!scope.rows[0] || !workspaceAllowed(req.principal, scope.rows[0].workspace_id)
+          || !projectAllowed(req.principal, scope.rows[0].project_id)) {
+        await client.query("ROLLBACK");
+        return reply.code(404).send({ error: "server_not_found" });
+      }
       const current = await client.query(
         "SELECT candidate_pin_id FROM server_tools WHERE server_id = $1 AND tool_name = $2 FOR UPDATE",
         [sid, tool]
@@ -469,21 +479,13 @@ export function registerAdminRoutes(app: FastifyInstance): void {
       }
       if (current.rows[0].candidate_pin_id) {
         await client.query(
-          `UPDATE tool_pins SET status = 'superseded'
-            WHERE id = $1 AND status IN ('candidate', 'pending_review', 'approved')`,
+          "SELECT 1 FROM api_set_tool_pin_status($1, 'superseded')",
           [current.rows[0].candidate_pin_id]
         );
       }
       const res = await client.query(
-        `UPDATE server_tools SET quarantined=true, quarantine_reason='quarantined by reviewer',
-           candidate_pin_id=NULL, updated_at=now()
-          WHERE server_id=$1 AND tool_name=$2
-          RETURNING tool_name, quarantined, definition_version, definition_hash,
-                    active_pin_id, candidate_pin_id`,
+        `SELECT * FROM api_set_server_tool_state($1,$2,NULL,true,NULL,true,'quarantined by reviewer')`,
         [sid, tool]
-      );
-      const scope = await client.query(
-        "SELECT workspace_id, project_id FROM mcp_servers WHERE id = $1", [sid]
       );
       await audit(client, { actor_type: "admin", actor_id: req.principal?.userId ?? undefined,
         action: "tool.quarantined", resource_type: "server_tool", resource_id: `${sid}/${tool}`,
@@ -522,7 +524,8 @@ export function registerAdminRoutes(app: FastifyInstance): void {
         return reply.code(404).send({ error: "pin_not_found" });
       }
       const pin = found.rows[0];
-      if (!workspaceAllowed(req.principal, pin.workspace_id)) {
+      if (!workspaceAllowed(req.principal, pin.workspace_id)
+          || !projectAllowed(req.principal, pin.project_id)) {
         await client.query("ROLLBACK");
         return reply.code(403).send({ error: "workspace_forbidden" });
       }
@@ -549,8 +552,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
         );
         if (pin.current_candidate_pin_id) {
           await client.query(
-            `UPDATE tool_pins SET status = 'superseded'
-              WHERE id = $1 AND status IN ('candidate', 'pending_review', 'approved')`,
+            "SELECT 1 FROM api_set_tool_pin_status($1, 'superseded')",
             [pin.current_candidate_pin_id]
           );
         }
@@ -572,16 +574,13 @@ export function registerAdminRoutes(app: FastifyInstance): void {
         candidateStatus = candidate.rows[0].status;
       } else if (pin.status === "candidate") {
         const updated = await client.query(
-          `UPDATE tool_pins SET status='pending_review', quarantine_reason='review requested'
-            WHERE id=$1 RETURNING id, version, status`,
+          "SELECT * FROM api_set_tool_pin_status($1, 'pending_review', NULL, 'review requested')",
           [pin.id]
         );
         candidateStatus = updated.rows[0].status;
       }
       await client.query(
-        `UPDATE server_tools SET candidate_pin_id=$3, quarantined=true,
-           quarantine_reason='review requested', updated_at=now()
-          WHERE server_id=$1 AND tool_name=$2`,
+        `SELECT * FROM api_set_server_tool_state($1,$2,NULL,true,$3,true,'review requested')`,
         [pin.server_id, pin.tool_name, candidateId]
       );
       await audit(client, { actor_type: "admin", actor_id: req.principal?.userId ?? undefined,
@@ -619,7 +618,8 @@ export function registerAdminRoutes(app: FastifyInstance): void {
         return reply.code(404).send({ error: "pin_not_found" });
       }
       const pin = found.rows[0];
-      if (!workspaceAllowed(req.principal, pin.workspace_id)) {
+      if (!workspaceAllowed(req.principal, pin.workspace_id)
+          || !projectAllowed(req.principal, pin.project_id)) {
         await client.query("ROLLBACK");
         return reply.code(403).send({ error: "workspace_forbidden" });
       }
@@ -629,9 +629,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
       }
       const reviewedBy = req.principal?.userId ?? "admin";
       const updated = await client.query(
-        `UPDATE tool_pins SET status='approved', reviewed_at=now(), reviewed_by=$2
-          WHERE id=$1 RETURNING id, server_id, tool_name, version, status, definition_hash,
-                            reviewed_at, reviewed_by`,
+        "SELECT * FROM api_set_tool_pin_status($1, 'approved', $2)",
         [pin.id, reviewedBy]
       );
       await audit(client, { actor_type: "admin", actor_id: req.principal?.userId ?? undefined,
@@ -738,7 +736,8 @@ export function registerAdminRoutes(app: FastifyInstance): void {
       // both find a live row and both insert a new version, leaving the rule
       // with two live heads and a version an operator believes was retired.
       const old = await client.query("SELECT * FROM policies WHERE id = $1 FOR UPDATE", [id]);
-      if (!old.rows[0] || !workspaceAllowed(req.principal, old.rows[0].workspace_id)) {
+      if (!old.rows[0] || !workspaceAllowed(req.principal, old.rows[0].workspace_id)
+          || !projectAllowed(req.principal, old.rows[0].project_id)) {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "policy_not_found" });
       }
@@ -779,7 +778,8 @@ export function registerAdminRoutes(app: FastifyInstance): void {
   app.get("/v1/policy-drafts/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
     const res = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
-    if (!res.rows[0] || !workspaceAllowed(req.principal, res.rows[0].workspace_id)) {
+    if (!res.rows[0] || !workspaceAllowed(req.principal, res.rows[0].workspace_id)
+        || !projectAllowed(req.principal, res.rows[0].project_id)) {
       return reply.code(404).send({ error: "policy_not_found" });
     }
     return res.rows[0];
@@ -788,7 +788,8 @@ export function registerAdminRoutes(app: FastifyInstance): void {
   app.post("/v1/policy-drafts/:id/export", async (req, reply) => {
     const { id } = req.params as { id: string };
     const res = await pool.query("SELECT * FROM policies WHERE id = $1", [id]);
-    if (!res.rows[0] || !workspaceAllowed(req.principal, res.rows[0].workspace_id)) {
+    if (!res.rows[0] || !workspaceAllowed(req.principal, res.rows[0].workspace_id)
+        || !projectAllowed(req.principal, res.rows[0].project_id)) {
       return reply.code(404).send({ error: "policy_not_found" });
     }
     const draft = res.rows[0];
@@ -831,6 +832,8 @@ export function registerAdminRoutes(app: FastifyInstance): void {
     }
     const scope = scopeClause(req.principal, params, "workspace_id");
     if (scope) where.push(scope);
+    const projectScope = projectClause(req.principal, params, "project_id");
+    if (projectScope) where.push(projectScope);
     params.push(limit);
     const res = await pool.query(
       `SELECT * FROM policy_decisions ${where.length ? "WHERE " + where.join(" AND ") : ""}
