@@ -185,7 +185,7 @@ export function registerBudgetRoutes(app: FastifyInstance) {
     // accepted as the legacy spelling and maps to that workspace's default
     // project, so existing callers keep working after the identity split.
     scope: z.enum(["run", "agent", "project"]),
-    ref_id: z.string().uuid(),
+    ref_id: z.string().guid(),
     limit_micro: z.number().int().min(0),
     effect: z.enum(["block", "warn"]).default("block"),
     // 'lifetime' is the original behaviour: one limit for the row's whole life.
@@ -343,7 +343,7 @@ export function registerBudgetRoutes(app: FastifyInstance) {
   app.put("/v1/budgets/:id", updateBudget);
 
   const checkSchema = z.object({
-    budget_id: z.string().uuid(),
+    budget_id: z.string().guid(),
     max_cost_micro: z.number().int().min(0),
     ttl_seconds: z.number().int().min(1).default(300)
   });
@@ -472,7 +472,7 @@ export function registerBudgetRoutes(app: FastifyInstance) {
   });
 
   const settleSchema = z.object({
-    reservation_id: z.string().uuid(),
+    reservation_id: z.string().guid(),
     actual_cost_micro: z.number().int().min(0).nullable().optional()
   });
 
@@ -547,7 +547,7 @@ export function registerBudgetRoutes(app: FastifyInstance) {
   });
 
   app.post("/v1/budgets/release", async (req, reply) => {
-    const parsed = z.object({ reservation_id: z.string().uuid() }).safeParse(req.body);
+    const parsed = z.object({ reservation_id: z.string().guid() }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_release" });
     const client = await pool.connect();
     try {

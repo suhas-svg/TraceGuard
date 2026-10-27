@@ -10,7 +10,7 @@
     "test": "echo 'schemas: no tests yet'"
   },
   "dependencies": {
-    "zod": "^3.23.8"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "typescript": "^5.5.0"

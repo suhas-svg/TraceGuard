@@ -7,7 +7,7 @@ import { pool } from "./db.js";
 import { projectAllowed, projectById, projectClause } from "./project-scope.js";
 import { workspaceAllowed } from "./auth.js";
 
-const UUID = z.string().uuid();
+const UUID = z.string().guid();
 
 function isAdmin(principal: Principal | undefined): boolean {
   return !!principal && (principal.projects === "all" || principal.scopes.includes("admin"));

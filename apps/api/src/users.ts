@@ -158,7 +158,7 @@ export function registerUserRoutes(app: FastifyInstance) {
       name: z.string().min(1).max(128),
       scopes: z.array(z.enum(["admin", "ingest", "gateway", "approve", "read"])).min(1),
       expires_days: z.number().int().min(1).max(365).default(90),
-      workspace_id: z.string().uuid().nullable().optional()
+      workspace_id: z.string().guid().nullable().optional()
     }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_key" });
     const owner = await pool.query("SELECT id, role FROM users WHERE id = $1",
@@ -213,7 +213,7 @@ export function registerUserRoutes(app: FastifyInstance) {
 
   app.post("/v1/users/:id/memberships", async (req, reply) => {
     if (localIdentityDisabled()) return externalIdentityOnly(reply);
-    const parsed = z.object({ workspace_id: z.string().uuid() }).safeParse(req.body);
+    const parsed = z.object({ workspace_id: z.string().guid() }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_membership" });
     const p = req.params as { id: string };
     const owner = await pool.query("SELECT id FROM users WHERE id = $1", [p.id]);

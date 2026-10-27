@@ -10,7 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@traceguard/audit-chain": "workspace:*",
     "@traceguard/canonical-json": "workspace:*",
     "@traceguard/policy-signing": "workspace:*",
@@ -19,7 +19,7 @@
     "fastify": "^5.0.0",
     "pg": "^8.12.0",
     "protobufjs": "^8.8.1",
-    "zod": "^3.23.8"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

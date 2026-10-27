@@ -337,8 +337,11 @@ describe("signed policy enforcement", () => {
   it("verifies the audit chain and detects a tampered event", async () => {
     const ok = await gw.inject({ method: "POST", url: "/v1/audit/verify", headers: key });
     expect(ok.statusCode).toBe(200);
-    expect(ok.json().ok).toBe(true);
-    expect(ok.json().checked).toBeGreaterThan(0);
+    const okBody = ok.json();
+    // Surface the verifier's findings: a bare `false` says nothing about
+    // whether a link, a hash, or a workspace sequence failed.
+    expect(okBody.ok, JSON.stringify(okBody.problems)).toBe(true);
+    expect(okBody.checked).toBeGreaterThan(0);
 
     // A database owner tampering with an event is exactly who this verifier
     // exists for: the append-only trigger has to be disabled first, and that
