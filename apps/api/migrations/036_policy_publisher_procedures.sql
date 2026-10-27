@@ -102,6 +102,9 @@ $$;
 
 -- Activate an already-inserted signed version for its workspace. The version
 -- must belong to that workspace; the upsert is the only trusted-config write.
+-- Dropped first: an older build's function returned boolean, and CREATE OR
+-- REPLACE cannot change a return type (039 does the same).
+DROP FUNCTION IF EXISTS policy_activate_version(uuid, uuid);
 CREATE OR REPLACE FUNCTION policy_activate_version(
   p_workspace_id uuid,
   p_policy_version_id uuid

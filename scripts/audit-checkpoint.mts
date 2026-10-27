@@ -17,6 +17,7 @@
 // carries the prior signed checkpoint as its `anchor`; create/prune refuse if
 // that anchor was signed by a different key (key rotation needs a trusted key
 // history first).
+import { createPublicKey } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { Pool, type PoolClient } from "pg";
 import {
