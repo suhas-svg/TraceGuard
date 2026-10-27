@@ -2,7 +2,7 @@
 import { validateAgainstSchema } from "./schema-check.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import type { PoolClient } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { pool } from "./db.js";
 import { audit, type AuditEntry } from "./audit.js";
 import { projectAllowed, projectClause } from "./project-scope.js";
@@ -87,8 +87,9 @@ function boundedSummary(result: unknown): string {
 }
 
 // Â§11.3 step 3: hard budget limits gate managed operations. Returns the first
-// exhausted block budget covering this run or agent, or null. Tool calls do
-// not spend the budget themselves; the gate stops work once it is gone.
+// exhausted block budget covering this run or agent, or null. A tool call does
+// not spend the budget, but it may hold a configurable reservation while the
+// upstream call is in flight; the gate stops work once the limit is gone.
 async function enforceBudget(
   client: PoolClient,
   ctx: { workspace_id: string; run_id: string | null; agent_id: string | null }
@@ -103,6 +104,39 @@ async function enforceBudget(
     [ctx.workspace_id, ctx.run_id, ctx.agent_id]
   );
   return res.rows[0] ?? null;
+}
+
+type BudgetExhausted = {
+  id: string;
+  scope: string;
+  spent_micro: string | number;
+  reserved_micro: string | number;
+  limit_micro: string | number;
+};
+
+type ToolCallHoldOutcome = {
+  reservation_ids: string[];
+  budget_ids: string[];
+  exhausted: BudgetExhausted | null;
+};
+
+// The hold amount and TTL are read per request so a deployment (or a test) can
+// enable, disable, or shrink the reservation without a restart. Zero preserves
+// the historical behavior: the gate only checks already-exhausted budgets.
+const toolCallHoldMicro = (): number =>
+  approvalEnv("TOOL_CALL_RESERVATION_MICRO", 0);
+const toolCallHoldTtlSeconds = (): number =>
+  approvalEnv("TOOL_CALL_RESERVATION_TTL_SECONDS", 300);
+
+async function releaseToolCallHolds(
+  db: Pool | PoolClient, workspaceId: string, reservationIds: string[]
+): Promise<number> {
+  if (reservationIds.length === 0) return 0;
+  const res = await db.query(
+    "SELECT gateway_release_tool_call($1,$2) AS released",
+    [workspaceId, reservationIds]
+  );
+  return Number(res.rows[0]?.released ?? 0);
 }
 
 // Project-scoped audit entries carry both the workspace and the project. The
@@ -259,8 +293,16 @@ export function buildGateway() {
          }, { captureRaw: true }))]
       );
     } catch (err) {
-      // The denial stands even when the trace write cannot land, but a
-      // silently missing denial is unauditable: leave a reason in the log.
+      // A caller can name a run that was never ingested. The foreign-key
+      // violation is the only expected failure: the denial still lives in
+      // policy_decisions and the audit trail, and a span cannot exist without
+      // its run. Every other failure is a real trace-write problem and must
+      // stay loud.
+      const code = (err as { code?: string }).code;
+      if (code === "23503") {
+        app.log.debug(`denied-span skipped: run ${ctx.run_id} not found`);
+        return;
+      }
       app.log.warn(`denied-span write failed: ${(err as Error).message}`);
     }
   }
@@ -302,6 +344,27 @@ export function buildGateway() {
         metadata: { tool, error: urlRecheck.reason } });
       throw new Error(`upstream fails validation: ${urlRecheck.reason}`);
     }
+    // Ordinary allows must be durable before the side effect. Approved
+    // retries already recorded their decision and execution intent in the
+    // linearization transaction; recording here would duplicate that row.
+    // The audit write must land now, not after the upstream returns: a
+    // database failure has to stop the call, not leave an executed tool with
+    // no durable decision evidence (section 15, NFR-007).
+    if (!decisionMeta.provenanceRecorded) {
+      await recordDecision(client, {
+        ...decisionMeta.corr,
+        workspace_id: server.workspace_id, caller, server_id: server.id, tool_name: tool,
+        args_hash: sha256Hex(stableStringify(args)), decision: decisionMeta.approval_id ? "approved_retry" : "allow",
+        policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
+        policy_version_id: decisionMeta.policy_version_id,
+        matched: decisionMeta.matched, reason: decisionMeta.approval_id ? "approved" : "allowed",
+        approval_id: decisionMeta.approval_id ?? null, overhead_ms: decisionMeta.overheadMs ?? null
+      });
+      await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "policy.allow",
+        resource_type: "server_tool", resource_id: `${server.id}/${tool}`, result: "allow",
+        metadata: { approval_id: decisionMeta.approval_id ?? null } });
+      decisionMeta.provenanceRecorded = true;
+    }
     let result: unknown;
     try {
       // §7.4: resolve the reference at the last responsible moment. A missing
@@ -327,27 +390,8 @@ export function buildGateway() {
         metadata: { tool, error: detail } });
       throw err;
     }
-    // Approved retries pre-record their decision in the execution-intent
-    // transaction (Â§9.2 rule 5, before the linearization point); recording it
-    // again here would double the row without adding information. The error
-    // paths below still record â€” a failed dispatch is new information.
-    if (!decisionMeta.provenanceRecorded) {
-      await recordDecision(client, {
-        ...decisionMeta.corr,
-        workspace_id: server.workspace_id, caller, server_id: server.id, tool_name: tool,
-        args_hash: sha256Hex(stableStringify(args)), decision: decisionMeta.approval_id ? "approved_retry" : "allow",
-        policy_id: decisionMeta.policy_id, policy_version: decisionMeta.policy_version,
-        policy_version_id: decisionMeta.policy_version_id,
-        matched: decisionMeta.matched, reason: decisionMeta.approval_id ? "approved" : "allowed",
-        approval_id: decisionMeta.approval_id ?? null, overhead_ms: decisionMeta.overheadMs ?? null
-      });
-    }
-    // §10.3: every policy decision is auditable as such. The execution
-    // outcome is already covered by policy_decisions and by the failure
-    // events above; this event records the allow that authorized dispatch.
-    await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "policy.allow",
-      resource_type: "server_tool", resource_id: `${server.id}/${tool}`, result: "allow",
-      metadata: { approval_id: decisionMeta.approval_id ?? null } });
+    // The allow decision and its §10.3 audit event were written before the
+    // dispatch above, so the trail exists even if the upstream call now fails.
     return result;
   }
 
@@ -372,6 +416,11 @@ export function buildGateway() {
       span_id: parsed.data.span_id ?? null,
       request_id: parsed.data.request_id ?? null
     };
+    // Tool-call holds are released in the route's finally block. Keeping the
+    // ids here means every early return (pending approval, denial, failure)
+    // returns the unused headroom without a second code path.
+    let heldReservationIds: string[] = [];
+    let holdWorkspaceId: string | null = null;
     const client = await pool.connect();
     try {
       const srv = await client.query("SELECT * FROM mcp_servers WHERE id = $1", [server_id]);
@@ -381,6 +430,7 @@ export function buildGateway() {
         return reply.code(404).send({ error: "server_not_found" });
       }
       const server = srv.rows[0];
+      holdWorkspaceId = server.workspace_id;
 
       if (server.disabled_at) {
         const reason = "server disabled";
@@ -637,11 +687,51 @@ export function buildGateway() {
       // do not spend the budget themselves, but once a block budget covering
       // this run or agent is fully exhausted, the gateway stops forwarding
       // and records which budget stopped the call.
-      const exhausted = await enforceBudget(client, {
+      let exhausted: BudgetExhausted | null = await enforceBudget(client, {
         workspace_id: server.workspace_id,
         run_id: parsed.data.run_id ?? null,
         agent_id: parsed.data.agent_id ?? null
       });
+      // The cheap gate above rejects an already-exhausted budget. The
+      // reservation procedure then holds headroom for the duration of this
+      // call, serialized on the budget rows, so two concurrent calls cannot
+      // both spend the same last unit. A zero amount leaves this disabled.
+      const holdMicro = toolCallHoldMicro();
+      if (!exhausted && holdMicro > 0
+          && (parsed.data.run_id || parsed.data.agent_id)) {
+        const hold = await client.query(
+          "SELECT gateway_reserve_tool_call($1,$2,$3,$4,$5) AS outcome",
+          [server.workspace_id, parsed.data.run_id ?? null,
+           parsed.data.agent_id ?? null, holdMicro, toolCallHoldTtlSeconds()]
+        );
+        const outcome = hold.rows[0]?.outcome as ToolCallHoldOutcome | undefined;
+        heldReservationIds = outcome?.reservation_ids ?? [];
+        if (outcome?.exhausted) {
+          exhausted = outcome.exhausted;
+        } else if (heldReservationIds.length > 0) {
+          try {
+            await auditForScope(pool, server, {
+              actor_type: "agent", actor_id: caller, action: "budget.reserved",
+              resource_type: "budget", resource_id: outcome?.budget_ids?.[0],
+              result: "reserved",
+              metadata: { tool, server_id, amount_micro: holdMicro,
+                reservation_ids: heldReservationIds,
+                run_id: parsed.data.run_id ?? null,
+                agent_id: parsed.data.agent_id ?? null }
+            });
+          } catch (err) {
+            // A hold with no audit record cannot be reconciled. Return the
+            // headroom and fail the call closed.
+            try {
+              await releaseToolCallHolds(pool, server.workspace_id, heldReservationIds);
+            } catch (releaseErr) {
+              app.log.warn(`budget hold release failed: ${(releaseErr as Error).message}`);
+            }
+            heldReservationIds = [];
+            throw err;
+          }
+        }
+      }
       if (exhausted) {
         const reason = `budget exhausted (${exhausted.scope} ${exhausted.id})`;
         await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
@@ -1033,6 +1123,42 @@ export function buildGateway() {
       if (verdict.decision === "need_approval") {
         // Â§9.4 queue protections: active-pending caps and a creation rate
         // limit, counted against DB time. Limits only tighten (Â§9.4).
+        const requestId = parsed.data.request_id ?? `req-${randomUUID()}`;
+        const hash = requestHash(caller, server_id, tool, args as Record<string, unknown>, requestId, String(toolRow.rows[0].definition_hash));
+        const sealed = seal(ARGS_KEY, args as Record<string, unknown>, requestId);
+        // A retry of the same logical call must return the existing row even
+        // when the caller is at a queue or rate cap. Check dedupe before the
+        // caps; only genuinely new approvals consume a slot.
+        const priorExisting = await client.query(
+          `SELECT id, request_id, status, expires_at, args_hash FROM approvals
+            WHERE project_id=$1 AND caller=$2 AND request_id=$3`,
+          [server.project_id, caller, requestId]
+        );
+        const existingApproval = priorExisting.rows[0];
+        if (existingApproval) {
+          if (!hashesEqual(String(existingApproval.args_hash), hash)) {
+            await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "approval.request_conflict",
+              resource_type: "approval", resource_id: existingApproval.id, result: "deny",
+              metadata: { server_id, tool } });
+            return reply.code(409).send({ error: "request_id_conflict" });
+          }
+          await recordDecision(client, { ...corr, workspace_id: server.workspace_id, caller, server_id,
+            tool_name: tool, args_hash: callArgsHash, decision: "need_approval",
+            policy_id: verdict.rule?.id ?? null, policy_version: verdict.rule?.version ?? null,
+            policy_version_id: policy.policy_version_id,
+            matched: verdict.matched, reason: verdict.reason, approval_id: existingApproval.id,
+            overhead_ms: overheadMs() });
+          await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "policy.approval_required",
+            resource_type: "server_tool", resource_id: `${server_id}/${tool}`, result: "need_approval",
+            metadata: { rule: verdict.rule?.name ?? null, reason: verdict.reason, approval_id: existingApproval.id } });
+          await auditForScope(pool, server, { actor_type: "agent", actor_id: caller, action: "approval.created",
+            resource_type: "approval", resource_id: existingApproval.id, result: "pending" });
+          void notify(server.workspace_id, "approval.requested",
+            { approval_id: existingApproval.id, caller, server_id, tool });
+          reply.header("Cache-Control", "no-store");
+          return reply.code(202).send({ approval_id: existingApproval.id,
+            status: existingApproval.status, expires_at: existingApproval.expires_at });
+        }
         const pendingCaller = await client.query(
           "SELECT count(*)::int AS n FROM approvals WHERE caller = $1 AND project_id = $2 AND status IN ('pending','approved')",
           [caller, server.project_id]
@@ -1062,9 +1188,6 @@ export function buildGateway() {
         if (recent.rows[0].n >= Math.min(approvalEnv("APPROVAL_RATE_PER_MINUTE", 5), 5)) {
           return reply.code(429).send({ error: "approval_rate_limited", retry_after_seconds: 60 });
         }
-        const requestId = parsed.data.request_id ?? `req-${randomUUID()}`;
-        const hash = requestHash(caller, server_id, tool, args as Record<string, unknown>, requestId, String(toolRow.rows[0].definition_hash));
-        const sealed = seal(ARGS_KEY, args as Record<string, unknown>, requestId);
         // TTLs run on database time (Â§9.4): the row's expiry and every later
         // check compare against the one clock the gateway process cannot skew.
         const ap = await client.query(
@@ -1120,6 +1243,17 @@ export function buildGateway() {
         return reply.code(502).send({ error: "upstream_failed" });
       }
     } finally {
+      if (heldReservationIds.length > 0 && holdWorkspaceId) {
+        // Release through the pool, not the request client: an aborted
+        // transaction on that client must not block returning the hold. A
+        // failure leaves the hold for the expiry sweep to settle at its
+        // reserved maximum, the conservative outcome.
+        try {
+          await releaseToolCallHolds(pool, holdWorkspaceId, heldReservationIds);
+        } catch (err) {
+          app.log.warn(`budget hold release failed: ${(err as Error).message}`);
+        }
+      }
       client.release();
     }
   });
@@ -1160,6 +1294,8 @@ export function buildGateway() {
     }
     const dscope = scopeClause(req.principal, params, "workspace_id");
     if (dscope) where.push(dscope);
+    const dproject = projectClause(req.principal, params, "project_id");
+    if (dproject) where.push(dproject);
     params.push(limit);
     const res = await pool.query(
       `SELECT * FROM policy_decisions ${where.length ? "WHERE " + where.join(" AND ") : ""}
@@ -1168,8 +1304,8 @@ export function buildGateway() {
     return { items: res.rows };
   });
 
-  app.get("/v1/audit-events", async (req) => {
-    const q = req.query as { action?: string; limit?: string };
+  app.get("/v1/audit-events", async (req, reply) => {
+    const q = req.query as { action?: string; limit?: string; cursor?: string };
     const limit = Math.min(Math.max(Number(q.limit ?? 50), 1), 200);
     const params: unknown[] = [];
     const where: string[] = [];
@@ -1177,12 +1313,39 @@ export function buildGateway() {
       params.push(q.action);
       where.push(`action = $${params.length}`);
     }
-    params.push(limit);
+    const ascope = scopeClause(req.principal, params, "workspace_id");
+    if (ascope) where.push(ascope);
+    const aproject = projectClause(req.principal, params, "project_id");
+    if (aproject) where.push(aproject);
+    if (q.cursor) {
+      let decoded = "";
+      try {
+        decoded = Buffer.from(q.cursor, "base64url").toString("utf8");
+      } catch {
+        return reply.code(400).send({ error: "invalid_cursor" });
+      }
+      const [timestamp, id] = decoded.split("|");
+      if (!timestamp || !id || Number.isNaN(Date.parse(timestamp))
+          || !z.string().uuid().safeParse(id).success) {
+        return reply.code(400).send({ error: "invalid_cursor" });
+      }
+      params.push(timestamp);
+      const timestampParam = params.length;
+      params.push(id);
+      where.push(`(timestamp, id) < ($${timestampParam}::timestamptz, $${params.length}::uuid)`);
+    }
+    params.push(limit + 1);
     const res = await pool.query(
       `SELECT * FROM audit_events ${where.length ? "WHERE " + where.join(" AND ") : ""}
-       ORDER BY timestamp DESC LIMIT $${params.length}`, params
+       ORDER BY timestamp DESC, id DESC LIMIT $${params.length}`, params
     );
-    return { items: res.rows };
+    const hasMore = res.rows.length > limit;
+    const items = res.rows.slice(0, limit);
+    const last = items[items.length - 1];
+    const next_cursor = hasMore && last
+      ? Buffer.from(`${new Date(last.timestamp).toISOString()}|${last.id}`).toString("base64url")
+      : null;
+    return { items, next_cursor };
   });
 
   // Â§10: verification recomputes every event hash and checks every link. The
@@ -1195,7 +1358,13 @@ export function buildGateway() {
   // can verify an imported checkpoint; it cannot sign or prune one.
 
 
-  app.post("/v1/audit/verify", async (req) => {
+  app.post("/v1/audit/verify", async (req, reply) => {
+    // The chain is global across workspaces. A project- or workspace-scoped
+    // principal cannot verify a partial chain and must not receive another
+    // tenant's event hashes, so only an unscoped operator may run verification.
+    if (!(req.principal?.workspaces === "all" && req.principal?.projects === "all")) {
+      return reply.code(403).send({ error: "audit_verify_requires_global_scope" });
+    }
     const q = (req.query ?? {}) as { limit?: string };
     const limit = Math.min(Math.max(Number(q.limit ?? 200_000), 1), 1_000_000);
     // Migration 028 columns travel with every row: the verifier recomputes
@@ -1310,8 +1479,18 @@ export function registerApprovalControlRoutes(app: FastifyInstance): void {
     // execution intent returns to APPROVED â€” nothing was dispatched, so the
     // approval is still safely consumable; executing without a terminal
     // outcome past the recovery window becomes OUTCOME_UNKNOWN.
+    const sweepScope = (params: unknown[]): string => {
+      const parts: string[] = [];
+      const w = scopeClause(req.principal, params, "workspace_id");
+      if (w) parts.push(w);
+      const p = projectClause(req.principal, params, "project_id");
+      if (p) parts.push(p);
+      return parts.length ? ` AND ${parts.join(" AND ")}` : "";
+    };
+    const staleParams: unknown[] = [];
     const stale = await pool.query(
-      "SELECT * FROM approvals WHERE status = 'pending' AND expires_at < now()"
+      `SELECT * FROM approvals WHERE status = 'pending' AND expires_at < now()
+       ${sweepScope(staleParams)}`, staleParams
     );
     for (const row of stale.rows) {
       await pool.query(
@@ -1322,9 +1501,11 @@ export function registerApprovalControlRoutes(app: FastifyInstance): void {
         resource_type: "approval", resource_id: row.id, result: "expired",
         workspace_id: row.workspace_id, project_id: row.project_id });
     }
+    const claimParams: unknown[] = [];
     const staleClaims = await pool.query(
       `SELECT *, (expires_at > now()) AS still_live FROM approvals
-        WHERE status = 'claimed' AND claim_lease_expires_at < now()`
+        WHERE status = 'claimed' AND claim_lease_expires_at < now()
+        ${sweepScope(claimParams)}`, claimParams
     );
     for (const row of staleClaims.rows) {
       if (row.still_live) {
@@ -1352,11 +1533,13 @@ export function registerApprovalControlRoutes(app: FastifyInstance): void {
           metadata: { reason: "claim lease and request TTL both expired" } });
       }
     }
+    const stuckParams: unknown[] = [approvalEnv("APPROVAL_EXECUTION_TIMEOUT_SECONDS", 300)];
     const stuck = await pool.query(
-      `SELECT id FROM approvals
+      `SELECT * FROM approvals
         WHERE status = 'executing'
-          AND execution_started_at < now() - ($1::int * interval '1 second')`,
-      [approvalEnv("APPROVAL_EXECUTION_TIMEOUT_SECONDS", 300)]
+          AND execution_started_at < now() - ($1::int * interval '1 second')
+          ${sweepScope(stuckParams)}`,
+      stuckParams
     );
     for (const row of stuck.rows) {
       await pool.query(
@@ -1374,10 +1557,13 @@ export function registerApprovalControlRoutes(app: FastifyInstance): void {
       params.push(q.status);
       where.push(`a.status = $${params.length}`);
     }
-    // The control surface requires approve scope (auth table), so rows only
-    // reach approvers; the workspace filter still bounds what they see.
+    // The control surface requires approve scope (auth table), and approval
+    // authority is project-scoped. Workspace membership alone is not enough:
+    // two projects can share a workspace.
     const ascope = scopeClause(req.principal, params, "a.workspace_id");
     if (ascope) where.push(ascope);
+    const apProject = projectClause(req.principal, params, "a.project_id");
+    if (apProject) where.push(apProject);
     params.push(limit);
     // FR-021: carry the gateway decision correlation (run/span/request) so the
     // approver can open the trace the held call belongs to. The decision row
@@ -1409,6 +1595,34 @@ export function registerApprovalControlRoutes(app: FastifyInstance): void {
     return { items };
   });
 
+  app.get("/_control/v1/approvals/:id", async (req, reply) => {
+    reply.header("Cache-Control", "no-store");
+    const { id } = req.params as { id: string };
+    const res = await pool.query(
+      `SELECT a.*, d.run_id, d.span_id, d.request_id
+         FROM approvals a
+         LEFT JOIN LATERAL (
+           SELECT run_id, span_id, request_id FROM policy_decisions
+            WHERE approval_id = a.id
+            ORDER BY timestamp DESC LIMIT 1
+         ) d ON true
+        WHERE a.id = $1`,
+      [id]
+    );
+    const approval = res.rows[0];
+    if (!approval) return reply.code(404).send({ error: "approval_not_found" });
+    if (!workspaceAllowed(req.principal, approval.workspace_id) ||
+        !projectAllowed(req.principal, approval.project_id)) {
+      return reply.code(404).send({ error: "approval_not_found" });
+    }
+    if (!approval.args_enc) return approval;
+    try {
+      return { ...approval, args: storedArgs(approval) };
+    } catch {
+      return { ...approval, args: {}, decrypt_error: true };
+    }
+  });
+
   app.post("/_control/v1/approvals/:id/decision", async (req, reply) => {
     reply.header("Cache-Control", "no-store");
     const { id } = req.params as { id: string };
@@ -1431,8 +1645,9 @@ export function registerApprovalControlRoutes(app: FastifyInstance): void {
         await client.query("ROLLBACK");
         return reply.code(409).send({ error: "approval_not_pending", status: approval.status });
       }
-      // Approvals from other workspaces read as missing here too.
-      if (!workspaceAllowed(req.principal, approval.workspace_id)) {
+      // Approvals outside the approver's workspace or project read as missing.
+      if (!workspaceAllowed(req.principal, approval.workspace_id) ||
+          !projectAllowed(req.principal, approval.project_id)) {
         await client.query("ROLLBACK");
         return reply.code(404).send({ error: "approval_not_found" });
       }

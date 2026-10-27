@@ -436,6 +436,42 @@ describe("MCP streamable HTTP gateway", () => {
     });
   });
 
+  it("does not dispatch an allow when the decision cannot be persisted", async () => {
+    // Section 15: the decision and audit evidence must be durable before the
+    // upstream side effect. Break the decision write and prove the tool body
+    // still never ran. Without the pre-dispatch ordering the upstream would
+    // answer and only then would the gateway fail.
+    const before = hits.echo;
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION test_fail_allow_decision() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.tool_name = 'echo' AND NEW.decision = 'allow' THEN
+          RAISE EXCEPTION 'injected policy decision outage';
+        END IF;
+        RETURN NEW;
+      END;
+      $$`);
+    await pool.query(
+      "CREATE TRIGGER test_fail_allow_decision BEFORE INSERT ON policy_decisions " +
+      "FOR EACH ROW EXECUTE FUNCTION test_fail_allow_decision()"
+    );
+    try {
+      const name = `${alias}__echo`;
+      const res = await rpc("tools/call",
+        { name, arguments: { text: "must-not-run" }, _meta: meta(`fault-${tag}`) },
+        { name });
+      // MCP carries application failures as a JSON-RPC error on an HTTP 200.
+      const body = res.json() as JsonBody;
+      expect(body.error.code).toBe(-32603);
+      expect(body.error.data.error).toBe("UPSTREAM_FAILED");
+      expect(hits.echo).toBe(before);
+    } finally {
+      await pool.query("DROP TRIGGER IF EXISTS test_fail_allow_decision ON policy_decisions");
+      await pool.query("DROP FUNCTION IF EXISTS test_fail_allow_decision()");
+    }
+  });
+
   it("serves MCP only over HTTP and refuses a stdio-shaped upstream", async () => {
     // §7.1/FR-026: the gateway is an HTTP boundary. There is no transport
     // selector to abuse, and a registration that names a stdio command is

@@ -205,6 +205,29 @@ describe("upstream request guard", () => {
     }
   });
 
+  it("refuses a redirect instead of following it to another address", async () => {
+    // A public upstream can answer a checked URL with a redirect to the
+    // metadata service or an internal host. The hop target was never checked,
+    // so the guard must not follow it; the body must not be replayed either.
+    const target = await listen();
+    const redirector = createServer((_req, res) => {
+      res.writeHead(302, { location: target.url });
+      res.end();
+    });
+    await new Promise<void>((resolve) => redirector.listen(0, "127.0.0.1", resolve));
+    const { port } = redirector.address() as AddressInfo;
+    try {
+      await withPrivateUpstreams("true", async () => {
+        await expect(guardedFetch(`http://127.0.0.1:${port}/mcp`))
+          .rejects.toThrow(/redirect/);
+      });
+      expect(target.hits(), "the redirect target must never be dialled").toBe(0);
+    } finally {
+      await new Promise<void>((resolve) => redirector.close(() => resolve()));
+      await target.close();
+    }
+  });
+
   it("still reaches an allowed upstream, so the guard is not a blanket refusal", async () => {
     const upstream = await listen();
     try {
