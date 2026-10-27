@@ -93,7 +93,7 @@ jobs:
         run: node tests/faults/run.mjs
       - name: OAuth clean-clone run
         run: node tests/oauth/clean-run.mjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: sbom.cdx.json
@@ -156,7 +156,7 @@ jobs:
       - run: pnpm --filter @traceguard/api... build
       - run: pnpm --filter @traceguard/web build
       - run: pnpm exec playwright test --config tests/e2e/playwright.config.ts
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: playwright-report
