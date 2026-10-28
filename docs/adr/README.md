@@ -16,6 +16,7 @@ must know. Implementation detail lives in the linked code and runbooks.
 | [0007](0007-product-name.md) | TraceGuard is a provisional name pending a clearance search |
 | [0008](0008-workspace-tooling.md) | pnpm workspaces and a committed frozen lockfile |
 | [0009](0009-repository-layout.md) | Gateway entrypoint and policy engine stay inside `apps/api` for 1.0 |
+| [0010](0010-credential-custody.md) | The gateway alone resolves upstream credentials; the API delegates discovery |
 
 An ADR is superseded by editing its status and linking the replacement; old
 records are not deleted.
