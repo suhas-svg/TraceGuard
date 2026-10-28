@@ -84,5 +84,23 @@ Rotate by generating a fresh key, deploying it as the primary with the old
 key as the previous, waiting past the approval TTL so sealed rows drain,
 then removing the previous key. New rows always use the primary.
 
+## Repository layout
+
+The specification's §5.4 tree is illustrative; the accepted deviations are
+recorded in [ADR-0009](adr/0009-repository-layout.md). In this repository:
+
+- `apps/api/src/gateway.ts` is the gateway entrypoint. It builds to
+  `apps/api/dist/gateway.js` and runs as its own container with ports 8091
+  (agent-facing) and 8093 (control), the `gateway_runtime` database role, and
+  the `agent_edge` (agent side) and `tools` (upstream side) network legs. It
+  shares the API image so the two services cannot drift between builds.
+- `apps/api/src/policy.ts` is the pure policy evaluator;
+  `policy-bundle.ts` loads and verifies the signed bundle from the database.
+- `examples/mock-tools/` is the combined read/write upstream used by compose,
+  the e2e suite, the security check, and the demo. It publishes no host port.
+
+The trust boundary is the container, database role, and network position — not
+the directory a source file lives in.
+
 Known limits: one API key per deploy, one approver key, and the SDK trusts the clock
 for Zulu timestamps.
