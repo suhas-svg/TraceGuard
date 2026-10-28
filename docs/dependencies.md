@@ -63,14 +63,14 @@ Dependabot PRs are reviewed like any other change: check the changelog for
 license changes, confirm the SBOM diff, and merge only when every required check
 is green.
 
-## Current snapshot (2026-10-27)
+## Current snapshot (2026-10-28)
 
 `pnpm run deps:check` against the installed workspace:
 
 ```
-Scanned 369 packages from the installed pnpm workspace
+Scanned 315 packages from the installed pnpm workspace
   production: 159
-  development: 210
+  development: 156
 Production licenses:
    140  MIT
     11  ISC
@@ -78,9 +78,12 @@ Production licenses:
      1  Apache-2.0
      1  BSD-2-Clause
 
-Development warnings (not shipped): 1
-  caniuse-lite@1.0.30001819 — CC-BY-4.0 — not-in-allowlist
+Development warnings (not shipped): 0
 ```
+
+The former `caniuse-lite` development warning is gone with the Vite 8
+migration: `@vitejs/plugin-react@6` no longer pulls the Babel/browserslist
+chain.
 
 `pnpm run deps:advisories` reports **0 accepted, 0 blocking** at this
 revision. The zod 3 time-box for GHSA-mrhx-c7xc-m3w5 was retired by moving the
