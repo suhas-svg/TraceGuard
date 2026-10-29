@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="TraceGuard dashboard redesign prototype">
+  <title>Overview · TraceGuard</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Ctext x='16' y='21' font-family='monospace' font-size='12' font-weight='700' fill='white' text-anchor='middle'%3ETG%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <div class="scrim" id="navScrim"></div>
+
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">TG</span>
+        <div class="brand-text">
+          <div class="brand-name">TraceGuard</div>
+          <div class="brand-tag">agent control plane</div>
+        </div>
+      </div>
+
+      <nav id="nav" aria-label="Primary"></nav>
+
+      <div class="sidebar-footer">
+        <button class="connection" id="connectionBtn" aria-label="Open connection settings">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span class="connection-text">
+            <span class="connection-title">API connected</span>
+            <span class="connection-sub">localhost:8090</span>
+          </span>
+        </button>
+        <button class="user-row" id="userBtn" aria-label="Open account and connection settings">
+          <span class="avatar" aria-hidden="true">AK</span>
+          <span class="user-text">
+            <span class="user-name">Alex Kim</span>
+            <span class="user-role">Admin</span>
+          </span>
+        </button>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <button class="icon-btn mobile-menu" id="menuBtn" aria-label="Open navigation">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        </button>
+        <div class="breadcrumb" id="breadcrumb"></div>
+        <span class="prototype-pill"><span></span>Prototype</span>
+        <div class="topbar-spacer"></div>
+        <button class="workspace-btn" id="workspaceBtn">
+          <span class="workspace-dot" aria-hidden="true"></span>
+          <span>Acme Production</span>
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <button class="search-trigger" id="searchTrigger" aria-label="Open command palette">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+          <span>Search or jump to…</span>
+          <span class="kbd">Ctrl K</span>
+        </button>
+        <button class="icon-btn" id="themeToggle" aria-label="Switch to dark mode"></button>
+        <button class="icon-btn has-dot" id="bellBtn" aria-label="Notifications">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 00-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M13.7 21a2 2 0 01-3.4 0"/></svg>
+        </button>
+        <span class="topbar-divider"></span>
+        <div class="avatar" aria-hidden="true">AK</div>
+      </header>
+
+      <main id="view" tabindex="-1"></main>
+    </div>
+  </div>
+
+  <div class="palette-scrim" id="paletteScrim" hidden>
+    <div class="palette" role="dialog" aria-modal="true" aria-label="Command palette">
+      <div class="palette-search">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <input id="paletteInput" placeholder="Search views, runs, actions…" aria-label="Command palette search" autocomplete="off">
+        <kbd>esc</kbd>
+      </div>
+      <div class="palette-list" id="paletteList"></div>
+      <div class="palette-foot"><span>↑↓ navigate</span><span>↵ select</span><span>esc close</span></div>
+    </div>
+  </div>
+
+  <div class="drawer-scrim" id="drawerScrim" hidden>
+    <div class="drawer" role="dialog" aria-modal="true" aria-label="Connection settings">
+      <div class="drawer-head">
+        <div>
+          <h2>Connection</h2>
+          <p>Where this dashboard sends reads and decisions.</p>
+        </div>
+        <button class="icon-btn" data-close-drawer aria-label="Close connection settings">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="drawer-body">
+        <form id="connectionForm">
+          <div class="field">
+            <label for="apiUrl">API URL</label>
+            <input class="input" id="apiUrl" value="http://localhost:8090">
+          </div>
+          <div class="field">
+            <label for="apiKey">API key</label>
+            <input class="input" id="apiKey" type="password" placeholder="Stored in this browser only">
+          </div>
+          <div class="field">
+            <label for="gatewayUrl">Gateway URL</label>
+            <input class="input" id="gatewayUrl" value="http://localhost:8091">
+          </div>
+          <div class="field">
+            <label for="approverKey">Approver key</label>
+            <input class="input" id="approverKey" type="password" placeholder="Required for approvals">
+          </div>
+          <div class="note">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/></svg>
+            <span>Keys stay in this browser. They are never written to the server or included in exports.</span>
+          </div>
+          <div class="connection-result" id="connectionResult" role="status"></div>
+          <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+            <button type="submit" class="btn primary">Save connection</button>
+            <button type="button" class="btn" id="testConnection">Test connection</button>
+          </div>
+        </form>
+      </div>
+      <div class="drawer-foot">
+        <span class="muted" style="font-size:10.5px">TraceGuard v0.1</span>
+        <a class="link-btn" href="#/overview" data-close-drawer>Done</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
