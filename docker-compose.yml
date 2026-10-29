@@ -57,6 +57,10 @@ services:
       # The dashboard exchanges the approver key for a session on the API
       # listener too; without it here the approver half of the connect fails.
       APPROVER_KEY: ${APPROVER_KEY:-dev_approver_change_me}
+      # ADR-0010: the API resolves no upstream credential. Discovery is
+      # delegated to the gateway's internal listener on the private network.
+      GATEWAY_INTERNAL_URL: http://gateway:8094
+      GATEWAY_INTERNAL_TOKEN: ${GATEWAY_INTERNAL_TOKEN:-dev_internal_change_me}
       PORT: 8080
     ports:
       - "8090:8080" # 8080 is taken on some dev machines, public side stays off it
@@ -87,6 +91,10 @@ services:
       # §9: human approvals live on their own control listener so agent
       # credentials never reach the queue or decisions.
       GATEWAY_CONTROL_PORT: 8093
+      # ADR-0010: service-to-service discovery listener. It stays on `front`
+      # and is never published; only the API is meant to reach it.
+      GATEWAY_INTERNAL_PORT: 8094
+      GATEWAY_INTERNAL_TOKEN: ${GATEWAY_INTERNAL_TOKEN:-dev_internal_change_me}
       APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS:-900}
       APPROVAL_CLAIM_LEASE_SECONDS: ${APPROVAL_CLAIM_LEASE_SECONDS:-30}
       # §10.2/FR-019: the gateway may verify a checkpoint, never sign one. The

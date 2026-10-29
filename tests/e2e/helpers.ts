@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { APIRequestContext, Page } from "@playwright/test";
-import { API_KEY, API_URL, APPROVER_KEY, GATEWAY_STATE_DIR, GATEWAY_URL, MOCK_TOOLS_URL, PUBLISHER_DATABASE_URL } from "./env";
+import { API_KEY, API_URL, APPROVER_KEY, GATEWAY_CONTROL_URL, GATEWAY_STATE_DIR, GATEWAY_URL, MOCK_TOOLS_URL, PUBLISHER_DATABASE_URL } from "./env";
 
 const auth = (key: string) => ({ authorization: `Bearer ${key}` });
 
@@ -101,13 +101,14 @@ export async function setKeys(page: Page) {
   // The dashboard keeps only URLs in localStorage. Privileged keys are
   // exchanged once for HttpOnly session cookies in the shared context jar.
   await page.addInitScript(
-    ([apiUrl, gwUrl]) => {
+    ([apiUrl, gwUrl, gwControlUrl]) => {
       localStorage.removeItem("tg_key");
       localStorage.removeItem("tg_approver_key");
       localStorage.setItem("tg_url", apiUrl);
       localStorage.setItem("tg_gw_url", gwUrl);
+      localStorage.setItem("tg_gw_control_url", gwControlUrl);
     },
-    [API_URL, GATEWAY_URL] as const
+    [API_URL, GATEWAY_URL, GATEWAY_CONTROL_URL] as const
   );
   for (const key of [API_KEY, APPROVER_KEY]) {
     const res = await page.context().request.post(`${API_URL}/v1/auth/session`, {

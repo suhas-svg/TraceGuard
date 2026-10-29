@@ -8,16 +8,68 @@ import { scopeClause, workspaceAllowed } from "./auth.js";
 import { projectAllowed, projectClause, resolveProject } from "./project-scope.js";
 import { gatewayAlias } from "./mcp.js";
 import {
-  checkUpstreamUrlResolved, definitionHash, definitionIssue, discoverTools,
-  pinnedDefinition
+  checkUpstreamUrlResolved, definitionHash, definitionIssue,
+  pinnedDefinition, type DiscoveredTool
 } from "./upstream.js";
-import { resolveSecretRef, secretRefIssue } from "./secret-ref.js";
+import { secretRefIssue } from "./secret-ref.js";
 
 async function defaultWorkspaceId(client: PoolClient): Promise<string> {
   const found = await client.query("SELECT id FROM workspaces WHERE name = 'default'");
   if (found.rows[0]) return found.rows[0].id;
   const created = await client.query("INSERT INTO workspaces (name) VALUES ('default') RETURNING id");
   return created.rows[0].id;
+}
+
+type DiscoveryResponse =
+  | { ok: true; tools: DiscoveredTool[] }
+  | { ok: false; status: number; error: string; reason?: string };
+
+// ADR-0010: the API never resolves a server credential. It asks the gateway's
+// internal listener to perform discovery; the gateway reads the row, resolves
+// the secret in its own process, and returns only definitions.
+async function discoverViaGateway(
+  id: string, log: FastifyRequest["log"]
+): Promise<DiscoveryResponse> {
+  const base = process.env.GATEWAY_INTERNAL_URL ?? "";
+  const token = process.env.GATEWAY_INTERNAL_TOKEN ?? "";
+  if (!base || !token) {
+    return { ok: false, status: 503, error: "discovery_unavailable" };
+  }
+  let response: Response;
+  try {
+    response = await fetch(
+      `${base.replace(/\/+$/, "")}/internal/v1/servers/${encodeURIComponent(id)}/discover`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(15_000)
+      }
+    );
+  } catch (err) {
+    log.error({ err }, "gateway internal discovery unreachable");
+    return { ok: false, status: 503, error: "discovery_unavailable" };
+  }
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    return { ok: false, status: 502, error: "discovery_failed" };
+  }
+  if (!response.ok) {
+    const body = payload as { error?: unknown; reason?: unknown };
+    return {
+      ok: false,
+      // Relay only the contract's statuses; anything else is a gateway fault.
+      status: [400, 404, 409, 502, 503, 504].includes(response.status) ? response.status : 502,
+      error: typeof body.error === "string" ? body.error : "discovery_failed",
+      reason: typeof body.reason === "string" ? body.reason : undefined
+    };
+  }
+  const tools = (payload as { tools?: unknown }).tools;
+  if (!Array.isArray(tools)) {
+    return { ok: false, status: 502, error: "discovery_failed" };
+  }
+  return { ok: true, tools: tools as DiscoveredTool[] };
 }
 
 export function registerAdminRoutes(app: FastifyInstance): void {
@@ -203,18 +255,17 @@ export function registerAdminRoutes(app: FastifyInstance): void {
       if (!recheck.ok) {
         return reply.code(400).send({ error: "unsafe_upstream", reason: recheck.reason });
       }
-      // Discovery also talks to the upstream, so it uses the same reference
-      // resolution as a tool call and fails closed when the credential is
-      // unavailable. B1 keeps this read in the API for the existing admin
-      // route; the value is never persisted or returned.
-      let authSecret: string | null;
-      try {
-        authSecret = resolveSecretRef(server.secret_ref);
-      } catch (err) {
-        req.log.error({ err }, "upstream secret reference unavailable");
-        return reply.code(503).send({ error: "secret_unavailable" });
+      // Discovery talks to the upstream with a server credential, so it is the
+      // gateway's job (ADR-0010): the API sends only the server id and gets
+      // back tool definitions. It never resolves or sees the secret.
+      const discovery = await discoverViaGateway(server.id, req.log);
+      if (!discovery.ok) {
+        return reply.code(discovery.status).send({
+          error: discovery.error,
+          ...(discovery.reason ? { reason: discovery.reason } : {})
+        });
       }
-      const tools = await discoverTools(server.base_url, authSecret);
+      const tools = discovery.tools;
       const rejected: { name: string; reason: string }[] = [];
       const pinned: string[] = [];
       const changed: string[] = [];

@@ -85,6 +85,28 @@ spec:
         - ipBlock:
             cidr: 0.0.0.0/0
 ---
+# ADR-0010: the internal discovery listener is a service-to-service surface.
+# Only api pods may reach it; it is deliberately absent from the dashboard
+# ingress policy below, so no external client can.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traceguard-gateway-internal-ingress
+  namespace: traceguard
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api
+      ports:
+        - protocol: TCP
+          port: 8094
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

@@ -1,7 +1,8 @@
 # ADR-0010: The gateway alone resolves upstream credentials
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-28
+- Implemented: 2026-10-29
 - Deciders: TraceGuard maintainers
 - Related: spec §7.3, §7.4; ADR-0004, ADR-0006; `apps/api/src/secret-ref.ts`,
   `apps/api/src/admin.ts`, `apps/api/src/gateway.ts`, `docker-compose.yml`,
