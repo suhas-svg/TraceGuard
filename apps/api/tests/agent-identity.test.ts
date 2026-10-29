@@ -30,7 +30,6 @@ let otherProjectId = "";
 let serverId = "";
 let alias = "";
 let principalA = "";
-let principalB = "";
 let foreignPrincipal = "";
 let tokenA = "";
 let tokenB = "";
@@ -145,7 +144,7 @@ describe("authenticated agent identity", () => {
       return res.json().id as string;
     };
     principalA = await provision(projectId, `agent-a-${tag}`);
-    principalB = await provision(projectId, `agent-b-${tag}`);
+    await provision(projectId, `agent-b-${tag}`);
     foreignPrincipal = await provision(otherProjectId, `agent-foreign-${tag}`);
     tokenA = mint(projectId, "gateway read", `agent-a-${tag}`);
     tokenB = mint(projectId, "gateway read", `agent-b-${tag}`);
