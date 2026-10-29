@@ -288,6 +288,96 @@ describe("least-privilege database roles", () => {
     });
   });
 
+  it("api_runtime cannot activate or clear quarantine on a tool pin", async () => {
+    // §13.4/FR-018a: the control API may create candidates and quarantine, but
+    // it must not be able to re-trust a changed tool definition. The old
+    // api_set_server_tool_state procedure allowed exactly that by accepting
+    // p_quarantined=false and an arbitrary active pin id.
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const ws = await pool.query<{ id: string }>(
+      "INSERT INTO workspaces (name) VALUES ($1) RETURNING id",
+      [`pin-boundary-${suffix}`]
+    );
+    const project = await pool.query<{ id: string }>(
+      "SELECT id FROM projects WHERE workspace_id = $1 LIMIT 1",
+      [ws.rows[0].id]
+    );
+    const server = await pool.query<{ id: string }>(
+      `INSERT INTO mcp_servers (workspace_id, project_id, name, base_url, gateway_alias)
+       VALUES ($1, $2, $3, 'http://mock-tools:9000', $4) RETURNING id`,
+      [ws.rows[0].id, project.rows[0].id, `pin-boundary-${suffix}`, `pin_boundary_${suffix}`.slice(0, 32)]
+    );
+    const pin = await pool.query<{ id: string }>(
+      `INSERT INTO tool_pins
+         (server_id, tool_name, version, definition, definition_hash, status)
+       VALUES ($1, 'echo', 1, '{"name":"echo"}'::jsonb, 'hash-v1', 'active')
+       RETURNING id`,
+      [server.rows[0].id]
+    );
+    await pool.query(
+      `INSERT INTO server_tools
+         (server_id, tool_name, definition, definition_hash, description,
+          input_schema, active_pin_id, quarantined, quarantine_reason)
+       VALUES ($1, 'echo', '{"name":"echo"}'::jsonb, 'hash-v1', '',
+               '{}'::jsonb, $2, true, 'definition changed')`,
+      [server.rows[0].id, pin.rows[0].id]
+    );
+
+    await asRole("api_runtime", async (c) => {
+      expect(await attempt(c, () => c.query(
+        `INSERT INTO tool_pins
+           (server_id, tool_name, version, definition, definition_hash, status)
+         VALUES ($1, 'echo', 2, '{}'::jsonb, 'hash-v2', 'active')`,
+        [server.rows[0].id]
+      ))).toBe(DENIED);
+      expect(await attempt(c, () => c.query(
+        `INSERT INTO server_tools
+           (server_id, tool_name, definition, definition_hash)
+         VALUES ($1, 'other', '{}'::jsonb, 'hash-other')`,
+        [server.rows[0].id]
+      ))).toBe(DENIED);
+      // The old activation/unquarantine shortcut is gone, not merely guarded.
+      expect(await attempt(c, () => c.query(
+        `SELECT * FROM api_set_server_tool_state($1, 'echo', NULL, false, NULL, false, NULL)`,
+        [server.rows[0].id]
+      ))).toBe("42883");
+
+      const state = await c.query<{ quarantined: boolean; active_pin_id: string }>(
+        `SELECT quarantined, active_pin_id
+           FROM api_set_tool_review_state($1, 'echo', NULL, true, 'still quarantined')`,
+        [server.rows[0].id]
+      );
+      expect(state.rows[0]?.quarantined).toBe(true);
+      expect(state.rows[0]?.active_pin_id).toBe(pin.rows[0].id);
+
+      // Re-initialization cannot replace existing pin history with a new active
+      // pin, even if the caller supplies a fresh definition and hash.
+      expect(await attempt(c, () => c.query(
+        `SELECT * FROM api_initialize_tool_pin($1, 'echo', '{}'::jsonb, 'hash-v2')`,
+        [server.rows[0].id]
+      ))).toBe("P0001");
+    });
+
+    const fns = await pool.query<{ proname: string; owner: string; secdef: boolean }>(
+      `SELECT proname, pg_get_userbyid(proowner) AS owner, prosecdef AS secdef
+         FROM pg_proc
+        WHERE proname IN
+          ('api_initialize_tool_pin', 'api_create_tool_pin_candidate', 'api_set_tool_review_state')
+        ORDER BY proname`
+    );
+    expect(fns.rows.map((r) => r.proname)).toEqual([
+      "api_create_tool_pin_candidate",
+      "api_initialize_tool_pin",
+      "api_set_tool_review_state"
+    ]);
+    for (const row of fns.rows) {
+      expect(row.owner).toBe("policy_owner");
+      expect(row.secdef).toBe(true);
+    }
+
+    await pool.query("DELETE FROM workspaces WHERE id = $1", [ws.rows[0].id]);
+  });
+
   it("policy_publisher appends versions and trust through narrow procedures", async () => {
     await asRole("policy_publisher", async (c) => {
       expect(await attempt(c, () => c.query("UPDATE policy_versions SET content_hash = 'x' WHERE false"))).toBe(DENIED);

@@ -292,7 +292,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
           // only existing tools transition; the rejection is still audited.
           if (current.rows[0]) {
             await client.query(
-              `SELECT * FROM api_set_server_tool_state($1,$2,NULL,true,NULL,true,$3)`,
+              `SELECT * FROM api_set_tool_review_state($1,$2,NULL,true,$3)`,
               [id, t.name, issue]
             );
           }
@@ -319,22 +319,13 @@ export function registerAdminRoutes(app: FastifyInstance): void {
           [id, t.name]
         );
         if (!existing.rows[0]) {
-          await client.query(
-            `INSERT INTO server_tools
-               (server_id, tool_name, description, input_schema, definition, definition_hash)
-             VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6)`,
-            [id, t.name, t.description ?? "", JSON.stringify(t.inputSchema), JSON.stringify(definition), hash]
-          );
+          // First discovery is the only time the API may create an active
+          // pin. The procedure refuses if the tool already has pin history,
+          // so a changed definition can never re-enter through this path.
           const pin = await client.query(
-            `INSERT INTO tool_pins
-               (server_id, tool_name, version, definition, definition_hash, status)
-             VALUES ($1,$2,1,$3::jsonb,$4,'active')
-             RETURNING id, version`,
-            [id, t.name, JSON.stringify(definition), hash]
-          );
-          await client.query(
-            `SELECT * FROM api_set_server_tool_state($1,$2,$3)`,
-            [id, t.name, pin.rows[0].id]
+            `SELECT * FROM api_initialize_tool_pin($1,$2,$3::jsonb,$4,$5,$6::jsonb)`,
+            [id, t.name, JSON.stringify(definition), hash, t.description ?? "",
+             JSON.stringify(t.inputSchema)]
           );
           pinned.push(t.name);
           await audit(client, { actor_type: "system", action: "tool.pinned",
@@ -361,20 +352,12 @@ export function registerAdminRoutes(app: FastifyInstance): void {
               [existing.rows[0].candidate_pin_id]
             );
           }
-          const next = await client.query(
-            `SELECT COALESCE(MAX(version), 0) + 1 AS version
-               FROM tool_pins WHERE server_id = $1 AND tool_name = $2`,
-            [id, t.name]
-          );
           const candidate = await client.query(
-            `INSERT INTO tool_pins
-               (server_id, tool_name, version, definition, definition_hash, status, quarantine_reason)
-             VALUES ($1,$2,$3,$4::jsonb,$5,'candidate','definition changed')
-             RETURNING id, version`,
-            [id, t.name, next.rows[0].version, JSON.stringify(definition), hash]
+            `SELECT * FROM api_create_tool_pin_candidate($1,$2,$3::jsonb,$4,'candidate','definition changed')`,
+            [id, t.name, JSON.stringify(definition), hash]
           );
           await client.query(
-            `SELECT * FROM api_set_server_tool_state($1,$2,NULL,true,$3,true,'definition changed')`,
+            `SELECT * FROM api_set_tool_review_state($1,$2,$3,true,'definition changed')`,
             [id, t.name, candidate.rows[0].id]
           );
           changed.push(t.name);
@@ -399,7 +382,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
             [existing.rows[0].candidate_pin_id]
           );
           await client.query(
-            "SELECT * FROM api_set_server_tool_state($1,$2,NULL,true,NULL)",
+            "SELECT * FROM api_set_tool_review_state($1,$2,NULL,true,NULL)",
             [id, t.name]
           );
         }
@@ -535,7 +518,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
         );
       }
       const res = await client.query(
-        `SELECT * FROM api_set_server_tool_state($1,$2,NULL,true,NULL,true,'quarantined by reviewer')`,
+        `SELECT * FROM api_set_tool_review_state($1,$2,NULL,true,'quarantined by reviewer')`,
         [sid, tool]
       );
       await audit(client, { actor_type: "admin", actor_id: req.principal?.userId ?? undefined,
@@ -607,17 +590,9 @@ export function registerAdminRoutes(app: FastifyInstance): void {
             [pin.current_candidate_pin_id]
           );
         }
-        const next = await client.query(
-          `SELECT COALESCE(MAX(version), 0) + 1 AS version
-             FROM tool_pins WHERE server_id = $1 AND tool_name = $2`,
-          [pin.server_id, pin.tool_name]
-        );
         const candidate = await client.query(
-          `INSERT INTO tool_pins
-             (server_id, tool_name, version, definition, definition_hash, status, quarantine_reason)
-           VALUES ($1,$2,$3,$4::jsonb,$5,'pending_review','review requested')
-           RETURNING id, version, status`,
-          [pin.server_id, pin.tool_name, next.rows[0].version, JSON.stringify(pin.definition),
+          `SELECT * FROM api_create_tool_pin_candidate($1,$2,$3::jsonb,$4,'pending_review','review requested')`,
+          [pin.server_id, pin.tool_name, JSON.stringify(pin.definition),
            pin.definition_hash]
         );
         candidateId = candidate.rows[0].id;
@@ -631,7 +606,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
         candidateStatus = updated.rows[0].status;
       }
       await client.query(
-        `SELECT * FROM api_set_server_tool_state($1,$2,NULL,true,$3,true,'review requested')`,
+        `SELECT * FROM api_set_tool_review_state($1,$2,$3,true,'review requested')`,
         [pin.server_id, pin.tool_name, candidateId]
       );
       await audit(client, { actor_type: "admin", actor_id: req.principal?.userId ?? undefined,
