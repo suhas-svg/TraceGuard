@@ -30,7 +30,10 @@ def check(label: str, ok: bool, detail: str = "") -> None:
 
 
 def _pod_spec(doc: dict) -> dict:
-    return (doc.get("spec", {}).get("template", {}).get("spec", {}) or {})
+    spec = doc.get("spec", {}) or {}
+    if doc.get("kind") == "CronJob":
+        spec = spec.get("jobTemplate", {}).get("spec", {}) or {}
+    return (spec.get("template", {}).get("spec", {}) or {})
 
 
 def containers(doc: dict) -> list[dict]:
@@ -84,7 +87,7 @@ for doc in docs:
         name = f"{doc['kind']}/{doc['metadata']['name']}/{con['name']}"
         res = con.get("resources", {}) or {}
         check(f"4a. {name} resources", bool(res.get("requests")) and bool(res.get("limits")))
-    if doc["kind"] != "Job":  # batch containers are not probed
+    if doc["kind"] not in ("Job", "CronJob"):  # batch containers are not probed
         for con in main_containers(doc):
             name = f"{doc['kind']}/{doc['metadata']['name']}/{con['name']}"
             check(f"4b. {name} probe", bool(con.get("livenessProbe") or con.get("readinessProbe")))

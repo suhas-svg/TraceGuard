@@ -1,0 +1,61 @@
+# §11.3/§11.4/§12.3: the API exposes its sweeps as cron endpoints. This is the
+# cron. It runs the same four calls as scripts/maintenance.mjs --once; keep the
+# two in step.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: maintenance
+  namespace: traceguard
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: maintenance
+        spec:
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile: { type: RuntimeDefault }
+          restartPolicy: Never
+          containers:
+            - name: maintenance
+              image: traceguard/api:v1.16.0
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: { drop: ["ALL"] }
+              command: ["node", "-e"]
+              args:
+                - |
+                  const base = "http://api:8080";
+                  const calls = [
+                    "/v1/admin/finalize-stale-runs?older_than_seconds=900",
+                    "/v1/admin/finalize-orphan-spans?older_than_seconds=900",
+                    "/v1/admin/sweep-budget-holds",
+                    "/v1/retention/run",
+                  ];
+                  let failed = 0;
+                  for (const p of calls) {
+                    try {
+                      const r = await fetch(base + p, { method: "POST",
+                        headers: { authorization: "Bearer " + process.env.API_KEY },
+                        signal: AbortSignal.timeout(60000) });
+                      const t = await r.text();
+                      if (r.ok || t.includes("no_retention_rules")) console.log(p, "ok");
+                      else { failed++; console.error(p, r.status, t.slice(0, 200)); }
+                    } catch (e) { failed++; console.error(p, String(e)); }
+                  }
+                  process.exit(failed ? 1 : 0);
+              env:
+                - name: API_KEY
+                  valueFrom: { secretKeyRef: { name: traceguard-secrets, key: API_KEY } }
+              resources:
+                requests: { memory: "64Mi", cpu: "50m" }
+                limits: { memory: "256Mi" }

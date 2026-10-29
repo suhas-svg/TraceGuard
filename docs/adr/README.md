@@ -17,6 +17,7 @@ must know. Implementation detail lives in the linked code and runbooks.
 | [0008](0008-workspace-tooling.md) | pnpm workspaces and a committed frozen lockfile |
 | [0009](0009-repository-layout.md) | Gateway entrypoint and policy engine stay inside `apps/api` for 1.0 |
 | [0010](0010-credential-custody.md) | The gateway alone resolves upstream credentials; the API delegates discovery |
+| [0011](0011-accepted-spec-deviations.md) | Accepted deviations from spec v3.0 found in the 2026-10-29 scan |
 
 An ADR is superseded by editing its status and linking the replacement; old
 records are not deleted.

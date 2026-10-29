@@ -11,6 +11,7 @@ resources:
   - gateway.yaml
   - web.yaml
   - networkpolicy.yaml
+  - maintenance-cronjob.yaml
 
 images:
   - name: traceguard/api

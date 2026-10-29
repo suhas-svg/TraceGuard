@@ -166,6 +166,27 @@ services:
     networks:
       - agent_edge
 
+  # §11.3/§11.4/§12.3: orphaned runs, unresolved parents, abandoned budget
+  # holds and retention rules are cron endpoints on the API. This service is
+  # the scheduler; it holds only the admin key and sits on `front`.
+  maintenance:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - ./scripts/maintenance.mjs:/app/maintenance.mjs:ro
+    command: ["node", "maintenance.mjs"]
+    environment:
+      TRACEGUARD_URL: http://api:8080
+      API_KEY: ${API_KEY:-dev_key_change_me}
+      MAINTENANCE_TOKEN: ${MAINTENANCE_TOKEN:-}
+      MAINTENANCE_INTERVAL_SECONDS: ${MAINTENANCE_INTERVAL_SECONDS:-300}
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - front
+
   web:
     build:
       context: .

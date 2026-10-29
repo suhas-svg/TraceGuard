@@ -312,7 +312,8 @@ memberships, and OTLP ingestion landed on top; their sections are under
 - Cost explorer drill-downs: an input-vs-output cost split on the group-by view.
 - OTLP export from TraceGuard, plus log ingestion alongside traces.
 - A deployment that has actually been rolled out. The manifests are rendered and
-  checked by `infra/k8s/check.py`, never applied to a cluster, and the §14
-  numbers in `docs/PERFORMANCE.md` come from one Windows dev box.
+  checked by `infra/k8s/check.py` and were fixed to apply cleanly on a fresh kind
+  cluster (PR #88), but have not run a production-like rollout with ingress and
+  TLS, and the §14 numbers in `docs/PERFORMANCE.md` come from one Windows dev box.
 - SSO/OIDC for the dashboard, replacing bearer-token login.
 - Alerting integrations (Slack, PagerDuty) on top of the existing webhook events.
