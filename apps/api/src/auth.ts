@@ -45,6 +45,16 @@ export interface Principal {
   issuer?: string | null;
 }
 
+// §8.2/§9.1: the caller recorded on a decision and bound into an approval is
+// the authenticated principal, never a request field. An agent principal gets
+// a stable namespaced value so its approvals cannot collide with a human
+// subject that happens to share the same string.
+export function principalCaller(principal?: Principal | null): string | null {
+  if (!principal) return null;
+  if (principal.agentPrincipalId) return `agent_principal:${principal.agentPrincipalId}`;
+  return principal.userId;
+}
+
 // Writes that non-admin actors may perform. Everything else that mutates
 // state needs admin.
 const WRITE_ALLOW: [string, string][] = [

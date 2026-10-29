@@ -40,6 +40,4 @@ Back up the pgdata volume on your own schedule before trusting this.
 Two settings to revisit the moment you front this with ingress: set `DASHBOARD_ORIGIN`
 in `configmap.yaml` to the origin that serves the dashboard — CORS rejects its calls from
 any other origin — and set `ALLOW_PRIVATE_UPSTREAMS: "true"` if your upstream MCP servers
-are registered by private IP (DNS names pass either way). There is no NetworkPolicy yet:
-compose keeps the mock upstream on an internal network, this path does not enforce that
-boundary.
+are registered by private IP (DNS names pass either way). `infra/k8s/networkpolicy.yaml` now provides the boundary: default deny plus DNS and postgres rules. `infra/k8s/check.py` validates it. This path still does not provide ingress/TLS.

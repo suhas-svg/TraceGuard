@@ -697,6 +697,20 @@ export function registerAdminRoutes(app: FastifyInstance): void {
     }
   });
 
+  // §8.2/§13.1: a policy's agent scope names an authenticated AgentPrincipal
+  // in the same project. A telemetry agent id or another project's principal
+  // must not become a live rule scope.
+  async function agentPrincipalInProject(
+    client: PoolClient, agentId: string, projectId: string
+  ): Promise<boolean> {
+    const res = await client.query(
+      `SELECT 1 FROM agent_principals
+        WHERE id = $1 AND project_id = $2 AND status = 'active'`,
+      [agentId, projectId]
+    );
+    return res.rows.length > 0;
+  }
+
   const createPolicy = async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = policySchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_policy" });
@@ -708,6 +722,13 @@ export function registerAdminRoutes(app: FastifyInstance): void {
       });
       if (!projectContext) return reply.code(403).send({ error: "project_forbidden" });
       const p = parsed.data;
+      if (p.agent_id && !(await agentPrincipalInProject(
+        client, p.agent_id, projectContext.project.id
+      ))) {
+        return reply.code(400).send({
+          error: "invalid_policy", reason: "agent_principal_not_in_project"
+        });
+      }
       const res = await client.query(
         `INSERT INTO policies
            (workspace_id, project_id, name, enabled, priority, agent_id, server_id, tool_name, effect, conditions)
@@ -772,6 +793,14 @@ export function registerAdminRoutes(app: FastifyInstance): void {
         return reply.code(409).send({ error: "policy_superseded" });
       }
       const p = parsed.data;
+      if (p.agent_id && !(await agentPrincipalInProject(
+        client, p.agent_id, old.rows[0].project_id
+      ))) {
+        await client.query("ROLLBACK");
+        return reply.code(400).send({
+          error: "invalid_policy", reason: "agent_principal_not_in_project"
+        });
+      }
       const next = await client.query(
         `INSERT INTO policies
            (workspace_id, project_id, name, enabled, priority, agent_id, server_id, tool_name,

@@ -408,6 +408,47 @@ describe("least-privilege database roles", () => {
     await pool.query("DELETE FROM workspaces WHERE id = $1", [ws.rows[0].id]);
   });
 
+  it("policy agent scope is bound to an agent principal in the same project", async () => {
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const ws = await pool.query<{ id: string }>(
+      "INSERT INTO workspaces (name) VALUES ($1) RETURNING id",
+      [`policy-agent-scope-${suffix}`]
+    );
+    const projects = await pool.query<{ id: string; name: string }>(
+      "SELECT id, name FROM projects WHERE workspace_id = $1 ORDER BY name",
+      [ws.rows[0].id]
+    );
+    const first = projects.rows.find((p) => p.name === "default")!;
+    const second = await pool.query<{ id: string }>(
+      "INSERT INTO projects (workspace_id, name) VALUES ($1,$2) RETURNING id",
+      [ws.rows[0].id, `other-${suffix}`]
+    );
+    const principal = await pool.query<{ id: string }>(
+      `INSERT INTO agent_principals
+         (project_id, issuer, subject, allowed_scopes)
+       VALUES ($1, 'https://issuer.test', $2, '["gateway"]'::jsonb)
+       RETURNING id`,
+      [second.rows[0].id, `policy-agent-${suffix}`]
+    );
+
+    // A policy in project A cannot name a principal from project B, even
+    // though both rows exist in the same workspace.
+    await expect(pool.query(
+      `INSERT INTO policies (workspace_id, project_id, name, agent_id, effect)
+       VALUES ($1,$2,$3,$4,'deny')`,
+      [ws.rows[0].id, first.id, `cross-project-${suffix}`, principal.rows[0].id]
+    )).rejects.toMatchObject({ code: "23503" });
+
+    const valid = await pool.query(
+      `INSERT INTO policies (workspace_id, project_id, name, agent_id, effect)
+       VALUES ($1,$2,$3,$4,'deny') RETURNING id`,
+      [ws.rows[0].id, second.rows[0].id, `same-project-${suffix}`, principal.rows[0].id]
+    );
+    expect(valid.rows[0]?.id).toBeTruthy();
+
+    await pool.query("DELETE FROM workspaces WHERE id = $1", [ws.rows[0].id]);
+  });
+
   it("policy_publisher appends versions and trust through narrow procedures", async () => {
     await asRole("policy_publisher", async (c) => {
       expect(await attempt(c, () => c.query("UPDATE policy_versions SET content_hash = 'x' WHERE false"))).toBe(DENIED);

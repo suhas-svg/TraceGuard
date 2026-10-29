@@ -3,7 +3,7 @@ import { pool } from "./db.js";
 import { audit } from "./audit.js";
 import { evaluate } from "./policy.js";
 import { loadActivePolicy, rulesFromBundle } from "./policy-bundle.js";
-import type { Principal } from "./auth.js";
+import { principalCaller, type Principal } from "./auth.js";
 import { resolveProject } from "./project-scope.js";
 
 // The agent-facing boundary is the MCP Streamable HTTP profile of the
@@ -198,7 +198,7 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
 
   // The authenticated principal is the caller; MCP clientInfo is diagnostic
   // only (§9.1). The env key has no human identity and is a dev profile.
-  const caller = req.principal?.userId ?? "agent";
+  const caller = principalCaller(req.principal) ?? "agent";
   const meta = env.params._meta as Record<string, unknown>;
   const logicalRaw = meta[META_LOGICAL_REQUEST_ID];
   const logicalId = typeof logicalRaw === "string" && logicalRaw.length > 0 && logicalRaw.length <= 128
@@ -223,7 +223,8 @@ async function callTool(app: FastifyInstance, req: { headers: Record<string, str
       });
     }
     const verdict = evaluate(rulesFromBundle(loaded.policy.bundle), {
-      caller, agent_id: null, server_id: server.id, tool_name: tool, args
+      caller, agent_id: req.principal?.agentPrincipalId ?? null,
+      server_id: server.id, tool_name: tool, args
     });
     if (verdict.decision === "need_approval") {
       return rpcError(env.id, -32005, "Approval client required", {

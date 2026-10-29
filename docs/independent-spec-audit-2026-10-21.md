@@ -8,6 +8,8 @@
 
 **Auditor:** independent code/test review, not the repository's `docs/spec-conformance.md`
 
+> **Status note (2026-10-29):** this is the frozen 2026-10-21 baseline at `f36d122` against spec v3.0. Remediation since then (042 immutable pins, 043 `secret_ref`, 041 sessions, PKCE/resource, `external_identity_required`) is recorded only in `docs/spec-conformance.md` (maintainer self-assessment, updated 2026-10-27). No second independent re-audit has ratified it. Do not read §7 as the current tree verdict.
+
 ## Verdict
 
 **Not conformant with the v1.0 must-have set as it stands.**

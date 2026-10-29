@@ -19,7 +19,7 @@ import { loadActivePolicy, rulesFromBundle } from "./policy-bundle.js";
 import { callUpstreamTool, checkUpstreamUrlResolved, discoverTools } from "./upstream.js";
 import { resolveSecretRef } from "./secret-ref.js";
 import { hashesEqual, parseKey, seal, tryOpen } from "./seal.js";
-import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
+import { authHook, principalCaller, scopeClause, workspaceAllowed } from "./auth.js";
 import { assertProductionAuth, oauthConfigFromEnv, protectedResourceMetadata } from "./oauth.js";
 import { registerMcpRoutes } from "./mcp.js";
 import { notify } from "./notify.js";
@@ -263,9 +263,10 @@ export function buildGateway() {
     caller: z.string().max(128).optional(),
     request_id: z.string().max(128).optional(),
     approval_id: z.string().guid().optional(),
-    // Attribution the caller supplies, like `caller` itself; see
-    // docs/security.md for what that does and does not prove.
-    agent_id: z.string().guid().optional(),
+    // Agent identity is not accepted from the body: it comes from the
+    // authenticated AgentPrincipal (§8.2/§9.1). The route rejects the field
+    // explicitly rather than letting zod strip it, so a caller cannot believe
+    // it selected another agent's rules.
     // When a run is named, the gateway writes its own denials into that run's
     // trace, so denied calls show up next to failed ones (FR-005).
     run_id: z.string().guid().optional(),
@@ -405,13 +406,23 @@ export function buildGateway() {
     // is forwarded. The upstream round trip is excluded by construction.
     const t0 = performance.now();
     const overheadMs = () => Math.round(performance.now() - t0);
+    const rawBody = req.body as Record<string, unknown> | null;
+    if (rawBody && typeof rawBody === "object" && "agent_id" in rawBody) {
+      return reply.code(400).send({
+        error: "agent_id_not_accepted",
+        detail: "agent identity comes from the authenticated principal"
+      });
+    }
     const parsed = callSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_call" });
     const { server_id, tool, arguments: args } = parsed.data;
-    // Â§9.1: the caller in the binding hash is the authenticated principal,
+    // §9.1: the caller in the binding hash is the authenticated principal,
     // never a request field. Static environment keys carry no subject, so
     // only for them does the body value stand in.
-    const caller = req.principal?.userId ?? parsed.data.caller ?? parsed.data.agent_name ?? "agent";
+    const caller = principalCaller(req.principal) ?? parsed.data.caller ?? parsed.data.agent_name ?? "agent";
+    // §8.2: policy and budget agent identity is the provisioned principal
+    // matched from the bearer token, not a body field.
+    const agentPrincipalId = req.principal?.agentPrincipalId ?? null;
     // FR-021: the trace ids (when the caller supplies them) ride on every
     // decision row this call records â€” including denials that never reach an
     // approval â€” so the run view can show which decision belongs to which span.
@@ -625,7 +636,7 @@ export function buildGateway() {
       // existed when the approval was issued.
       const rules = rulesFromBundle(policy.bundle);
       const verdict = evaluate(rules, {
-        caller, agent_id: parsed.data.agent_id ?? null, server_id, tool_name: tool,
+        caller, agent_id: agentPrincipalId, server_id, tool_name: tool,
         args: args as Record<string, unknown>
       });
       const callArgsHash = argsHash(args as Record<string, unknown>);
@@ -694,7 +705,7 @@ export function buildGateway() {
       let exhausted: BudgetExhausted | null = await enforceBudget(client, {
         workspace_id: server.workspace_id,
         run_id: parsed.data.run_id ?? null,
-        agent_id: parsed.data.agent_id ?? null
+        agent_id: agentPrincipalId
       });
       // The cheap gate above rejects an already-exhausted budget. The
       // reservation procedure then holds headroom for the duration of this
@@ -702,11 +713,11 @@ export function buildGateway() {
       // both spend the same last unit. A zero amount leaves this disabled.
       const holdMicro = toolCallHoldMicro();
       if (!exhausted && holdMicro > 0
-          && (parsed.data.run_id || parsed.data.agent_id)) {
+          && (parsed.data.run_id || agentPrincipalId)) {
         const hold = await client.query(
           "SELECT gateway_reserve_tool_call($1,$2,$3,$4,$5) AS outcome",
           [server.workspace_id, parsed.data.run_id ?? null,
-           parsed.data.agent_id ?? null, holdMicro, toolCallHoldTtlSeconds()]
+           agentPrincipalId, holdMicro, toolCallHoldTtlSeconds()]
         );
         const outcome = hold.rows[0]?.outcome as ToolCallHoldOutcome | undefined;
         heldReservationIds = outcome?.reservation_ids ?? [];
@@ -721,7 +732,7 @@ export function buildGateway() {
               metadata: { tool, server_id, amount_micro: holdMicro,
                 reservation_ids: heldReservationIds,
                 run_id: parsed.data.run_id ?? null,
-                agent_id: parsed.data.agent_id ?? null }
+                agent_id: agentPrincipalId }
             });
           } catch (err) {
             // A hold with no audit record cannot be reconciled. Return the
@@ -903,7 +914,7 @@ export function buildGateway() {
           return reply.code(403).send({ error: "policy_invalidated", reason: why });
         }
         const recheck = evaluate(rulesFromBundle(freshPolicy.bundle), {
-          caller, agent_id: parsed.data.agent_id ?? null, server_id, tool_name: tool,
+          caller, agent_id: agentPrincipalId, server_id, tool_name: tool,
           args: stored
         });
         if (recheck.decision === "deny") {
@@ -1006,7 +1017,7 @@ export function buildGateway() {
           (p) => p.server_id === server.id && p.tool_name === tool
         );
         const lastVerdict = evaluate(rulesFromBundle(lastPolicy.bundle), {
-          caller, agent_id: parsed.data.agent_id ?? null, server_id, tool_name: tool,
+          caller, agent_id: agentPrincipalId, server_id, tool_name: tool,
           args: stored
         });
         // FR-010: the verdict recorded at the linearization point must be one

@@ -832,25 +832,31 @@ describe("integration and security", () => {
     }
   });
 
-  it("agent-scoped rules take effect when the call names its agent", async () => {
-    // Agent-scoped rules need a real agent row (FK), which ingest creates.
+  it("rejects caller-supplied agent identity on gateway calls and policy drafts", async () => {
+    // The telemetry `agents` table is not an authenticated principal. A policy
+    // must not be scoped to it, and a gateway call must not name its own agent.
     const agentName = `ag-deny-${tag}`;
     const ingested = await api.inject({ method: "POST", url: "/v1/ingest/events", headers: key,
       payload: { events: [ev({ agent_name: agentName })] } });
     expect(ingested.statusCode).toBe(200);
-    const agentA = (await pool.query("SELECT id FROM agents WHERE name = $1", [agentName])).rows[0].id;
-    await api.inject({ method: "POST", url: "/v1/policies", headers: key,
-      payload: { name: `agent-deny-${tag}`, priority: 200, agent_id: agentA, effect: "deny" } });
-    await publishTestPolicy(pool);
+    const telemetryAgent = (await pool.query(
+      "SELECT id FROM agents WHERE name = $1", [agentName]
+    )).rows[0].id;
+
+    const draft = await api.inject({ method: "POST", url: "/v1/policies", headers: key,
+      payload: { name: `agent-deny-${tag}`, priority: 200, agent_id: telemetryAgent, effect: "deny" } });
+    expect(draft.statusCode).toBe(400);
+    expect(draft.json().reason).toBe("agent_principal_not_in_project");
+
     const before = upstreamHits;
     const hit = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
-      payload: { server_id: serverId, tool: "echo", arguments: { text: "hi" }, caller: "t", agent_id: agentA } });
-    expect(hit.statusCode).toBe(403);
-    expect(hit.json().reason).toContain(`agent-deny-${tag}`);
+      payload: {
+        server_id: serverId, tool: "echo", arguments: { text: "hi" }, caller: "t",
+        agent_id: telemetryAgent
+      } });
+    expect(hit.statusCode).toBe(400);
+    expect(hit.json().error).toBe("agent_id_not_accepted");
     expect(upstreamHits).toBe(before);
-    const other = await gw.inject({ method: "POST", url: "/v1/gateway/tools/call", headers: key,
-      payload: { server_id: serverId, tool: "echo", arguments: { text: "hi" }, caller: "t", agent_id: randomUUID() } });
-    expect([200, 202]).toContain(other.statusCode);
   });
 
   it("records a denied gateway call as a denied span in the run trace", async () => {
