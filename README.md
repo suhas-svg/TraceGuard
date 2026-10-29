@@ -47,7 +47,8 @@ events. The gateway receives only the public key and can verify, not sign or
 prune. Artifacts produced after a prune carry the prior signed checkpoint as
 their `anchor`; the offline verifier checks it before using its workspace heads.
 
-Dev ports: API 8090, gateway 8091, approval control listener 8093, mock tools
+Dev ports: API 8090, gateway 8091, approval control listener 8093, gateway
+internal discovery 8094 (compose network only, never published), mock tools
 8092 (internal only), web 5173. The demo agent runs as the `agent` container
 on `agent_edge`: the gateway is the only container it can reach, and
 `pnpm test:security` proves that from inside it (upstream, api and postgres

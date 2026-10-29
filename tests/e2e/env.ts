@@ -5,6 +5,8 @@ export const DATABASE_URL =
   "postgres://traceguard:traceguard_dev_only@localhost:5432/traceguard_e2e";
 export const API_URL = process.env.E2E_API_URL ?? "http://localhost:8090";
 export const GATEWAY_URL = process.env.E2E_GATEWAY_URL ?? "http://localhost:8091";
+export const GATEWAY_CONTROL_URL =
+  process.env.E2E_GATEWAY_CONTROL_URL ?? "http://localhost:8093";
 export const WEB_URL = process.env.E2E_WEB_URL ?? "http://localhost:5173";
 export const MOCK_TOOLS_URL = process.env.E2E_MOCK_TOOLS_URL ?? "http://localhost:8092";
 export const API_KEY = "test_key";

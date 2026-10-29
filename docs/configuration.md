@@ -13,6 +13,9 @@ variable, which is how the compose file reads them.
 | APPROVAL_ARGS_KEY_PREVIOUS | gateway | (optional) | previous key kept during rotation until old rows expire |
 | GATEWAY_PORT | gateway | 8091 | agent-facing listener |
 | GATEWAY_CONTROL_PORT | gateway | 8093 | human approval control listener; agent credentials are rejected there |
+| GATEWAY_INTERNAL_PORT | gateway | 8094 | service-to-service discovery listener; never publish it, and keep it on the private network |
+| GATEWAY_INTERNAL_URL | api | — | base URL the api calls for discovery; unset returns `503 discovery_unavailable` |
+| GATEWAY_INTERNAL_TOKEN | api + gateway | — | shared bearer token for the internal listener; the listener refuses to start without it, and both sides must match |
 | CONTROL_API_URL | gateway | http://127.0.0.1:8090 | API base the gateway forwards the fixed `/v1/ingest/events` telemetry path to; set to `http://api:8080` in compose |
 | APPROVAL_TTL_SECONDS | gateway | 900 | pending approvals die after this (hard max 3600) |
 | APPROVAL_CLAIM_LEASE_SECONDS | gateway | 30 | how long a consume attempt holds the CLAIMED lease before the sweep returns it to APPROVED |

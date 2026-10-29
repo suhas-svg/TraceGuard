@@ -1,6 +1,6 @@
 ﻿import Fastify, { type FastifyInstance } from "fastify";
 import { validateAgainstSchema } from "./schema-check.js";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import type { Pool, PoolClient } from "pg";
 import { pool } from "./db.js";
@@ -16,7 +16,7 @@ import {
   stableStringify
 } from "./policy.js";
 import { loadActivePolicy, rulesFromBundle } from "./policy-bundle.js";
-import { callUpstreamTool, checkUpstreamUrlResolved } from "./upstream.js";
+import { callUpstreamTool, checkUpstreamUrlResolved, discoverTools } from "./upstream.js";
 import { resolveSecretRef } from "./secret-ref.js";
 import { hashesEqual, parseKey, seal, tryOpen } from "./seal.js";
 import { authHook, scopeClause, workspaceAllowed } from "./auth.js";
@@ -31,6 +31,10 @@ const PORT = Number(process.env.GATEWAY_PORT ?? 8091);
 // Â§9: the human approval surface listens separately from the agent-facing
 // gateway. The dashboard talks to this port; agent credentials never do.
 const CONTROL_PORT = Number(process.env.GATEWAY_CONTROL_PORT ?? 8093);
+// ADR-0010: the API delegates upstream discovery here so only the gateway ever
+// resolves a server credential. This listener is never published and is only
+// reachable from the API on the private network.
+const INTERNAL_PORT = Number(process.env.GATEWAY_INTERNAL_PORT ?? 8094);
 // Â§9.4: default 15 minutes, hard maximum 60 minutes. Deployments may lower the
 // default; nothing may raise the cap without a spec change.
 const APPROVAL_TTL_SECONDS = Math.min(Math.max(Number(process.env.APPROVAL_TTL_SECONDS ?? 900), 60), 3600);
@@ -1732,8 +1736,72 @@ export function buildGatewayControl() {
   return app;
 }
 
+// ADR-0010: service-to-service listener. It exists so the API never resolves
+// an upstream credential: the gateway reads the server row, resolves the
+// secret in its own process, and returns only tool definitions.
+export function buildGatewayInternal() {
+  const token = process.env.GATEWAY_INTERNAL_TOKEN ?? "";
+  if (!token) {
+    throw new Error("GATEWAY_INTERNAL_TOKEN must be set for the internal gateway listener");
+  }
+  const expected = Buffer.from(token, "utf8");
+  const authorized = (header: string | undefined): boolean => {
+    const prefix = "Bearer ";
+    if (!header || !header.startsWith(prefix)) return false;
+    const given = Buffer.from(header.slice(prefix.length), "utf8");
+    return given.length === expected.length && timingSafeEqual(given, expected);
+  };
+  const app = Fastify({ logger: true, genReqId: () => randomUUID() });
+  // A liveness probe carries no data, so it does not need the token.
+  app.get("/healthz", async () => ({ ok: true }));
+  app.addHook("onRequest", async (req, reply) => {
+    if (req.url.split("?")[0] === "/healthz") return;
+    if (!authorized(req.headers.authorization)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+  });
+  app.post("/internal/v1/servers/:id/discover", async (req, reply) => {
+    const started = Date.now();
+    const parsed = z.string().guid().safeParse((req.params as { id?: string }).id);
+    if (!parsed.success) return reply.code(404).send({ error: "server_not_found" });
+    const res = await pool.query<{
+      id: string; base_url: string; secret_ref: string | null; disabled_at: Date | null;
+    }>(
+      "SELECT id, base_url, secret_ref, disabled_at FROM mcp_servers WHERE id = $1",
+      [parsed.data]
+    );
+    const server = res.rows[0];
+    if (!server) return reply.code(404).send({ error: "server_not_found" });
+    if (server.disabled_at) return reply.code(409).send({ error: "server_disabled" });
+    const resolved = await checkUpstreamUrlResolved(server.base_url);
+    if (!resolved.ok) {
+      return reply.code(400).send({ error: "unsafe_upstream", reason: resolved.reason ?? null });
+    }
+    let authSecret: string | null;
+    try {
+      authSecret = await resolveSecretRef(server.secret_ref);
+    } catch (err) {
+      req.log.error({ err }, "server secret unavailable");
+      return reply.code(503).send({ error: "secret_unavailable" });
+    }
+    try {
+      const tools = await discoverTools(server.base_url, authSecret);
+      return reply.send({ tools, duration_ms: Date.now() - started });
+    } catch (err) {
+      const timedOut = err instanceof Error
+        && (err.name === "TimeoutError" || /timed out|timeout/i.test(err.message));
+      req.log.error({ err }, "upstream discovery failed");
+      return reply.code(timedOut ? 504 : 502).send({
+        error: timedOut ? "discovery_timeout" : "discovery_failed"
+      });
+    }
+  });
+  return app;
+}
+
 const isMain = process.argv[1]?.endsWith("gateway.js") || process.argv[1]?.endsWith("gateway.ts");
 if (isMain) {
   buildGateway().listen({ port: PORT, host: "0.0.0.0" });
   buildGatewayControl().listen({ port: CONTROL_PORT, host: "0.0.0.0" });
+  buildGatewayInternal().listen({ port: INTERNAL_PORT, host: "0.0.0.0" });
 }

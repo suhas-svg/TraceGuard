@@ -21,6 +21,13 @@
   control approvals enforce the same boundary.
 - Upstream redirects are refused, not followed: a URL that passed validation
   cannot bounce the gateway to a different origin or a private address.
+- Upstream credentials belong to the gateway alone. The API never resolves a
+  server's `secret_ref`: discovery is delegated to the gateway's internal
+  listener (`GATEWAY_INTERNAL_PORT`, default 8094, never published), which
+  reads the server row, resolves the secret in its own process, and returns
+  only tool definitions. The API keeps the pin and quarantine writes, and if
+  the listener is unconfigured or unreachable discovery fails with
+  `503 discovery_unavailable` instead of falling back to a direct call.
 - Agent credentials cannot decide approvals. The queue and decision endpoints
   live on the gateway's separate control listener (`GATEWAY_CONTROL_PORT`,
   default 8093) rather than the agent-facing port; the approve scope is
