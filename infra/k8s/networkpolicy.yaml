@@ -53,7 +53,7 @@ spec:
             matchExpressions:
               - key: app
                 operator: In
-                values: [api, gateway]
+                values: [api, gateway, migrate]
       ports:
         - protocol: TCP
           port: 5432
@@ -68,7 +68,7 @@ spec:
     matchExpressions:
       - key: app
         operator: In
-        values: [api, gateway]
+        values: [api, gateway, migrate]
   policyTypes: [Egress]
   egress:
     - to:

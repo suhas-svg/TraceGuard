@@ -31,6 +31,20 @@ updates the package scope, image names, environment variables, documentation,
 and deployment manifests together. A partial rename is worse than a documented
 provisional name.
 
+## Clearance search (2026-10-29, preliminary — not legal clearance)
+
+- npm: `traceguard`, `traceguard-sdk`, `@traceguard/*` all unclaimed (registry 404).
+  No npm conflict today; reserving the scope before release is still open.
+- PyPI: `traceguard` 1.5.0 (LLM instrumentation), `traceguard-ai`,
+  `traceguard-core` (agent-pipeline runtime) all taken. The local package is
+  `traceguard-sdk`, close enough to confuse. PyPI collision is real.
+- GitHub: dozens of `TraceGuard` repos, including `aexises/TraceGuard`
+  (agent tool-action authorization, direct overlap) and
+  `jaysflight1/TRACEguard` (agent trust layer). Collision is real.
+- Still open (human/legal task): trademark registers in target jurisdictions,
+  primary domain and handles, container/image names. A web search is not
+  clearance, and this note does not grant the release gate.
+
 ## Consequences
 
 - Public branding and marketing spend wait for the search; engineering can

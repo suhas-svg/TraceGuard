@@ -8,6 +8,7 @@ spec:
     app: web
   ports:
     - port: 80
+      targetPort: 8080
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -36,12 +37,12 @@ spec:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
           ports:
-            - containerPort: 80
+            - containerPort: 8080
           livenessProbe:
-            httpGet: { path: /, port: 80 }
+            httpGet: { path: /, port: 8080 }
             periodSeconds: 15
           readinessProbe:
-            httpGet: { path: /, port: 80 }
+            httpGet: { path: /, port: 8080 }
             periodSeconds: 5
           resources:
             requests: { memory: "32Mi", cpu: "50m" }
