@@ -378,6 +378,36 @@ describe("least-privilege database roles", () => {
     await pool.query("DELETE FROM workspaces WHERE id = $1", [ws.rows[0].id]);
   });
 
+  it("agent principals cannot store human approval or admin scopes", async () => {
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const ws = await pool.query<{ id: string }>(
+      "INSERT INTO workspaces (name) VALUES ($1) RETURNING id",
+      [`agent-scope-${suffix}`]
+    );
+    const project = await pool.query<{ id: string }>(
+      "SELECT id FROM projects WHERE workspace_id = $1 LIMIT 1",
+      [ws.rows[0].id]
+    );
+
+    await expect(pool.query(
+      `INSERT INTO agent_principals
+         (project_id, issuer, subject, allowed_scopes)
+       VALUES ($1, 'https://issuer.test', $2, '["gateway", "approve"]'::jsonb)`,
+      [project.rows[0].id, `approve-${suffix}`]
+    )).rejects.toMatchObject({ code: "23514" });
+
+    const valid = await pool.query(
+      `INSERT INTO agent_principals
+         (project_id, issuer, subject, allowed_scopes)
+       VALUES ($1, 'https://issuer.test', $2, '["gateway", "read", "ingest"]'::jsonb)
+       RETURNING id`,
+      [project.rows[0].id, `valid-${suffix}`]
+    );
+    expect(valid.rows[0]?.id).toBeTruthy();
+
+    await pool.query("DELETE FROM workspaces WHERE id = $1", [ws.rows[0].id]);
+  });
+
   it("policy_publisher appends versions and trust through narrow procedures", async () => {
     await asRole("policy_publisher", async (c) => {
       expect(await attempt(c, () => c.query("UPDATE policy_versions SET content_hash = 'x' WHERE false"))).toBe(DENIED);
