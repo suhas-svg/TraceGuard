@@ -21,6 +21,9 @@ RUN pnpm --filter @traceguard/web build
 
 FROM nginx:alpine
 COPY --from=build /app/apps/web/dist /usr/share/nginx/html
+# Unprivileged listener: the image runs as nginx (runAsNonRoot), and :80
+# cannot bind without root. The k8s Service keeps port 80 externally.
+COPY apps/web/nginx.conf /etc/nginx/conf.d/default.conf
 # The base image keeps /var/cache/nginx and the pid path root-owned, so an
 # unprivileged master cannot even create its temp dirs. Hand them over.
 RUN chown -R nginx:nginx /var/cache/nginx && touch /var/run/nginx.pid && chown nginx:nginx /var/run/nginx.pid

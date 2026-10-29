@@ -8,9 +8,16 @@ metadata:
 spec:
   backoffLimit: 3
   template:
+    metadata:
+      labels:
+        app: migrate
     spec:
       securityContext:
         runAsNonRoot: true
+        # Numeric uid required: kubelet cannot verify non-root for the image's
+        # non-numeric `postgres` user. 70 is the postgres uid in postgres:17-alpine.
+        runAsUser: 70
+        runAsGroup: 70
         seccompProfile: { type: RuntimeDefault }
       restartPolicy: OnFailure
       # The Job is applied at the same time as postgres, so the container must
