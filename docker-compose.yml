@@ -192,7 +192,7 @@ services:
       context: .
       dockerfile: ./apps/web/Dockerfile
     ports:
-      - "5173:80"
+      - "5173:8080"
     networks:
       - front
 
