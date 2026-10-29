@@ -81,7 +81,12 @@ above before running it on a database you care about.
 ## Cron endpoints
 
 These are endpoints rather than in-process schedulers, so one operator decision
-drives all of them.
+drives all of them. The reference deployments schedule them for you: the
+Compose `maintenance` service (`scripts/maintenance.mjs`, every
+`MAINTENANCE_INTERVAL_SECONDS`, default 300) and the Kubernetes CronJob
+`infra/k8s/maintenance-cronjob.yaml` (every five minutes). In OAuth production
+mode the static `API_KEY` is ignored, so set `MAINTENANCE_TOKEN` to a token with
+the admin scope (Compose) or change the CronJob's credential to match.
 
 ```bash
 # Close runs orphaned by a crashed SDK (§11.3: a run silent for 15 minutes is
