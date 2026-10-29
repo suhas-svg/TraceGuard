@@ -22,6 +22,10 @@ export default tseslint.config(
     languageOptions: { globals: { ...globals.node } }
   },
   {
+    files: ["prototype/**/*.{js,mjs}"],
+    languageOptions: { globals: { ...globals.browser } }
+  },
+  {
     rules: {
       // A few `any`s survive at adapter boundaries; keep them visible
       // without failing the build.
