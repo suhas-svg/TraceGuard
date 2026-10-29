@@ -43,19 +43,21 @@ let auditA1: string;
 let auditA2: string;
 let auditB: string;
 let tokenA: string;
+let humanApproverToken: string;
+let humanAdminToken: string;
 const originalEnv = { ...process.env };
 const dir = mkdtempSync(join(tmpdir(), "tg-isolation-"));
 const kid = `isolation-${tag}`;
 const ed = generateKeyPairSync("ed25519");
 const jwksFile = join(dir, "jwks.json");
 
-function mint(projectId: string, scope: string): string {
+function mint(projectId: string, scope: string, subject = `agent-${tag}`): string {
   const header = b64({ alg: "EdDSA", typ: "JWT", kid });
   const payload = b64({
     iss: ISSUER,
     aud: AUDIENCE,
     resource: AUDIENCE,
-    sub: `agent-${tag}`,
+    sub: subject,
     exp: Math.floor(Date.now() / 1000) + 300,
     scope,
     projects: [projectId],
@@ -174,12 +176,14 @@ beforeAll(async () => {
       issuer: ISSUER,
       subject: `agent-${tag}`,
       display_name: "isolation reader",
-      allowed_scopes: ["read", "admin", "approve"]
+      allowed_scopes: ["read"]
     }
   });
   expect(principal.statusCode).toBe(201);
 
-  tokenA = mint(projectA, "read admin approve");
+  tokenA = mint(projectA, "read");
+  humanApproverToken = mint(projectA, "read approve", `human-approver-${tag}`);
+  humanAdminToken = mint(projectA, "read admin", `human-admin-${tag}`);
 });
 
 afterAll(async () => {
@@ -243,8 +247,9 @@ describe("project isolation for a project-pinned agent", () => {
     expect(decisions.statusCode).toBe(200);
     expect(decisions.json().items).toEqual([]);
 
+    const auditToken = bearer(humanAdminToken);
     const firstAudit = await gw.inject({
-      method: "GET", url: "/v1/audit-events?action=isolation.fixture&limit=1", headers: token
+      method: "GET", url: "/v1/audit-events?action=isolation.fixture&limit=1", headers: auditToken
     });
     expect(firstAudit.statusCode).toBe(200);
     expect(ids(firstAudit.json().items)).toEqual([auditA2]);
@@ -252,7 +257,7 @@ describe("project isolation for a project-pinned agent", () => {
     const secondAudit = await gw.inject({
       method: "GET",
       url: `/v1/audit-events?action=isolation.fixture&limit=1&cursor=${encodeURIComponent(firstAudit.json().next_cursor)}`,
-      headers: token
+      headers: auditToken
     });
     expect(secondAudit.statusCode).toBe(200);
     expect(ids(secondAudit.json().items)).toEqual([auditA1]);
@@ -273,15 +278,32 @@ describe("project isolation for a project-pinned agent", () => {
     });
     expect(foreignTools.statusCode).toBe(404);
 
+    // Retention is workspace-scoped, so even a project-pinned admin cannot
+    // reach it. Agent principals now lack admin entirely, so use the human
+    // admin token to exercise the workspace-scope check rather than the
+    // generic scope denial.
     const retention = await api.inject({
-      method: "GET", url: "/v1/retention/rules", headers: token
+      method: "GET", url: "/v1/retention/rules", headers: bearer(humanAdminToken)
     });
     expect(retention.statusCode).toBe(403);
     expect(retention.json().error).toBe("retention_requires_workspace_scope");
   });
 
-  it("scopes the control approval queue, detail, and decision", async () => {
+  it("rejects agent principals from the control listener", async () => {
     const token = bearer(tokenA);
+    for (const [method, url, payload] of [
+      ["GET", "/_control/v1/approvals", undefined],
+      ["GET", `/_control/v1/approvals/${approvalA}`, undefined],
+      ["POST", `/_control/v1/approvals/${approvalA}/decision`, { approved: true }]
+    ] as const) {
+      const res = await ctl.inject({ method, url, headers: token, payload: payload as never });
+      expect(res.statusCode, url).toBe(403);
+      expect(res.json().error, url).toBe("agent_principal_forbidden");
+    }
+  });
+
+  it("scopes the control approval queue, detail, and decision for a human approver", async () => {
+    const token = bearer(humanApproverToken);
 
     const list = await ctl.inject({
       method: "GET", url: "/_control/v1/approvals", headers: token

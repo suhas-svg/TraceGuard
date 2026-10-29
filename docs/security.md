@@ -113,10 +113,12 @@ servers directly. Run upstreams on the internal `tools` network and the
 agent on `agent_edge`: the gateway is then the only container with a foot on
 both, and `tests/security/bypass.mjs` fails if that stops being true.
 
-The `caller` and `agent_id` fields on gateway calls are attribution the
-caller supplies, not authenticated identity; policy scoping on them tells
-cooperative agents apart, not adversaries. Give each agent its own key when
-identity must be authenticated.
+Policy and budget agent identity comes from the authenticated AgentPrincipal,
+never from the request body. Gateway calls that include `agent_id` are rejected
+with `400 agent_id_not_accepted`; the `caller` field is only fallback
+attribution for static API keys and is ignored when the request has an
+authenticated principal. Policy drafts may only name an active AgentPrincipal
+in the same project, enforced by both the API and a composite foreign key.
 
 ## Sensitive data inventory
 

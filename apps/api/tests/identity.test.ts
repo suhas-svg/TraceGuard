@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildApp } from "../src/index.js";
+import { buildGatewayControl } from "../src/gateway.js";
 import { pool } from "../src/db.js";
 
 // §7.1/§13.1/§14: projects are the policy/data scope, agent principals are
@@ -177,6 +178,30 @@ describe("identity model", () => {
     expect(afterRevoke.statusCode).toBe(401);
   });
 
+  it("refuses human approval and admin scopes on agent principals", async () => {
+    const subject = `agent-scope-${tag}`;
+    const badCreate = await post(`/v1/projects/${projectId}/agent-principals`, {
+      issuer: "https://issuer.identity.test",
+      subject,
+      allowed_scopes: ["gateway", "approve"]
+    });
+    expect(badCreate.statusCode).toBe(400);
+    expect(badCreate.json().error).toBe("invalid_agent_principal");
+
+    const created = await post(`/v1/projects/${projectId}/agent-principals`, {
+      issuer: "https://issuer.identity.test",
+      subject,
+      allowed_scopes: ["gateway", "read"]
+    });
+    expect(created.statusCode).toBe(201);
+
+    const badPatch = await patch(`/v1/agent-principals/${created.json().id}`, {
+      allowed_scopes: ["admin"]
+    });
+    expect(badPatch.statusCode).toBe(400);
+    expect(badPatch.json().error).toBe("invalid_agent_principal");
+  });
+
   it("maps a validated OAuth subject to its project-scoped agent principal", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tg-identity-"));
     const jwksFile = join(dir, "jwks.json");
@@ -240,6 +265,19 @@ describe("identity model", () => {
       expect(listed.json().items.map((p: { id: string }) => p.id)).toEqual([projectId]);
       expect((await get(`/v1/projects/${projectId}`, oauth)).statusCode).toBe(200);
       expect((await get(`/v1/projects/${otherProjectId}`, oauth)).statusCode).toBe(404);
+
+      // Even if the issuer token carries a human scope, an agent principal
+      // cannot reach the human approval listener.
+      const ctl = buildGatewayControl();
+      try {
+        const control = await ctl.inject({
+          method: "GET", url: "/_control/v1/approvals", headers: oauth
+        });
+        expect(control.statusCode).toBe(403);
+        expect(control.json().error).toBe("agent_principal_forbidden");
+      } finally {
+        await ctl.close();
+      }
 
       const disabled = await patch(`/v1/agent-principals/${principal.json().id}`, {
         status: "disabled"

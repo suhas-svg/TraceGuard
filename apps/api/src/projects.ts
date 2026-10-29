@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
-import { ALL_SCOPES, newIngestKey } from "./auth.js";
+import { AGENT_PRINCIPAL_SCOPES, newIngestKey } from "./auth.js";
 import type { Principal } from "./auth.js";
 import { audit } from "./audit.js";
 import { pool } from "./db.js";
@@ -198,7 +198,7 @@ export function registerProjectRoutes(app: FastifyInstance): void {
       issuer: z.string().url(),
       subject: z.string().min(1).max(512),
       display_name: z.string().max(128).default(""),
-      allowed_scopes: z.array(z.enum(ALL_SCOPES as [string, ...string[]]))
+      allowed_scopes: z.array(z.enum(AGENT_PRINCIPAL_SCOPES as unknown as [string, ...string[]]))
         .default(["gateway", "read", "ingest"])
     }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_agent_principal" });
@@ -241,7 +241,7 @@ export function registerProjectRoutes(app: FastifyInstance): void {
     const parsed = z.object({
       display_name: z.string().max(128).optional(),
       status: z.enum(["active", "disabled"]).optional(),
-      allowed_scopes: z.array(z.enum(ALL_SCOPES as [string, ...string[]])).optional()
+      allowed_scopes: z.array(z.enum(AGENT_PRINCIPAL_SCOPES as unknown as [string, ...string[]])).optional()
     }).refine((v) => v.display_name !== undefined || v.status !== undefined ||
       v.allowed_scopes !== undefined, { message: "nothing to update" }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_agent_principal" });

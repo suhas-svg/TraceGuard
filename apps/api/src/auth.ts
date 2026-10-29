@@ -16,6 +16,11 @@ import {
 // still cannot reach the approval surface (§9.1).
 export const ALL_SCOPES = ["admin", "ingest", "gateway", "approve", "read"];
 
+// Agent principals are non-human MCP callers. They may call tools and read
+// their own project, but they must never hold a human approval or admin scope.
+// Migration 051 enforces the same set at the database boundary.
+export const AGENT_PRINCIPAL_SCOPES = ["gateway", "read", "ingest"] as const;
+
 // The static env keys and the admin role keep full administrative scope;
 // "approve" is deliberately absent.
 export const ADMIN_SCOPES = ["admin", "ingest", "gateway", "read"];
@@ -38,6 +43,16 @@ export interface Principal {
   // Set when an OAuth token matched an active, provisioned AgentPrincipal.
   agentPrincipalId?: string | null;
   issuer?: string | null;
+}
+
+// §8.2/§9.1: the caller recorded on a decision and bound into an approval is
+// the authenticated principal, never a request field. An agent principal gets
+// a stable namespaced value so its approvals cannot collide with a human
+// subject that happens to share the same string.
+export function principalCaller(principal?: Principal | null): string | null {
+  if (!principal) return null;
+  if (principal.agentPrincipalId) return `agent_principal:${principal.agentPrincipalId}`;
+  return principal.userId;
 }
 
 // Writes that non-admin actors may perform. Everything else that mutates
@@ -230,7 +245,11 @@ export async function resolvePrincipal(
           agentPrincipalId = chosen.id as string;
           agentPrincipalProject = chosen.project_id as string;
           const allowed = new Set((chosen.allowed_scopes ?? []) as string[]);
-          scopes = scopes.filter((s) => allowed.has(s));
+          const agentScopes = new Set<string>(AGENT_PRINCIPAL_SCOPES);
+          // Do not trust a legacy row that still contains approve/admin. The
+          // database constraint added in 051 prevents new ones; this filter
+          // keeps an already-provisioned row from becoming an approver.
+          scopes = scopes.filter((s) => allowed.has(s) && agentScopes.has(s));
         }
       }
       // Legacy tokens name workspaces instead of projects. Only UUID-shaped
@@ -396,6 +415,16 @@ export async function authHook(req: FastifyRequest, reply: FastifyReply): Promis
   // reach MCP, approvals, administration, or even reads.
   if (principal.kind === "ingest" && scope !== "ingest") {
     return reply.code(403).send({ error: "ingest_key_scope" }) as unknown as void;
+  }
+  // §9.1/§13.1: approval decisions are human-only. Check the agent principal
+  // marker itself, not just the scope list, so a legacy or misprovisioned row
+  // can never reach the control listener even if it still carries "approve".
+  if (req.url.startsWith("/_control/") && principal.agentPrincipalId) {
+    await audit(pool, { actor_type: "system", action: "control.access_denied",
+      resource_type: "route", resource_id: req.url, result: "rejected",
+      metadata: { method: req.method, reason: "agent_principal_forbidden",
+        agent_principal_id: principal.agentPrincipalId } }).catch(() => undefined);
+    return reply.code(403).send({ error: "agent_principal_forbidden" }) as unknown as void;
   }
   // §7.3: in production the gateway maps an OAuth subject to a provisioned,
   // project-scoped AgentPrincipal. A valid token that was never provisioned
